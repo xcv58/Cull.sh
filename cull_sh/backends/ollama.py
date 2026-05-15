@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import base64
 import json
+import time
 from typing import Literal
 
 import httpx
@@ -37,10 +38,19 @@ class OllamaVisionBackend(VisionBackend):
     Ollama-specific transport and response details.
     """
 
-    def __init__(self, base_url: str, model: str, timeout_seconds: float = 120.0) -> None:
+    def __init__(
+        self,
+        base_url: str,
+        model: str,
+        timeout_seconds: float = 300.0,
+        max_attempts: int = 3,
+        retry_backoff_seconds: float = 2.0,
+    ) -> None:
         self.base_url = base_url.rstrip("/")
         self.model = model
         self.timeout_seconds = timeout_seconds
+        self.max_attempts = max_attempts
+        self.retry_backoff_seconds = retry_backoff_seconds
 
     def score_batch(
         self,
@@ -92,71 +102,83 @@ class OllamaVisionBackend(VisionBackend):
             cohort_lines.append(f"Image {index}: {preview.asset.filename}")
             encoded_images.append(base64.b64encode(preview.image_bytes).decode("ascii"))
 
-        try:
-            response = client.post(
-                f"{self.base_url}/api/chat",
-                json={
-                    "model": self.model,
-                    "messages": [
-                        {
-                            "role": "system",
-                            "content": (
-                                "You are a photography culling assistant. "
-                                "Evaluate this same-scene cohort together. "
-                                "Return only valid JSON that matches the provided schema. "
-                                "Use the provided filenames exactly and return one result per image. "
-                                "Compare the images relative to each other before deciding. "
-                                "Use triage, not binary culling: reject, review, or pick."
-                            ),
-                        },
-                        {
-                            "role": "user",
-                            "content": (
-                                "Scene cohort:\n"
-                                + "\n".join(cohort_lines)
-                                + "\n\n"
-                                + f"User instructions: {prompt}\n"
-                                + "Decision policy:\n"
-                                + "- reject: obvious miss that does not need human attention\n"
-                                + "- review: usable or uncertain image that still needs a human decision\n"
-                                + "- pick: clearly one of the strongest images in this cohort and worth extra edit effort\n"
-                                + "Use reject sparingly and only for obvious misses. "
-                                + "Use pick sparingly and only for clear standouts. "
-                                + "Use review as the default middle ground. "
-                                + "Do not reject every image in the cohort unless they are all clearly unusable. "
-                                + "If nothing is strong enough to pick but one image is still usable, keep the best image as review.\n"
-                                + "Return a bucket of reject, review, or pick for each image. "
-                                + "Use rating 4 or 5 for picks, and rating 0 for review or reject. "
-                                + "Return a Lightroom label from Red, Yellow, Green, Blue, Purple, or null. "
-                                + "Use null when unsure."
-                            ),
-                            "images": encoded_images,
-                        },
-                    ],
-                    "format": OllamaBatchDecisionPayload.model_json_schema(),
-                    "stream": False,
-                    "options": {"temperature": 0},
+        request_payload = {
+            "model": self.model,
+            "messages": [
+                {
+                    "role": "system",
+                    "content": (
+                        "You are a photography culling assistant. "
+                        "Evaluate this same-scene cohort together. "
+                        "Return only valid JSON that matches the provided schema. "
+                        "Use the provided filenames exactly and return one result per image. "
+                        "Compare the images relative to each other before deciding. "
+                        "Use triage, not binary culling: reject, review, or pick."
+                    ),
                 },
-            )
-            response.raise_for_status()
-        except httpx.HTTPError as exc:  # pragma: no cover - network/service dependent
-            raise VisionBackendError(f"ollama request failed: {exc}") from exc
+                {
+                    "role": "user",
+                    "content": (
+                        "Scene cohort:\n"
+                        + "\n".join(cohort_lines)
+                        + "\n\n"
+                        + f"User instructions: {prompt}\n"
+                        + "Decision policy:\n"
+                        + "- reject: obvious miss that does not need human attention\n"
+                        + "- review: usable or uncertain image that still needs a human decision\n"
+                        + "- pick: clearly one of the strongest images in this cohort and worth extra edit effort\n"
+                        + "Use reject sparingly and only for obvious misses. "
+                        + "Use pick sparingly and only for clear standouts. "
+                        + "Use review as the default middle ground. "
+                        + "Do not reject every image in the cohort unless they are all clearly unusable. "
+                        + "If nothing is strong enough to pick but one image is still usable, keep the best image as review.\n"
+                        + "Return a bucket of reject, review, or pick for each image. "
+                        + "Use rating 4 or 5 for picks, and rating 0 for review or reject. "
+                        + "Return a Lightroom label from Red, Yellow, Green, Blue, Purple, or null. "
+                        + "Use null when unsure."
+                    ),
+                    "images": encoded_images,
+                },
+            ],
+            "format": OllamaBatchDecisionPayload.model_json_schema(),
+            "stream": False,
+            "options": {"temperature": 0},
+        }
 
-        payload = response.json()
-        content = payload.get("message", {}).get("content")
-        if not content:
-            raise VisionBackendError("ollama response did not include message content")
+        last_error: str | None = None
+        for attempt in range(1, self.max_attempts + 1):
+            try:
+                response = client.post(
+                    f"{self.base_url}/api/chat",
+                    json=request_payload,
+                )
+                response.raise_for_status()
+            except httpx.TimeoutException as exc:  # pragma: no cover - network/service dependent
+                last_error = (
+                    f"ollama request timed out after {self.timeout_seconds:.0f}s"
+                )
+            except httpx.HTTPStatusError as exc:  # pragma: no cover - network/service dependent
+                status_code = exc.response.status_code
+                if 500 <= status_code < 600:
+                    last_error = f"ollama request failed with {status_code}"
+                else:
+                    raise VisionBackendError(f"ollama request failed: {exc}") from exc
+            except httpx.HTTPError as exc:  # pragma: no cover - network/service dependent
+                raise VisionBackendError(f"ollama request failed: {exc}") from exc
+            else:
+                try:
+                    payload = response.json()
+                    return _parse_batch_payload(payload, previews)
+                except VisionBackendError as exc:
+                    last_error = str(exc)
 
-        try:
-            parsed = OllamaBatchDecisionPayload.model_validate(json.loads(content))
-        except (json.JSONDecodeError, ValidationError) as exc:
-            raise VisionBackendError(f"ollama returned invalid structured output: {exc}") from exc
+            if attempt == self.max_attempts:
+                break
+            time.sleep(self.retry_backoff_seconds * attempt)
 
-        if len(parsed.decisions) != len(previews):
-            raise VisionBackendError(
-                "ollama cohort response did not include one decision per input image"
-            )
-        return parsed
+        raise VisionBackendError(
+            f"{last_error or 'ollama request failed'} after {self.max_attempts} attempt(s)"
+        )
 
 
 def _normalize_label(value: str | None) -> ColorLabel | None:
@@ -178,3 +200,33 @@ def _normalize_label(value: str | None) -> ColorLabel | None:
         return mapping[normalized]
     except KeyError as exc:
         raise VisionBackendError(f"unsupported color label from ollama: {value}") from exc
+
+
+def _parse_batch_payload(
+    payload: dict[str, object],
+    previews: list[PreviewImage],
+) -> OllamaBatchDecisionPayload:
+    content = payload.get("message", {}).get("content")
+    if not content:
+        raise VisionBackendError("ollama response did not include message content")
+
+    try:
+        parsed = OllamaBatchDecisionPayload.model_validate(json.loads(content))
+    except (json.JSONDecodeError, ValidationError) as exc:
+        raise VisionBackendError(
+            f"ollama returned invalid structured output: {exc}"
+        ) from exc
+
+    if len(parsed.decisions) != len(previews):
+        raise VisionBackendError(
+            "ollama cohort response did not include one decision per input image"
+        )
+
+    expected_filenames = {preview.asset.filename for preview in previews}
+    returned_filenames = [decision.filename for decision in parsed.decisions]
+    if set(returned_filenames) != expected_filenames:
+        raise VisionBackendError(
+            "ollama cohort response did not include the expected filenames"
+        )
+
+    return parsed
