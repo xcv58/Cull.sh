@@ -1,0 +1,162 @@
+# Cull.sh
+
+`Cull.sh` is a natural-language-driven CLI for photo culling.
+
+The intended workflow is:
+
+1. Discover proprietary RAW files.
+2. Extract embedded JPEG previews without modifying the RAWs.
+3. Run fast local quality checks such as blur detection.
+4. Send only viable candidates to a vision model backend.
+5. Write Lightroom-compatible `.xmp` sidecars with ratings and labels.
+6. Optionally apply safe Lightroom sidecar edits to RAWs.
+
+The repository is scaffolded around a provider-agnostic backend interface so local models such as Ollama can be used for development, while Anthropic or OpenAI can be added later without changing the pipeline shape.
+
+## Layout
+
+- `main.py`: thin entrypoint
+- `cull_sh/`: application package
+- `docs/architecture.md`: architecture plan and build order
+- `requirements.txt`: bootstrap dependencies
+
+## Quickstart
+
+```bash
+python3 -m venv .venv
+source .venv/bin/activate
+pip install -r requirements.txt
+python main.py --help
+python main.py doctor
+```
+
+If you plan to use the Ollama backend, make sure the local API is running on
+`http://localhost:11434`. `python main.py doctor` now probes that endpoint directly.
+
+## Current Status
+
+This scaffold includes:
+
+- CLI entrypoint with Typer
+- provider-agnostic backend interface
+- Ollama backend implementation
+- RAW discovery
+- provisional scene grouping
+- multi-metric local preview analysis
+- portrait-aware local face / eye hints
+- scene-relative candidate reranking
+- near-duplicate suppression before vision scoring
+- run manifests under `runs/<timestamp>/manifest.jsonl`
+- XMP sidecar writing with merge support for existing files
+- optional Lightroom sidecar edits for all RAWs by default
+- architecture plan for the full app
+
+## Current Workflow
+
+```bash
+python main.py doctor
+python main.py cull --path /path/to/raws --prompt "Keep the sharpest wildlife photos"
+python main.py cull --path /path/to/raws --genre portrait
+python main.py cull --path /path/to/raws --genre street --prefer "interesting gestures and layering"
+python main.py cull --path /path/to/raws --genre flowers --limit 24
+python main.py cull --path /path/to/raws --prompt "Keep the sharpest wildlife photos" --no-dry-run
+python main.py cull --path /path/to/raws --genre event --lightroom-auto-edit --no-dry-run
+python main.py lightroom-edit --path "/path/to/culled raws" --no-dry-run
+python main.py lightroom-adaptive-color --path "/path/to/culled raws"
+python main.py repair-sidecars
+python main.py repair-sidecars --run-dir runs/20260411-220756-823242
+```
+
+If you omit `--prompt`, the CLI can generate one from a genre preset:
+
+- `auto`: broad cross-genre prompt
+- `mixed`
+- `portrait`
+- `street`
+- `flowers`
+- `wildlife`
+- `landscape`
+- `event`
+- `product`
+
+In an interactive terminal, omitting `--prompt` starts a guided setup so the app can
+ask for genre and any extra preference. This is intentionally deterministic and
+cheaper than adding a separate model-driven “conversation” step before every run.
+
+In `--dry-run` mode, the pipeline still:
+
+- discovers RAW files
+- extracts previews
+- computes blur scores
+- scores surviving images with the configured backend
+- writes run artifacts under `runs/`
+- shows progress during extraction, local scoring, and vision scoring
+
+With `--no-dry-run`, it also writes or updates `.xmp` sidecars next to each RAW.
+
+`--lightroom-auto-edit` extends culling sidecar writes for RAW photos with
+safe Lightroom sidecar edits:
+
+- lens profile corrections enabled
+
+Cull.sh does not invent Lightroom's per-image Adaptive Color AI payload. The
+validated path is to let Lightroom apply that profile through the UI or a preset
+automation pass, because the visible Adaptive Color result requires Lightroom's
+generated `crs:AILook` data. The verifier counts Lightroom `.acr` payloads for
+sidecar RAW files and embedded DNG XMP when Lightroom writes the AI payload back
+into a DNG.
+
+By default, Lightroom edit stages process all RAWs, including rejected photos,
+so the whole folder has the same baseline treatment if you later rescue a reject.
+Use `--lightroom-edit-scope kept` on `cull`, `lightroom-edit`, or
+`lightroom-adaptive-color` to restore the older kept-only behavior.
+
+For folders that have already been culled, use `lightroom-edit` to apply the same
+sidecar edit to every RAW:
+
+```bash
+python main.py lightroom-edit --path "/path/to/culled-raws" --dry-run
+python main.py lightroom-edit --path "/path/to/culled-raws" --no-dry-run
+```
+
+Then use `lightroom-adaptive-color` to prepare the Computer Use UI stage for
+Adaptive Color:
+
+```bash
+python main.py lightroom-adaptive-color --path "/path/to/culled-raws"
+```
+
+This writes `lightroom-adaptive-color.md` and `.json` under a new `runs/`
+directory. The checklist tells Computer Use to open Adobe Lightroom, filter to
+the in-scope RAW photos, verify the visible count, select all visible photos, and
+choose `Adaptive Color` directly from Lightroom's Profile dropdown. This profile
+step must happen inside Lightroom so Lightroom can generate per-image
+`crs:AILook` data.
+
+`--limit` now applies after whole-folder scene grouping, so `--limit 24` means
+"process the first 24 scenes" rather than "stop after 24 files".
+
+`--batch-size` now controls the maximum images per same-scene cohort sent to the
+vision backend for comparative scoring.
+
+Longer runs now persist progress incrementally:
+
+- local rejections can write sidecars before vision scoring starts
+- each vision batch rewrites `manifest.jsonl`
+- each completed vision batch writes sidecars immediately when `--no-dry-run` is enabled
+
+## Lightroom Flags
+
+Cull.sh writes Lightroom-visible culling state in three forms:
+
+- `xmpDM:Pick=1` for kept images and `xmpDM:Pick=-1` for rejects
+- `xmp:Label="Red"` for local blur rejects and `xmp:Label="Yellow"` for vision rejects
+- `xmp:Rating="-1"` for rejects and `1..5` for kept images
+
+If you need to repair sidecars from an older run without rescoring, use:
+
+```bash
+python main.py repair-sidecars
+```
+
+By default this replays the latest run manifest under `runs/`.

@@ -1,0 +1,585 @@
+from __future__ import annotations
+
+from pathlib import Path
+import shutil
+import sys
+
+import httpx
+import typer
+from rich.console import Console
+from rich.table import Table
+
+from cull_sh.config import BackendConfig, DEFAULT_EXTENSIONS, PipelineConfig
+from cull_sh.lightroom_ui import build_adaptive_color_stage
+from cull_sh.lightroom_ui import write_adaptive_color_handoff
+from cull_sh.manifests import create_run_dir
+from cull_sh.manifests import decision_from_manifest_record
+from cull_sh.manifests import find_latest_run_dir
+from cull_sh.manifests import load_manifest_records
+from cull_sh.models import LightroomEditScope
+from cull_sh.pipeline import run_pipeline
+from cull_sh.prompting import GenrePreset
+from cull_sh.prompting import parse_genre
+from cull_sh.prompting import resolve_prompt
+from cull_sh.prompting import supported_genre_labels
+from cull_sh.quality import learned_iqa_available
+from cull_sh.quality import learned_iqa_import_error
+from cull_sh.quality import support_metric_import_errors
+from cull_sh.reporting import RichPipelineReporter
+from cull_sh.scanner import discover_raw_assets
+from cull_sh.xmp import sidecar_is_rejected
+from cull_sh.xmp import write_lightroom_edit_sidecar
+from cull_sh.xmp import write_xmp_sidecar
+
+
+app = typer.Typer(
+    help="Cull.sh: natural-language photo culling for proprietary RAW files."
+)
+console = Console()
+
+
+@app.command()
+def doctor(
+    backend_url: str = typer.Option(
+        "http://localhost:11434",
+        help="Backend URL to probe for Ollama health.",
+    ),
+) -> None:
+    """Report key local dependencies used by the scaffold."""
+    table = Table(title="Cull.sh Doctor")
+    table.add_column("Dependency")
+    table.add_column("Location")
+
+    for tool in ("exiftool", "sips", "ollama"):
+        location = shutil.which(tool) or "not found"
+        table.add_row(tool, location)
+
+    console.print(table)
+
+    health = Table(title="Backend Health")
+    health.add_column("Check")
+    health.add_column("Result")
+    try:
+        response = httpx.get(f"{backend_url.rstrip('/')}/api/tags", timeout=3.0)
+        response.raise_for_status()
+        models = response.json().get("models", [])
+        health.add_row("Ollama API", f"reachable ({len(models)} model(s) listed)")
+    except Exception as exc:  # pragma: no cover - environment dependent
+        health.add_row("Ollama API", f"unreachable: {exc}")
+
+    console.print(health)
+
+
+@app.command()
+def cull(
+    path: Path = typer.Option(..., exists=True, file_okay=False, dir_okay=True),
+    prompt: str | None = typer.Option(
+        None,
+        help="Explicit culling instructions. Overrides genre presets when provided.",
+    ),
+    genre: GenrePreset = typer.Option(
+        GenrePreset.AUTO,
+        case_sensitive=False,
+        help="Genre preset used when --prompt is omitted.",
+    ),
+    prefer: str | None = typer.Option(
+        None,
+        help="Optional short preference appended to the genre preset prompt.",
+    ),
+    interactive: bool = typer.Option(
+        True,
+        "--interactive/--no-interactive",
+        help="Ask for genre and preferences when no prompt is provided.",
+    ),
+    provider: str = typer.Option("ollama", help="Vision backend provider."),
+    model: str = typer.Option("gemma4:latest", help="Vision backend model name."),
+    backend_url: str = typer.Option(
+        "http://localhost:11434",
+        help="Base URL for the selected backend.",
+    ),
+    batch_size: int = typer.Option(
+        4,
+        min=1,
+        help="Maximum images per same-scene cohort sent to the vision backend.",
+    ),
+    limit: int | None = typer.Option(
+        None,
+        min=1,
+        help="Only process the first N scenes after full-folder grouping.",
+    ),
+    extract_workers: int = typer.Option(6, min=1),
+    score_workers: int = typer.Option(6, min=1),
+    min_blur_score: float = typer.Option(110.0, min=0.0),
+    min_tenengrad_score: float = typer.Option(45.0, min=0.0),
+    learned_iqa: bool = typer.Option(
+        True,
+        "--learned-iqa/--no-learned-iqa",
+        help="Enable learned local quality scores with MUSIQ and NIMA when PyIQA is available.",
+    ),
+    min_musiq_score: float = typer.Option(50.0, min=0.0),
+    min_nima_score: float = typer.Option(4.6, min=0.0),
+    brisque: bool = typer.Option(
+        True,
+        "--brisque/--no-brisque",
+        help="Record BRISQUE scores when the optional library is available.",
+    ),
+    cpbd: bool = typer.Option(
+        True,
+        "--cpbd/--no-cpbd",
+        help="Record CPBD perceptual blur scores when the optional library is available.",
+    ),
+    max_brisque_score: float = typer.Option(55.0, min=0.0),
+    min_cpbd_score: float = typer.Option(0.3, min=0.0),
+    use_brisque_for_reject: bool = typer.Option(
+        False,
+        "--use-brisque-for-reject/--no-use-brisque-for-reject",
+        help="Let BRISQUE contribute a weak-quality vote in the local reject gate.",
+    ),
+    use_cpbd_for_reject: bool = typer.Option(
+        False,
+        "--use-cpbd-for-reject/--no-use-cpbd-for-reject",
+        help="Let CPBD contribute a weak-quality vote in the local reject gate.",
+    ),
+    local_reject_required_support_votes: int = typer.Option(2, min=1),
+    duplicate_hamming_threshold: int = typer.Option(6, min=0),
+    max_scene_candidates: int | None = typer.Option(None, min=1),
+    cache_previews: bool = typer.Option(
+        False,
+        help="Persist extracted JPEG previews under runs/<timestamp>/previews.",
+    ),
+    lightroom_auto_edit: bool = typer.Option(
+        False,
+        "--lightroom-auto-edit/--no-lightroom-auto-edit",
+        help=(
+            "When writing sidecars, apply safe Lightroom sidecar edits. "
+            "Lens corrections are written directly; Adaptive "
+            "Color still needs Lightroom UI/preset automation."
+        ),
+    ),
+    lightroom_edit_scope: LightroomEditScope = typer.Option(
+        LightroomEditScope.ALL,
+        "--lightroom-edit-scope",
+        help="Which RAW files receive Lightroom sidecar/UI edits: all or kept.",
+    ),
+    dry_run: bool = typer.Option(True, help="Skip sidecar writes for now."),
+) -> None:
+    """
+    Start a culling run.
+
+    The scaffold currently performs discovery and prints a summary while the remaining
+    phases are implemented incrementally.
+    """
+    prompt_selection = _resolve_prompt_selection(
+        prompt=prompt,
+        genre=genre,
+        prefer=prefer,
+        interactive=interactive,
+    )
+
+    config = PipelineConfig(
+        path=path,
+        prompt=prompt_selection.prompt,
+        genre=prompt_selection.genre.value,
+        prefer=prompt_selection.prefer,
+        prompt_source=prompt_selection.source,
+        backend=BackendConfig(
+            provider=provider,
+            model=model,
+            base_url=backend_url,
+        ),
+        limit=limit,
+        batch_size=batch_size,
+        extract_workers=extract_workers,
+        score_workers=score_workers,
+        min_blur_score=min_blur_score,
+        min_tenengrad_score=min_tenengrad_score,
+        enable_learned_iqa=learned_iqa,
+        min_musiq_score=min_musiq_score,
+        min_nima_score=min_nima_score,
+        enable_brisque=brisque,
+        enable_cpbd=cpbd,
+        max_brisque_score=max_brisque_score,
+        min_cpbd_score=min_cpbd_score,
+        use_brisque_for_reject=use_brisque_for_reject,
+        use_cpbd_for_reject=use_cpbd_for_reject,
+        local_reject_required_support_votes=local_reject_required_support_votes,
+        duplicate_hamming_threshold=duplicate_hamming_threshold,
+        max_scene_candidates=max_scene_candidates,
+        cache_previews=cache_previews,
+        lightroom_auto_edit=lightroom_auto_edit,
+        lightroom_edit_scope=lightroom_edit_scope,
+        dry_run=dry_run,
+    )
+
+    with RichPipelineReporter(console) as reporter:
+        items, summary, run_dir = run_pipeline(config, reporter=reporter)
+    console.print(f"Discovered {summary.discovered} RAW file(s) under {path}")
+    if config.limit is not None:
+        console.print(f"Limit: first {config.limit} scene(s) after full-folder grouping")
+    console.print(
+        f"Backend: provider={config.backend.provider} model={config.backend.model}"
+    )
+    console.print(
+        f"Prompt: source={config.prompt_source} genre={config.genre}"
+    )
+    if config.enable_learned_iqa:
+        if learned_iqa_available():
+            console.print(
+                f"Local IQA: enabled (MUSIQ>={config.min_musiq_score}, NIMA>={config.min_nima_score})"
+            )
+        else:
+            console.print(
+                "Local IQA: unavailable, falling back to blur-only local filtering"
+                + (f" ({learned_iqa_import_error()})" if learned_iqa_import_error() else "")
+            )
+    support_errors = support_metric_import_errors()
+    if config.enable_brisque or config.enable_cpbd:
+        console.print(
+            "Support metrics: "
+            f"BRISQUE={'on' if config.enable_brisque else 'off'}"
+            f" (threshold<={config.max_brisque_score}, vote={'on' if config.use_brisque_for_reject else 'off'})"
+            ", "
+            f"CPBD={'on' if config.enable_cpbd else 'off'}"
+            f" (threshold>={config.min_cpbd_score}, vote={'on' if config.use_cpbd_for_reject else 'off'})"
+        )
+        if support_errors:
+            console.print(
+                "Support metric load errors: "
+                + ", ".join(f"{name}={error}" for name, error in sorted(support_errors.items()))
+            )
+    if config.prefer:
+        console.print(f"Preference: {config.prefer}")
+    console.print(f"Run artifacts: {run_dir}")
+    console.print(f"Dry run: {'yes' if config.dry_run else 'no'}")
+    console.print(
+        "Lightroom auto edit: "
+        + ("on" if config.lightroom_auto_edit else "off")
+        + f" (scope={config.lightroom_edit_scope.value})"
+    )
+    console.print(
+        "Local filtering complete; images that passed blur screening are ready for vision."
+    )
+
+    if items:
+        preview = Table(title="Phase 1 Summary")
+        preview.add_column("Filename")
+        preview.add_column("Scene")
+        preview.add_column("Status")
+        preview.add_column("Laplacian")
+        preview.add_column("Tenengrad")
+        preview.add_column("Rank")
+        for item in items[:10]:
+            blur_score = (
+                f"{item.metrics.blur_score:.2f}"
+                if item.metrics and item.metrics.blur_score is not None
+                else "-"
+            )
+            tenengrad_score = (
+                f"{item.metrics.tenengrad_score:.2f}"
+                if item.metrics and item.metrics.tenengrad_score is not None
+                else "-"
+            )
+            local_rank_score = (
+                f"{item.metrics.local_rank_score:.2f}"
+                if item.metrics and item.metrics.local_rank_score is not None
+                else "-"
+            )
+            preview.add_row(
+                item.asset.filename,
+                item.scene_id or "-",
+                item.status.value,
+                blur_score,
+                tenengrad_score,
+                local_rank_score,
+            )
+        console.print(preview)
+
+    stats = Table(title="Counts")
+    stats.add_column("Metric")
+    stats.add_column("Value")
+    stats.add_row("Locally rejected", str(summary.locally_rejected))
+    stats.add_row("Rejected total", str(summary.rejected_total))
+    stats.add_row("Review", str(summary.reviewed))
+    stats.add_row("Pick", str(summary.picked))
+    stats.add_row("Sent to vision", str(summary.queued_for_vision))
+    stats.add_row("Vision scored", str(summary.scored))
+    stats.add_row("Sidecars written", str(summary.sidecars_written))
+    stats.add_row(
+        "Lightroom sidecar edits written",
+        str(summary.lightroom_edits_written),
+    )
+    stats.add_row("Failed", str(summary.failed))
+    console.print(stats)
+
+
+@app.command("lightroom-edit")
+def lightroom_edit(
+    path: Path = typer.Option(..., exists=True, file_okay=False, dir_okay=True),
+    limit: int | None = typer.Option(
+        None,
+        min=1,
+        help="Only inspect the first N discovered RAW files.",
+    ),
+    dry_run: bool = typer.Option(
+        True,
+        "--dry-run/--no-dry-run",
+        help="Show what would be edited without writing sidecars.",
+    ),
+    edit_scope: LightroomEditScope = typer.Option(
+        LightroomEditScope.ALL,
+        "--lightroom-edit-scope",
+        help="Which RAW files receive Lightroom sidecar edits: all or kept.",
+    ),
+) -> None:
+    """Apply safe Lightroom sidecar edits to RAW files in a folder."""
+    assets = discover_raw_assets(path, DEFAULT_EXTENSIONS)
+    if limit is not None:
+        assets = assets[:limit]
+
+    candidates = 0
+    rejected_found = 0
+    skipped_rejected = 0
+    sidecars_written = 0
+    failed: list[tuple[str, str]] = []
+
+    for asset in assets:
+        try:
+            rejected = sidecar_is_rejected(asset.xmp_path)
+        except Exception as exc:
+            failed.append((asset.filename, f"sidecar read failed: {exc}"))
+            continue
+        if rejected:
+            rejected_found += 1
+        if edit_scope == LightroomEditScope.KEPT and rejected:
+            skipped_rejected += 1
+            continue
+
+        candidates += 1
+        if dry_run:
+            continue
+        try:
+            write_lightroom_edit_sidecar(asset.xmp_path)
+        except Exception as exc:
+            failed.append((asset.filename, f"sidecar write failed: {exc}"))
+            continue
+        sidecars_written += 1
+
+    console.print(f"Discovered {len(assets)} RAW file(s) under {path}")
+    console.print(f"Edit scope: {edit_scope.value}")
+    console.print(f"Edit candidates: {candidates}")
+    console.print(f"Rejected RAW files: {rejected_found}")
+    console.print(f"Rejected skipped: {skipped_rejected}")
+    console.print(f"Sidecars written: {sidecars_written}")
+    console.print(f"Dry run: {'yes' if dry_run else 'no'}")
+    console.print("Sidecar edit: lens corrections")
+    console.print("Adaptive Color: requires Lightroom UI/preset automation")
+
+    if failed:
+        errors = Table(title="Lightroom Edit Errors")
+        errors.add_column("Filename")
+        errors.add_column("Error")
+        for filename, error in failed[:10]:
+            errors.add_row(filename, error)
+        console.print(errors)
+        raise typer.Exit(code=1)
+
+
+@app.command("lightroom-adaptive-color")
+def lightroom_adaptive_color(
+    path: Path = typer.Option(..., exists=True, file_okay=False, dir_okay=True),
+    limit: int | None = typer.Option(
+        None,
+        min=1,
+        help="Only inspect the first N discovered RAW files.",
+    ),
+    runs_root: Path = typer.Option(
+        Path("runs"),
+        file_okay=False,
+        dir_okay=True,
+        help="Root directory for Computer Use handoff artifacts.",
+    ),
+    handoff: bool = typer.Option(
+        True,
+        "--handoff/--no-handoff",
+        help="Write a Computer Use checklist and JSON handoff artifact.",
+    ),
+    assert_complete: bool = typer.Option(
+        False,
+        "--assert-complete/--no-assert-complete",
+        help="Exit with an error when in-scope RAW files still need Adaptive Color.",
+    ),
+    edit_scope: LightroomEditScope = typer.Option(
+        LightroomEditScope.ALL,
+        "--lightroom-edit-scope",
+        help="Which RAW files should be verified/edited in Lightroom: all or kept.",
+    ),
+) -> None:
+    """Prepare and verify the Computer Use stage for Lightroom Adaptive Color."""
+    stage = build_adaptive_color_stage(
+        path,
+        DEFAULT_EXTENSIONS,
+        limit=limit,
+        edit_scope=edit_scope,
+    )
+
+    counts = Table(title="Lightroom Adaptive Color Stage")
+    counts.add_column("Metric")
+    counts.add_column("Value")
+    counts.add_row("RAW files discovered", str(stage.total))
+    counts.add_row("Edit scope", stage.edit_scope.value)
+    counts.add_row("Edit candidates", str(stage.candidates))
+    counts.add_row("Non-rejected RAW files", str(stage.non_rejected))
+    counts.add_row("Rejected RAW files", str(stage.rejected))
+    counts.add_row(
+        "Already Adaptive Color / AI payload",
+        str(stage.already_adaptive_color),
+    )
+    counts.add_row("Lightroom .acr payload files", str(len(stage.lightroom_acr_filenames)))
+    counts.add_row("Embedded DNG AI payload files", str(len(stage.embedded_dng_filenames)))
+    counts.add_row("Pending Adaptive Color", str(stage.pending_adaptive_color))
+    counts.add_row("Lens corrections enabled", str(stage.lens_corrections_enabled))
+    counts.add_row("Sidecar read errors", str(len(stage.errors)))
+    console.print(counts)
+
+    if stage.pending_adaptive_color == 0:
+        console.print("Adaptive Color stage: complete for discovered in-scope files.")
+    else:
+        console.print(
+            "Adaptive Color stage: ready for Computer Use in Adobe Lightroom."
+        )
+        console.print(
+            "Apply Adaptive Color to one seed photo, copy only the profile/treatment "
+            "edit setting, then paste to the in-scope selection."
+        )
+        pending_preview = ", ".join(stage.pending_filenames[:5])
+        if pending_preview:
+            console.print(f"Next pending: {pending_preview}")
+
+    if handoff:
+        run_dir = create_run_dir(runs_root)
+        payload_path, checklist_path = write_adaptive_color_handoff(stage, run_dir)
+        console.print(f"Run artifacts: {run_dir}")
+        console.print(f"Computer Use checklist: {checklist_path}")
+        console.print(f"Computer Use payload: {payload_path}")
+
+    if stage.errors:
+        errors = Table(title="Adaptive Color Stage Errors")
+        errors.add_column("Filename")
+        errors.add_column("Error")
+        for error in stage.errors[:10]:
+            errors.add_row(error["filename"], error["error"])
+        console.print(errors)
+        raise typer.Exit(code=1)
+
+    if assert_complete and stage.pending_adaptive_color:
+        raise typer.Exit(code=2)
+
+
+@app.command("repair-sidecars")
+def repair_sidecars(
+    run_dir: Path | None = typer.Option(
+        None,
+        exists=True,
+        file_okay=False,
+        dir_okay=True,
+        help="Run directory containing manifest.jsonl. Defaults to the latest run under ./runs.",
+    ),
+    runs_root: Path = typer.Option(
+        Path("runs"),
+        exists=True,
+        file_okay=False,
+        dir_okay=True,
+        help="Root directory containing run artifacts when --run-dir is omitted.",
+    ),
+    lightroom_auto_edit: bool = typer.Option(
+        False,
+        "--lightroom-auto-edit/--no-lightroom-auto-edit",
+        help="Also apply safe Lightroom sidecar edits to repaired sidecars.",
+    ),
+    lightroom_edit_scope: LightroomEditScope = typer.Option(
+        LightroomEditScope.ALL,
+        "--lightroom-edit-scope",
+        help="Which repaired sidecars receive Lightroom edits: all or kept.",
+    ),
+) -> None:
+    """Rewrite sidecars from an existing manifest without rerunning scoring."""
+    try:
+        target_run_dir = run_dir or find_latest_run_dir(runs_root)
+    except FileNotFoundError as exc:
+        raise typer.BadParameter(str(exc)) from exc
+    records = load_manifest_records(target_run_dir)
+
+    rewritten = 0
+    skipped = 0
+    for record in records:
+        decision = decision_from_manifest_record(record)
+        if decision is None:
+            skipped += 1
+            continue
+        xmp_path = Path(str(record["xmp_path"]))
+        write_xmp_sidecar(
+            xmp_path,
+            decision,
+            apply_lightroom_edit=lightroom_auto_edit,
+            lightroom_edit_scope=lightroom_edit_scope,
+        )
+        rewritten += 1
+
+    console.print(f"Run artifacts: {target_run_dir}")
+    console.print(f"Sidecars rewritten: {rewritten}")
+    console.print(f"Records skipped: {skipped}")
+    console.print(
+        "Lightroom auto edit: "
+        + ("on" if lightroom_auto_edit else "off")
+        + f" (scope={lightroom_edit_scope.value})"
+    )
+
+
+def _resolve_prompt_selection(
+    prompt: str | None,
+    genre: GenrePreset,
+    prefer: str | None,
+    interactive: bool,
+):
+    if prompt is not None and prompt.strip():
+        return resolve_prompt(prompt=prompt, genre=genre, prefer=prefer, source="custom")
+
+    if interactive and sys.stdin.isatty():
+        return _run_guided_setup(genre, prefer)
+
+    return resolve_prompt(prompt=None, genre=genre, prefer=prefer, source="preset")
+
+
+def _run_guided_setup(genre: GenrePreset, prefer: str | None):
+    console.print("No prompt provided. Starting guided setup.")
+    selected_genre = genre
+    if genre == GenrePreset.AUTO:
+        raw_value = typer.prompt(
+            f"Genre ({supported_genre_labels()})",
+            default=GenrePreset.MIXED.value,
+        )
+        try:
+            selected_genre = parse_genre(raw_value)
+        except ValueError as exc:
+            raise typer.BadParameter(str(exc)) from exc
+        if selected_genre == GenrePreset.AUTO:
+            selected_genre = GenrePreset.MIXED
+
+    selected_prefer = prefer
+    if selected_prefer is None:
+        selected_prefer = typer.prompt(
+            "Anything to prioritize? Press Enter to skip",
+            default="",
+            show_default=False,
+        )
+
+    return resolve_prompt(
+        prompt=None,
+        genre=selected_genre,
+        prefer=selected_prefer,
+        source="interactive",
+    )
+
+
+if __name__ == "__main__":
+    app()
