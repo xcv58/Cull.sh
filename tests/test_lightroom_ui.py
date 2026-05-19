@@ -8,8 +8,11 @@ from unittest.mock import Mock
 from unittest.mock import patch
 
 from cull_sh.config import DEFAULT_EXTENSIONS
+from cull_sh.config import JPEG_EXTENSIONS
 from cull_sh.lightroom_ui import build_adaptive_color_stage
+from cull_sh.lightroom_ui import build_jpeg_auto_stage
 from cull_sh.lightroom_ui import write_adaptive_color_handoff
+from cull_sh.lightroom_ui import write_jpeg_auto_handoff
 from cull_sh.models import ColorLabel
 from cull_sh.models import DecisionBucket
 from cull_sh.models import DecisionSource
@@ -50,6 +53,7 @@ class LightroomUiTests(unittest.TestCase):
             self.assertEqual(stage.rejected_filenames, ["b.ARW"])
             self.assertEqual(stage.adaptive_color_filenames, ["c.ARW", "e.ARW"])
             self.assertEqual(stage.lightroom_acr_filenames, ["e.ARW"])
+            self.assertEqual(stage.dng_candidate_filenames, [])
             self.assertEqual(stage.pending_filenames, ["a.ARW", "b.ARW", "d.ARW"])
 
     def test_build_adaptive_color_stage_can_scope_to_kept_files(self) -> None:
@@ -110,6 +114,32 @@ class LightroomUiTests(unittest.TestCase):
             self.assertEqual(stage.lens_corrections_enabled, 1)
             self.assertEqual(stage.lightroom_acr_filenames, [])
             self.assertEqual(stage.embedded_dng_filenames, ["drone.DNG"])
+            self.assertEqual(stage.dng_candidate_filenames, ["drone.DNG"])
+
+    def test_build_adaptive_color_stage_scopes_dng_refresh_to_kept_files(self) -> None:
+        with TemporaryDirectory() as tmp_dir:
+            root = Path(tmp_dir)
+            for filename in ("keep.DNG", "reject.DNG"):
+                (root / filename).write_bytes(b"dng")
+            write_xmp_sidecar(
+                root / "reject.xmp",
+                FinalDecision(
+                    filename="reject.DNG",
+                    rating=-1,
+                    label=ColorLabel.RED,
+                    bucket=DecisionBucket.REJECT,
+                    source=DecisionSource.LOCAL,
+                ),
+            )
+
+            stage = build_adaptive_color_stage(
+                root,
+                DEFAULT_EXTENSIONS,
+                edit_scope=LightroomEditScope.KEPT,
+            )
+
+            self.assertEqual(stage.candidates, 1)
+            self.assertEqual(stage.dng_candidate_filenames, ["keep.DNG"])
 
     def test_write_adaptive_color_handoff(self) -> None:
         with TemporaryDirectory() as tmp_dir:
@@ -132,10 +162,86 @@ class LightroomUiTests(unittest.TestCase):
             )
             self.assertEqual(payload["seed_filename"], "frame.ARW")
             self.assertEqual(payload["verification_filenames"], ["frame.ARW"])
+            self.assertEqual(payload["dng_candidate_filenames"], [])
+            self.assertFalse(payload["dng_update_ai_settings_required"])
             self.assertIn("Copy Edit Settings", payload["computer_use_instruction"])
             self.assertIn("only the profile/treatment", payload["computer_use_instruction"])
             self.assertIn("AI settings update", payload["computer_use_instruction"])
             self.assertIn("Profile dropdown", checklist)
+
+    def test_write_adaptive_color_handoff_includes_dng_update_step(self) -> None:
+        with TemporaryDirectory() as tmp_dir:
+            root = Path(tmp_dir)
+            (root / "drone.DNG").write_bytes(b"raw")
+            stage = build_adaptive_color_stage(root, DEFAULT_EXTENSIONS)
+            run_dir = root / "run"
+
+            payload_path, checklist_path = write_adaptive_color_handoff(stage, run_dir)
+
+            payload = json.loads(payload_path.read_text(encoding="utf-8"))
+            checklist = checklist_path.read_text(encoding="utf-8")
+            self.assertEqual(payload["dng_candidate_filenames"], ["drone.DNG"])
+            self.assertTrue(payload["dng_update_ai_settings_required"])
+            self.assertIn("Photo > Update AI Settings", payload["computer_use_instruction"])
+            self.assertIn("visible count is 1", payload["computer_use_instruction"])
+            self.assertIn("In-scope DNG files", checklist)
+
+    def test_build_jpeg_auto_stage_counts_candidates(self) -> None:
+        with TemporaryDirectory() as tmp_dir:
+            root = Path(tmp_dir)
+            for filename in ("a.JPG", "b.jpeg", "ignore.ARW"):
+                (root / filename).write_bytes(b"jpeg")
+
+            def rejected(path: Path) -> bool:
+                return path.name == "b.jpeg"
+
+            with patch("cull_sh.lightroom_ui.jpeg_is_rejected", side_effect=rejected):
+                stage = build_jpeg_auto_stage(root, JPEG_EXTENSIONS)
+
+            self.assertEqual(stage.total, 2)
+            self.assertEqual(stage.rejected, 1)
+            self.assertEqual(stage.non_rejected, 1)
+            self.assertEqual(stage.candidates, 2)
+            self.assertEqual(stage.rejected_filenames, ["b.jpeg"])
+            self.assertEqual(stage.candidate_filenames, ["a.JPG", "b.jpeg"])
+
+    def test_build_jpeg_auto_stage_can_scope_to_kept_files(self) -> None:
+        with TemporaryDirectory() as tmp_dir:
+            root = Path(tmp_dir)
+            for filename in ("a.JPG", "b.JPG"):
+                (root / filename).write_bytes(b"jpeg")
+
+            def rejected(path: Path) -> bool:
+                return path.name == "b.JPG"
+
+            with patch("cull_sh.lightroom_ui.jpeg_is_rejected", side_effect=rejected):
+                stage = build_jpeg_auto_stage(
+                    root,
+                    JPEG_EXTENSIONS,
+                    edit_scope=LightroomEditScope.KEPT,
+                )
+
+            self.assertEqual(stage.candidates, 1)
+            self.assertEqual(stage.candidate_filenames, ["a.JPG"])
+
+    def test_write_jpeg_auto_handoff(self) -> None:
+        with TemporaryDirectory() as tmp_dir:
+            root = Path(tmp_dir)
+            (root / "frame.JPG").write_bytes(b"jpeg")
+            with patch("cull_sh.lightroom_ui.jpeg_is_rejected", return_value=False):
+                stage = build_jpeg_auto_stage(root, JPEG_EXTENSIONS)
+            run_dir = root / "run"
+
+            payload_path, checklist_path = write_jpeg_auto_handoff(stage, run_dir)
+
+            payload = json.loads(payload_path.read_text(encoding="utf-8"))
+            checklist = checklist_path.read_text(encoding="utf-8")
+            self.assertEqual(payload["automation_mode"], "jpeg_auto_settings_batch")
+            self.assertEqual(payload["edit_candidates"], 1)
+            self.assertIn("Photo > Apply Auto Settings", payload["computer_use_instruction"])
+            self.assertIn("do not apply Adaptive Color", payload["computer_use_instruction"])
+            self.assertIn("JPEG Auto Settings", checklist)
+            self.assertIn("- Edit scope: all JPEG files", checklist)
 
 
 def _write_adaptive_color_sidecar(path: Path, ai_payload: bool) -> None:

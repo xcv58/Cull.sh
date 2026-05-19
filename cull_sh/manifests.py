@@ -39,8 +39,14 @@ def write_manifest(run_dir: Path, items: list[WorkItem]) -> Path:
         for item in items:
             payload = {
                 "filename": item.filename,
+                "asset_kind": item.asset.kind.value,
                 "raw_path": str(item.asset.raw_path),
                 "xmp_path": str(item.asset.xmp_path),
+                "paired_raw_path": (
+                    str(item.asset.paired_raw_path)
+                    if item.asset.paired_raw_path is not None
+                    else None
+                ),
                 "scene_id": item.scene_id,
                 "scene_index": item.scene_index,
                 "status": item.status.value,
@@ -153,6 +159,8 @@ def write_run_config(run_dir: Path, config: PipelineConfig) -> Path:
         "local_reject_required_support_votes": config.local_reject_required_support_votes,
         "duplicate_hamming_threshold": config.duplicate_hamming_threshold,
         "max_scene_candidates": config.max_scene_candidates,
+        "include_jpegs": config.include_jpegs,
+        "mirror_paired_jpegs": config.mirror_paired_jpegs,
         "dry_run": config.dry_run,
         "cache_previews": config.cache_previews,
         "lightroom_auto_edit": config.lightroom_auto_edit,

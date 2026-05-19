@@ -9,14 +9,18 @@ import typer
 from rich.console import Console
 from rich.table import Table
 
-from cull_sh.config import BackendConfig, DEFAULT_EXTENSIONS, PipelineConfig
+from cull_sh.config import BackendConfig, DEFAULT_EXTENSIONS, JPEG_EXTENSIONS, PipelineConfig
 from cull_sh.lightroom_ui import build_adaptive_color_stage
+from cull_sh.lightroom_ui import build_jpeg_auto_stage
 from cull_sh.lightroom_ui import write_adaptive_color_handoff
+from cull_sh.lightroom_ui import write_jpeg_auto_handoff
 from cull_sh.manifests import create_run_dir
 from cull_sh.manifests import decision_from_manifest_record
 from cull_sh.manifests import find_latest_run_dir
 from cull_sh.manifests import load_manifest_records
+from cull_sh.models import AssetKind
 from cull_sh.models import LightroomEditScope
+from cull_sh.models import RawAsset
 from cull_sh.pipeline import run_pipeline
 from cull_sh.prompting import GenrePreset
 from cull_sh.prompting import parse_genre
@@ -28,12 +32,12 @@ from cull_sh.quality import support_metric_import_errors
 from cull_sh.reporting import RichPipelineReporter
 from cull_sh.scanner import discover_raw_assets
 from cull_sh.xmp import sidecar_is_rejected
+from cull_sh.xmp import write_photo_metadata
 from cull_sh.xmp import write_lightroom_edit_sidecar
-from cull_sh.xmp import write_xmp_sidecar
 
 
 app = typer.Typer(
-    help="Cull.sh: natural-language photo culling for proprietary RAW files."
+    help="Cull.sh: natural-language photo culling for RAW and JPEG files."
 )
 console = Console()
 
@@ -147,13 +151,23 @@ def cull(
         False,
         help="Persist extracted JPEG previews under runs/<timestamp>/previews.",
     ),
+    include_jpegs: bool = typer.Option(
+        True,
+        "--include-jpegs/--raw-only",
+        help="Cull JPEG files too. Paired RAW+JPEG files mirror the RAW decision by default.",
+    ),
+    mirror_paired_jpegs: bool = typer.Option(
+        True,
+        "--mirror-paired-jpegs/--score-paired-jpegs",
+        help="Mirror cull decisions to same-stem paired JPEGs instead of scoring them separately.",
+    ),
     lightroom_auto_edit: bool = typer.Option(
         False,
         "--lightroom-auto-edit/--no-lightroom-auto-edit",
         help=(
-            "When writing sidecars, apply safe Lightroom sidecar edits. "
-            "Lens corrections are written directly; Adaptive "
-            "Color still needs Lightroom UI/preset automation."
+            "When writing RAW metadata, apply safe Lightroom sidecar edits. "
+            "Lens corrections are written directly; Adaptive Color still "
+            "needs Lightroom UI/preset automation."
         ),
     ),
     lightroom_edit_scope: LightroomEditScope = typer.Option(
@@ -166,8 +180,8 @@ def cull(
     """
     Start a culling run.
 
-    The scaffold currently performs discovery and prints a summary while the remaining
-    phases are implemented incrementally.
+    Discovers RAW and JPEG files, scores them, and writes Lightroom-compatible
+    culling metadata when dry-run mode is disabled.
     """
     prompt_selection = _resolve_prompt_selection(
         prompt=prompt,
@@ -206,6 +220,8 @@ def cull(
         duplicate_hamming_threshold=duplicate_hamming_threshold,
         max_scene_candidates=max_scene_candidates,
         cache_previews=cache_previews,
+        include_jpegs=include_jpegs,
+        mirror_paired_jpegs=mirror_paired_jpegs,
         lightroom_auto_edit=lightroom_auto_edit,
         lightroom_edit_scope=lightroom_edit_scope,
         dry_run=dry_run,
@@ -213,7 +229,15 @@ def cull(
 
     with RichPipelineReporter(console) as reporter:
         items, summary, run_dir = run_pipeline(config, reporter=reporter)
-    console.print(f"Discovered {summary.discovered} RAW file(s) under {path}")
+    console.print(f"Discovered {summary.discovered} photo file(s) under {path}")
+    console.print(
+        f"Assets: RAW={summary.raw_discovered}, JPEG={summary.jpeg_discovered}"
+        + (
+            f" ({summary.mirrored_jpegs} paired JPEG decision mirror(s))"
+            if summary.mirrored_jpegs
+            else ""
+        )
+    )
     if config.limit is not None:
         console.print(f"Limit: first {config.limit} scene(s) after full-folder grouping")
     console.print(
@@ -252,10 +276,15 @@ def cull(
     console.print(f"Run artifacts: {run_dir}")
     console.print(f"Dry run: {'yes' if config.dry_run else 'no'}")
     console.print(
-        "Lightroom auto edit: "
+        "Lightroom RAW auto edit: "
         + ("on" if config.lightroom_auto_edit else "off")
         + f" (scope={config.lightroom_edit_scope.value})"
     )
+    if summary.jpeg_discovered:
+        console.print(
+            "Lightroom JPEG auto edit: use `python main.py lightroom-jpeg-auto "
+            f"--path \"{path}\"` after culling."
+        )
     console.print(
         "Local filtering complete; images that passed blur screening are ready for vision."
     )
@@ -303,12 +332,13 @@ def cull(
     stats.add_row("Pick", str(summary.picked))
     stats.add_row("Sent to vision", str(summary.queued_for_vision))
     stats.add_row("Vision scored", str(summary.scored))
-    stats.add_row("Sidecars written", str(summary.sidecars_written))
+    stats.add_row("Metadata records written", str(summary.sidecars_written))
     stats.add_row(
         "Lightroom sidecar edits written",
         str(summary.lightroom_edits_written),
     )
     stats.add_row("Failed", str(summary.failed))
+    stats.add_row("Mirrored paired JPEGs", str(summary.mirrored_jpegs))
     console.print(stats)
 
 
@@ -384,6 +414,72 @@ def lightroom_edit(
         raise typer.Exit(code=1)
 
 
+@app.command("lightroom-jpeg-auto")
+def lightroom_jpeg_auto(
+    path: Path = typer.Option(..., exists=True, file_okay=False, dir_okay=True),
+    limit: int | None = typer.Option(
+        None,
+        min=1,
+        help="Only inspect the first N discovered JPEG files.",
+    ),
+    handoff: bool = typer.Option(
+        True,
+        "--handoff/--no-handoff",
+        help="Write a Computer Use checklist and JSON handoff artifact.",
+    ),
+    edit_scope: LightroomEditScope = typer.Option(
+        LightroomEditScope.ALL,
+        "--lightroom-edit-scope",
+        help="Which JPEG files should receive Lightroom Auto Settings: all or kept.",
+    ),
+) -> None:
+    """Prepare the Computer Use stage for Lightroom Auto Settings on JPEG files."""
+    stage = build_jpeg_auto_stage(
+        path,
+        JPEG_EXTENSIONS,
+        limit=limit,
+        edit_scope=edit_scope,
+    )
+
+    counts = Table(title="Lightroom JPEG Auto Settings Stage")
+    counts.add_column("Metric")
+    counts.add_column("Value")
+    counts.add_row("JPEG files discovered", str(stage.total))
+    counts.add_row("Edit scope", stage.edit_scope.value)
+    counts.add_row("Edit candidates", str(stage.candidates))
+    counts.add_row("Non-rejected JPEG files", str(stage.non_rejected))
+    counts.add_row("Rejected JPEG files", str(stage.rejected))
+    counts.add_row("Metadata read errors", str(len(stage.errors)))
+    console.print(counts)
+
+    if stage.candidates == 0:
+        console.print("JPEG Auto Settings stage: no in-scope JPEG files found.")
+    else:
+        console.print("JPEG Auto Settings stage: ready for Computer Use in Adobe Lightroom.")
+        console.print(
+            "Filter to JPEG files, select the in-scope JPEG set, and run "
+            "Photo > Apply Auto Settings. Do not apply Adaptive Color to JPEGs."
+        )
+        candidate_preview = ", ".join(stage.candidate_filenames[:5])
+        if candidate_preview:
+            console.print(f"Next candidates: {candidate_preview}")
+
+    if handoff:
+        run_dir = create_run_dir(Path("runs"))
+        payload_path, checklist_path = write_jpeg_auto_handoff(stage, run_dir)
+        console.print(f"Handoff JSON: {payload_path}")
+        console.print(f"Handoff checklist: {checklist_path}")
+
+    if stage.errors:
+        errors = Table(title="JPEG Auto Stage Errors")
+        errors.add_column("Filename")
+        errors.add_column("Error")
+        for error in stage.errors:
+            errors.add_row(error["filename"], error["error"])
+        console.print(errors)
+        raise typer.Exit(code=1)
+
+
 @app.command("lightroom-adaptive-color")
 def lightroom_adaptive_color(
     path: Path = typer.Option(..., exists=True, file_okay=False, dir_okay=True),
@@ -436,6 +532,10 @@ def lightroom_adaptive_color(
     )
     counts.add_row("Lightroom .acr payload files", str(len(stage.lightroom_acr_filenames)))
     counts.add_row("Embedded DNG AI payload files", str(len(stage.embedded_dng_filenames)))
+    counts.add_row(
+        "DNG AI refresh candidates",
+        str(len(stage.dng_candidate_filenames)),
+    )
     counts.add_row("Pending Adaptive Color", str(stage.pending_adaptive_color))
     counts.add_row("Lens corrections enabled", str(stage.lens_corrections_enabled))
     counts.add_row("Sidecar read errors", str(len(stage.errors)))
@@ -516,9 +616,18 @@ def repair_sidecars(
         if decision is None:
             skipped += 1
             continue
-        xmp_path = Path(str(record["xmp_path"]))
-        write_xmp_sidecar(
-            xmp_path,
+        raw_path = Path(str(record["raw_path"]))
+        asset_kind = AssetKind(str(record.get("asset_kind", AssetKind.RAW.value)))
+        xmp_path = Path(str(record.get("xmp_path", raw_path.with_suffix(".xmp"))))
+        paired_raw_path = record.get("paired_raw_path")
+        asset = RawAsset(
+            raw_path=raw_path,
+            xmp_path=xmp_path,
+            kind=asset_kind,
+            paired_raw_path=Path(str(paired_raw_path)) if paired_raw_path else None,
+        )
+        write_photo_metadata(
+            asset,
             decision,
             apply_lightroom_edit=lightroom_auto_edit,
             lightroom_edit_scope=lightroom_edit_scope,

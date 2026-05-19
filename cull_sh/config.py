@@ -17,6 +17,11 @@ DEFAULT_EXTENSIONS = (
     ".rw2",
 )
 
+JPEG_EXTENSIONS = (
+    ".jpg",
+    ".jpeg",
+)
+
 
 @dataclass(slots=True)
 class BackendConfig:
@@ -56,6 +61,9 @@ class PipelineConfig:
     duplicate_hamming_threshold: int = 6
     max_scene_candidates: int | None = None
     extensions: tuple[str, ...] = DEFAULT_EXTENSIONS
+    jpeg_extensions: tuple[str, ...] = JPEG_EXTENSIONS
+    include_jpegs: bool = True
+    mirror_paired_jpegs: bool = True
     dry_run: bool = True
     cache_previews: bool = False
     lightroom_auto_edit: bool = False
