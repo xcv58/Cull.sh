@@ -37,12 +37,18 @@ from cull_sh.ranking import sort_candidates_for_vision
 from cull_sh.ranking import suppress_duplicates_and_rerank
 from cull_sh.reporting import NullReporter
 from cull_sh.reporting import PipelineReporter
-from cull_sh.scanner import discover_raw_assets
-from cull_sh.xmp import write_xmp_sidecar
+from cull_sh.scanner import discover_photo_assets
+from cull_sh.xmp import write_photo_metadata
 
 
 def build_work_items(config: PipelineConfig) -> list[WorkItem]:
-    assets = discover_raw_assets(config.path, config.extensions)
+    assets = discover_photo_assets(
+        config.path,
+        config.extensions,
+        include_jpegs=config.include_jpegs,
+        jpeg_extensions=config.jpeg_extensions,
+        mirror_paired_jpegs=config.mirror_paired_jpegs,
+    )
     return [WorkItem(asset=asset) for asset in assets]
 
 
@@ -63,15 +69,13 @@ def run_pipeline(
     )
     items, processed_scene_count = limit_items_to_scenes(items, config.limit)
     summary = PipelineSummary(discovered=len(items))
-    reporter.message(
-        f"Run initialized: discovered {total_discovered} RAW file(s)"
-    )
+    reporter.message(f"Run initialized: discovered {total_discovered} photo file(s)")
     if scene_count:
         reporter.message(f"Grouped discovery into {scene_count} provisional scene(s).")
     if config.limit is not None:
         reporter.message(
             "Scene limit active: "
-            f"processing first {processed_scene_count} scene(s) spanning {len(items)} RAW file(s)."
+            f"processing first {processed_scene_count} scene(s) spanning {len(items)} photo file(s)."
         )
 
     if not items:
@@ -87,8 +91,18 @@ def run_pipeline(
     local_sidecars_written = persist_decisions(items, config)
     write_manifest(run_dir, items)
     if local_sidecars_written:
-        reporter.message(f"Persisted local decisions and wrote {local_sidecars_written} sidecar(s).")
+        reporter.message(
+            f"Persisted local decisions and wrote {local_sidecars_written} metadata record(s)."
+        )
     score_with_backend(items, config, run_dir, reporter)
+    mirrored_jpegs = mirror_paired_jpeg_decisions(items)
+    mirrored_metadata_written = persist_decisions(items, config)
+    if mirrored_jpegs:
+        reporter.message(f"Mirrored cull decisions to {mirrored_jpegs} paired JPEG file(s).")
+    if mirrored_metadata_written:
+        reporter.message(
+            f"Persisted mirrored JPEG decisions and wrote {mirrored_metadata_written} metadata record(s)."
+        )
     write_manifest(run_dir, items)
     summary = summarize_items(items)
     return items, summary, run_dir
@@ -105,7 +119,8 @@ def extract_previews(
     if config.cache_previews:
         preview_dir.mkdir(parents=True, exist_ok=True)
 
-    reporter.start_phase("extract", "Extracting previews", len(items))
+    extract_items = [item for item in items if not item.asset.mirrors_paired_raw]
+    reporter.start_phase("extract", "Extracting previews", len(extract_items))
     with ThreadPoolExecutor(max_workers=config.extract_workers) as executor:
         futures = {
             executor.submit(
@@ -114,7 +129,7 @@ def extract_previews(
                 extractor,
                 preview_dir if config.cache_previews else None,
             ): item
-            for item in items
+            for item in extract_items
         }
         for future in as_completed(futures):
             item = futures[future]
@@ -209,6 +224,12 @@ def score_previews(
 def summarize_items(items: list[WorkItem]) -> PipelineSummary:
     summary = PipelineSummary(discovered=len(items))
     for item in items:
+        if item.asset.is_jpeg:
+            summary.jpeg_discovered += 1
+        else:
+            summary.raw_discovered += 1
+        if item.asset.mirrors_paired_raw and item.decision is not None:
+            summary.mirrored_jpegs += 1
         if item.status == WorkStatus.REJECTED_LOCAL:
             summary.locally_rejected += 1
         elif item.status in {WorkStatus.READY_FOR_VISION, WorkStatus.SCORED}:
@@ -301,7 +322,7 @@ def score_with_backend(
         reporter.advance_phase("vision", advance=len(cohort))
         reporter.message(
             f"Persisted vision cohort {index}/{total_cohorts} for {scene_id}: "
-            f"{len(cohort)} item(s), {sidecars_written} sidecar(s) written."
+            f"{len(cohort)} item(s), {sidecars_written} metadata record(s) written."
         )
     reporter.complete_phase("vision", "Scoring with vision backend")
 
@@ -311,7 +332,10 @@ def _extract_preview(
     extractor: PreviewExtractor,
     preview_dir: Path | None,
 ) -> PreviewImage:
-    image_bytes = extractor.extract_preview_bytes(item.asset.raw_path)
+    if item.asset.is_jpeg:
+        image_bytes = item.asset.raw_path.read_bytes()
+    else:
+        image_bytes = extractor.extract_preview_bytes(item.asset.raw_path)
     cache_path = None
     if preview_dir is not None:
         cache_path = preview_dir / f"{item.asset.raw_path.stem}.jpg"
@@ -385,8 +409,8 @@ def persist_decisions(items: list[WorkItem], config: PipelineConfig) -> int:
         if item.decision is None or item.sidecar_written:
             continue
         try:
-            write_xmp_sidecar(
-                item.asset.xmp_path,
+            write_photo_metadata(
+                item.asset,
                 item.decision,
                 apply_lightroom_edit=config.lightroom_auto_edit,
                 lightroom_edit_scope=config.lightroom_edit_scope,
@@ -396,11 +420,44 @@ def persist_decisions(items: list[WorkItem], config: PipelineConfig) -> int:
             item.error = f"sidecar write failed: {exc}"
             continue
         item.sidecar_written = True
-        item.lightroom_edit_written = config.lightroom_auto_edit and (
+        item.lightroom_edit_written = (not item.asset.is_jpeg) and config.lightroom_auto_edit and (
             config.lightroom_edit_scope == LightroomEditScope.ALL or item.decision.keep
         )
         written += 1
     return written
+
+
+def mirror_paired_jpeg_decisions(items: list[WorkItem]) -> int:
+    items_by_path = {item.asset.raw_path: item for item in items}
+    mirrored = 0
+    for item in items:
+        if not item.asset.mirrors_paired_raw or item.decision is not None:
+            continue
+        paired_raw_path = item.asset.paired_raw_path
+        if paired_raw_path is None:
+            continue
+        raw_item = items_by_path.get(paired_raw_path)
+        if raw_item is None or raw_item.decision is None:
+            continue
+        item.decision = FinalDecision(
+            filename=item.filename,
+            rating=raw_item.decision.rating,
+            label=raw_item.decision.label,
+            bucket=raw_item.decision.bucket,
+            source=raw_item.decision.source,
+            summary=f"Mirrored from paired RAW {raw_item.filename}.",
+        )
+        item.status = raw_item.status
+        item.local_trace = {
+            "mirrored_from_raw": str(paired_raw_path),
+            "raw_decision": raw_item.local_trace,
+        }
+        item.vision_trace = {
+            "mirrored_from_raw": str(paired_raw_path),
+            "raw_decision": raw_item.vision_trace,
+        }
+        mirrored += 1
+    return mirrored
 
 
 def _format_metric(value: float | None) -> str:

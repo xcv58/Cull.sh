@@ -7,7 +7,7 @@ import subprocess
 
 
 class PreviewExtractionError(RuntimeError):
-    """Raised when a preview cannot be extracted from a RAW file."""
+    """Raised when a preview cannot be extracted from a photo file."""
 
 
 class PreviewExtractor(ABC):

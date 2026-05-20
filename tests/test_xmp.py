@@ -3,6 +3,8 @@ from __future__ import annotations
 from pathlib import Path
 from tempfile import TemporaryDirectory
 import unittest
+from unittest.mock import Mock
+from unittest.mock import patch
 import xml.etree.ElementTree as ET
 
 from cull_sh.models import ColorLabel
@@ -12,7 +14,9 @@ from cull_sh.models import FinalDecision
 from cull_sh.models import LightroomEditScope
 from cull_sh.xmp import CRS_NS
 from cull_sh.xmp import NAMESPACES
+from cull_sh.xmp import jpeg_is_rejected
 from cull_sh.xmp import sidecar_is_rejected
+from cull_sh.xmp import write_jpeg_metadata
 from cull_sh.xmp import write_lightroom_edit_sidecar
 from cull_sh.xmp import write_xmp_sidecar
 
@@ -345,6 +349,62 @@ class XmpSidecarTests(unittest.TestCase):
             self.assertTrue(sidecar_is_rejected(rejected_by_pick))
             self.assertFalse(sidecar_is_rejected(kept))
             self.assertFalse(sidecar_is_rejected(Path(tmp_dir) / "missing.xmp"))
+
+    def test_write_jpeg_metadata_uses_embedded_xmp_tags(self) -> None:
+        decision = FinalDecision(
+            filename="frame.JPG",
+            rating=-1,
+            label=ColorLabel.RED,
+            bucket=DecisionBucket.REJECT,
+            source=DecisionSource.LOCAL,
+        )
+        result = Mock(returncode=0, stdout="", stderr="")
+
+        with (
+            patch("cull_sh.xmp.shutil.which", return_value="/usr/bin/exiftool"),
+            patch("cull_sh.xmp.subprocess.run", return_value=result) as run,
+        ):
+            write_jpeg_metadata(Path("/tmp/frame.JPG"), decision)
+
+        command = run.call_args.args[0]
+        self.assertIn("-overwrite_original", command)
+        self.assertIn("-XMP-xmp:Rating=-1", command)
+        self.assertIn("-XMP-xmpDM:Pick=-1", command)
+        self.assertIn("-XMP-xmp:Label=Red", command)
+
+    def test_write_jpeg_metadata_clears_review_flags(self) -> None:
+        decision = FinalDecision(
+            filename="frame.JPG",
+            rating=0,
+            label=None,
+            bucket=DecisionBucket.REVIEW,
+            source=DecisionSource.VISION,
+        )
+        result = Mock(returncode=0, stdout="", stderr="")
+
+        with (
+            patch("cull_sh.xmp.shutil.which", return_value="/usr/bin/exiftool"),
+            patch("cull_sh.xmp.subprocess.run", return_value=result) as run,
+        ):
+            write_jpeg_metadata(Path("/tmp/frame.JPG"), decision)
+
+        command = run.call_args.args[0]
+        self.assertIn("-XMP-xmp:Rating=", command)
+        self.assertIn("-XMP-xmpDM:Pick=", command)
+        self.assertIn("-XMP-xmp:Label=", command)
+
+    def test_jpeg_is_rejected_reads_embedded_xmp(self) -> None:
+        result = Mock(
+            returncode=0,
+            stdout='[{"SourceFile":"/tmp/frame.JPG","Rating":-1}]',
+            stderr="",
+        )
+
+        with (
+            patch("cull_sh.xmp.shutil.which", return_value="/usr/bin/exiftool"),
+            patch("cull_sh.xmp.subprocess.run", return_value=result),
+        ):
+            self.assertTrue(jpeg_is_rejected(Path("/tmp/frame.JPG")))
 
 
 if __name__ == "__main__":

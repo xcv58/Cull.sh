@@ -37,14 +37,29 @@ class LightroomEditScope(str, Enum):
     KEPT = "kept"
 
 
+class AssetKind(str, Enum):
+    RAW = "raw"
+    JPEG = "jpeg"
+
+
 @dataclass(slots=True)
 class RawAsset:
     raw_path: Path
     xmp_path: Path
+    kind: AssetKind = AssetKind.RAW
+    paired_raw_path: Path | None = None
 
     @property
     def filename(self) -> str:
         return self.raw_path.name
+
+    @property
+    def is_jpeg(self) -> bool:
+        return self.kind == AssetKind.JPEG
+
+    @property
+    def mirrors_paired_raw(self) -> bool:
+        return self.is_jpeg and self.paired_raw_path is not None
 
 
 @dataclass(slots=True)
@@ -116,6 +131,9 @@ class WorkItem:
 @dataclass(slots=True)
 class PipelineSummary:
     discovered: int = 0
+    raw_discovered: int = 0
+    jpeg_discovered: int = 0
+    mirrored_jpegs: int = 0
     locally_rejected: int = 0
     queued_for_vision: int = 0
     scored: int = 0

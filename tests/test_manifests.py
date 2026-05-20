@@ -36,6 +36,8 @@ class ManifestTests(unittest.TestCase):
             self.assertIsNone(payload["max_scene_candidates"])
             self.assertFalse(payload["lightroom_auto_edit"])
             self.assertEqual(payload["lightroom_edit_scope"], "all")
+            self.assertTrue(payload["include_jpegs"])
+            self.assertTrue(payload["mirror_paired_jpegs"])
 
     def test_find_latest_run_dir_returns_last_directory(self) -> None:
         with TemporaryDirectory() as tmp_dir:

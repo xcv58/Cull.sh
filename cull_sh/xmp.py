@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 from pathlib import Path
+import shutil
+import subprocess
 import xml.etree.ElementTree as ET
 
 from cull_sh.models import ColorLabel
@@ -8,6 +10,7 @@ from cull_sh.models import DecisionBucket
 from cull_sh.models import DecisionSource
 from cull_sh.models import FinalDecision
 from cull_sh.models import LightroomEditScope
+from cull_sh.models import RawAsset
 
 
 ADOBE_NS = "adobe:ns:meta/"
@@ -70,6 +73,41 @@ def write_xmp_sidecar(
     tree.write(path, encoding="utf-8", xml_declaration=True)
 
 
+def write_photo_metadata(
+    asset: RawAsset,
+    decision: FinalDecision,
+    apply_lightroom_edit: bool = False,
+    lightroom_edit_scope: LightroomEditScope = LightroomEditScope.ALL,
+) -> None:
+    if asset.is_jpeg:
+        write_jpeg_metadata(asset.raw_path, decision)
+        return
+
+    write_xmp_sidecar(
+        asset.xmp_path,
+        decision,
+        apply_lightroom_edit=apply_lightroom_edit,
+        lightroom_edit_scope=lightroom_edit_scope,
+    )
+
+
+def write_jpeg_metadata(path: Path, decision: FinalDecision) -> None:
+    exiftool = shutil.which("exiftool")
+    if exiftool is None:
+        raise RuntimeError("exiftool is required to write JPEG metadata")
+
+    command = [
+        exiftool,
+        "-overwrite_original",
+        *_jpeg_decision_args(decision),
+        str(path),
+    ]
+    result = subprocess.run(command, check=False, capture_output=True, text=True)
+    if result.returncode != 0:
+        error = result.stderr.strip() or result.stdout.strip()
+        raise RuntimeError(f"exiftool failed to write JPEG metadata: {error}")
+
+
 def write_lightroom_edit_sidecar(path: Path) -> None:
     """Apply safe Lightroom sidecar edit settings without changing culling state."""
     tree = _load_or_create_tree(path)
@@ -94,6 +132,44 @@ def sidecar_is_rejected(path: Path) -> bool:
     rating = description.get(f"{{{XMP_NS}}}Rating")
     pick = description.get(f"{{{XMP_DM_NS}}}Pick")
     return rating == "-1" or pick == "-1"
+
+
+def jpeg_is_rejected(path: Path) -> bool:
+    exiftool = shutil.which("exiftool")
+    if exiftool is None:
+        raise RuntimeError("exiftool is required to read JPEG metadata")
+
+    result = subprocess.run(
+        [
+            exiftool,
+            "-j",
+            "-XMP-xmp:Rating",
+            "-XMP-xmpDM:Pick",
+            str(path),
+        ],
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+    if result.returncode != 0:
+        error = result.stderr.strip() or result.stdout.strip()
+        raise RuntimeError(f"exiftool failed to read JPEG metadata: {error}")
+
+    import json
+
+    payload = json.loads(result.stdout)
+    if not payload:
+        return False
+    metadata = payload[0]
+    return _metadata_is_negative(metadata.get("Rating")) or _metadata_is_negative(
+        metadata.get("Pick")
+    )
+
+
+def photo_is_rejected(asset: RawAsset) -> bool:
+    if asset.is_jpeg:
+        return jpeg_is_rejected(asset.raw_path)
+    return sidecar_is_rejected(asset.xmp_path)
 
 
 def sidecar_has_adaptive_color_payload(path: Path) -> bool:
@@ -162,6 +238,36 @@ def _lightroom_label(decision: FinalDecision) -> ColorLabel | None:
     if decision.source == DecisionSource.LOCAL:
         return ColorLabel.RED
     return ColorLabel.YELLOW
+
+
+def _jpeg_decision_args(decision: FinalDecision) -> list[str]:
+    label = _lightroom_label(decision)
+    if decision.bucket == DecisionBucket.REJECT:
+        return [
+            f"-XMP-xmp:Rating={decision.rating}",
+            "-XMP-xmpDM:Pick=-1",
+            "-XMP-xmpDM:good=False",
+            f"-XMP-xmp:Label={label.value if label else ''}",
+        ]
+    if decision.bucket == DecisionBucket.PICK:
+        return [
+            f"-XMP-xmp:Rating={decision.rating}",
+            "-XMP-xmpDM:Pick=1",
+            "-XMP-xmpDM:good=True",
+            f"-XMP-xmp:Label={label.value if label else ''}",
+        ]
+    return [
+        "-XMP-xmp:Rating=",
+        "-XMP-xmpDM:Pick=",
+        "-XMP-xmpDM:good=",
+        "-XMP-xmp:Label=",
+    ]
+
+
+def _metadata_is_negative(value: object) -> bool:
+    if value == -1 or value == "-1":
+        return True
+    return False
 
 
 def _load_or_create_tree(path: Path) -> ET.ElementTree:
