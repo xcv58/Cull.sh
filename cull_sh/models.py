@@ -109,6 +109,29 @@ class FinalDecision:
 
 
 @dataclass(slots=True)
+class EditSuggestion:
+    """A set of gentle global Lightroom develop adjustments for one photo."""
+
+    filename: str
+    exposure: float = 0.0  # EV, roughly -5..+5
+    contrast: int = 0  # -100..100
+    highlights: int = 0  # -100..100
+    shadows: int = 0  # -100..100
+    vibrance: int = 0  # -100..100
+    summary: str = ""
+
+    @property
+    def is_noop(self) -> bool:
+        return (
+            self.exposure == 0.0
+            and self.contrast == 0
+            and self.highlights == 0
+            and self.shadows == 0
+            and self.vibrance == 0
+        )
+
+
+@dataclass(slots=True)
 class WorkItem:
     asset: RawAsset
     status: WorkStatus = WorkStatus.PENDING

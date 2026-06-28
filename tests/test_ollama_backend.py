@@ -10,6 +10,7 @@ import httpx
 from cull_sh.backends.base import VisionBackendError
 from cull_sh.backends.ollama import OllamaVisionBackend
 from cull_sh.backends.ollama import _parse_batch_payload
+from cull_sh.backends.ollama import _parse_edit_payload
 from cull_sh.backends.ollama import _normalize_label
 from cull_sh.models import ColorLabel
 from cull_sh.models import DecisionBucket
@@ -86,6 +87,55 @@ class OllamaBackendTests(unittest.TestCase):
         self.assertIn("after 3 attempt(s)", str(context.exception))
         self.assertEqual(fake_client.post.call_count, 3)
         self.assertEqual(sleep.call_count, 2)
+
+    def test_suggest_edits_maps_adjustments_in_order(self) -> None:
+        backend = OllamaVisionBackend(
+            base_url="http://localhost:11434",
+            model="gemma4:12b",
+            timeout_seconds=300.0,
+        )
+        previews = [_build_preview("a.ARW"), _build_preview("b.ARW")]
+        response = MagicMock()
+        response.raise_for_status.return_value = None
+        response.json.return_value = {
+            "message": {
+                "content": (
+                    '{"edits":['
+                    '{"filename":"b.ARW","exposure":0.0,"contrast":0,"highlights":0,'
+                    '"shadows":0,"vibrance":0,"summary":"ok"},'
+                    '{"filename":"a.ARW","exposure":0.5,"contrast":10,"highlights":-40,'
+                    '"shadows":25,"vibrance":8,"summary":"recover sky"}]}'
+                )
+            }
+        }
+        fake_client = MagicMock()
+        fake_client.__enter__.return_value = fake_client
+        fake_client.post.return_value = response
+
+        with patch("cull_sh.backends.ollama.httpx.Client", return_value=fake_client):
+            suggestions = backend.suggest_edits("prompt", previews)
+
+        # Results are remapped back to input order by filename.
+        self.assertEqual([s.filename for s in suggestions], ["a.ARW", "b.ARW"])
+        self.assertEqual(suggestions[0].exposure, 0.5)
+        self.assertEqual(suggestions[0].highlights, -40)
+        self.assertTrue(suggestions[1].is_noop)
+
+    def test_parse_edit_payload_rejects_wrong_count(self) -> None:
+        previews = [_build_preview("a.ARW"), _build_preview("b.ARW")]
+        payload = {
+            "message": {
+                "content": (
+                    '{"edits":[{"filename":"a.ARW","exposure":0.0,"contrast":0,'
+                    '"highlights":0,"shadows":0,"vibrance":0,"summary":""}]}'
+                )
+            }
+        }
+
+        with self.assertRaises(VisionBackendError) as context:
+            _parse_edit_payload(payload, previews)
+
+        self.assertIn("one result per input image", str(context.exception))
 
     def test_parse_batch_payload_rejects_missing_filename(self) -> None:
         preview = _build_preview("frame.ARW")

@@ -50,6 +50,7 @@ This scaffold includes:
 - XMP sidecar writing with merge support for existing RAW sidecars
 - embedded JPEG culling metadata
 - optional Lightroom sidecar edits for all RAWs by default
+- AI-suggested Lightroom develop edits written as reversible XMP sidecar settings
 - architecture plan for the full app
 
 ## Current Workflow
@@ -65,6 +66,8 @@ python main.py cull --path /path/to/raws --genre event --lightroom-auto-edit --n
 python main.py lightroom-edit --path "/path/to/culled raws" --no-dry-run
 python main.py lightroom-adaptive-color --path "/path/to/culled raws"
 python main.py lightroom-jpeg-auto --path "/path/to/culled raws"
+python main.py suggest-edits --path "/path/to/culled raws"
+python main.py suggest-edits --path "/path/to/culled raws" --no-dry-run
 python main.py repair-sidecars
 python main.py repair-sidecars --run-dir runs/20260411-220756-823242
 ```
@@ -159,6 +162,26 @@ handoff that filters to JPG/JPEG files, selects the in-scope JPEG set, and runs
 python main.py lightroom-jpeg-auto --path "/path/to/culled-raws"
 python main.py lightroom-jpeg-auto --path "/path/to/culled-raws" --lightroom-edit-scope kept
 ```
+
+## AI Develop Edits
+
+`suggest-edits` asks the vision model for gentle global develop adjustments and
+writes them as standard, fully reversible Camera Raw settings into the `.xmp`
+sidecar next to each kept RAW. Rejected RAW files are skipped, and existing
+culling state in the sidecar is preserved.
+
+```bash
+python main.py suggest-edits --path "/path/to/culled-raws"            # dry run: show suggestions only
+python main.py suggest-edits --path "/path/to/culled-raws" --no-dry-run
+python main.py suggest-edits --path "/path/to/culled-raws" --prefer "warm, punchy look"
+```
+
+The model suggests a small set of global sliders — exposure, contrast,
+highlights, shadows, and vibrance — clamped to safe ranges. Suggestions are also
+recorded under `runs/<timestamp>/edit-suggestions.jsonl`. Because these are
+ordinary `crs:` settings, Lightroom shows them as normal Develop edits you can
+adjust or reset. Local/AI edits such as Adaptive Color and masking still require
+the Lightroom UI handoff stages.
 
 `--limit` now applies after whole-folder scene grouping, so `--limit 24` means
 "process the first 24 scenes" rather than "stop after 24 files".

@@ -10,12 +10,14 @@ import xml.etree.ElementTree as ET
 from cull_sh.models import ColorLabel
 from cull_sh.models import DecisionBucket
 from cull_sh.models import DecisionSource
+from cull_sh.models import EditSuggestion
 from cull_sh.models import FinalDecision
 from cull_sh.models import LightroomEditScope
 from cull_sh.xmp import CRS_NS
 from cull_sh.xmp import NAMESPACES
 from cull_sh.xmp import jpeg_is_rejected
 from cull_sh.xmp import sidecar_is_rejected
+from cull_sh.xmp import write_develop_sidecar
 from cull_sh.xmp import write_jpeg_metadata
 from cull_sh.xmp import write_lightroom_edit_sidecar
 from cull_sh.xmp import write_xmp_sidecar
@@ -166,6 +168,63 @@ class XmpSidecarTests(unittest.TestCase):
             self.assertIsNone(description.get("{http://ns.adobe.com/xap/1.0/}Label"))
             self.assertIsNone(description.get("{http://ns.adobe.com/xmp/1.0/DynamicMedia/}Pick"))
             self.assertIsNone(description.get("{http://ns.adobe.com/xmp/1.0/DynamicMedia/}good"))
+
+    def test_write_develop_sidecar_writes_camera_raw_settings(self) -> None:
+        with TemporaryDirectory() as tmp_dir:
+            target = Path(tmp_dir) / "frame.xmp"
+            suggestion = EditSuggestion(
+                filename="frame.ARW",
+                exposure=0.5,
+                contrast=10,
+                highlights=-40,
+                shadows=25,
+                vibrance=8,
+            )
+
+            write_develop_sidecar(target, suggestion)
+
+            tree = ET.parse(target)
+            description = tree.getroot().find("rdf:RDF/rdf:Description", NAMESPACES)
+            self.assertIsNotNone(description)
+            assert description is not None
+            self.assertEqual(description.get(f"{{{CRS_NS}}}Exposure2012"), "+0.50")
+            self.assertEqual(description.get(f"{{{CRS_NS}}}Contrast2012"), "10")
+            self.assertEqual(description.get(f"{{{CRS_NS}}}Highlights2012"), "-40")
+            self.assertEqual(description.get(f"{{{CRS_NS}}}Shadows2012"), "25")
+            self.assertEqual(description.get(f"{{{CRS_NS}}}Vibrance"), "8")
+            self.assertEqual(description.get(f"{{{CRS_NS}}}HasSettings"), "True")
+
+    def test_write_develop_sidecar_preserves_cull_decision(self) -> None:
+        with TemporaryDirectory() as tmp_dir:
+            target = Path(tmp_dir) / "frame.xmp"
+            write_xmp_sidecar(
+                target,
+                FinalDecision(
+                    filename="frame.ARW",
+                    rating=5,
+                    label=ColorLabel.GREEN,
+                    bucket=DecisionBucket.PICK,
+                    source=DecisionSource.VISION,
+                ),
+            )
+
+            write_develop_sidecar(
+                target,
+                EditSuggestion(filename="frame.ARW", exposure=-0.3, highlights=-30),
+            )
+
+            tree = ET.parse(target)
+            description = tree.getroot().find("rdf:RDF/rdf:Description", NAMESPACES)
+            assert description is not None
+            self.assertEqual(
+                description.get("{http://ns.adobe.com/xap/1.0/}Rating"), "5"
+            )
+            self.assertEqual(
+                description.get("{http://ns.adobe.com/xmp/1.0/DynamicMedia/}Pick"), "1"
+            )
+            self.assertEqual(description.get(f"{{{CRS_NS}}}Exposure2012"), "-0.30")
+            self.assertEqual(description.get(f"{{{CRS_NS}}}Highlights2012"), "-30")
+            self.assertFalse(sidecar_is_rejected(target))
 
     def test_write_lightroom_edit_sidecar_applies_lens_corrections(self) -> None:
         with TemporaryDirectory() as tmp_dir:

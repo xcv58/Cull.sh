@@ -1,5 +1,8 @@
 from __future__ import annotations
 
+from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import as_completed
+import json
 from pathlib import Path
 import shutil
 import sys
@@ -9,7 +12,11 @@ import typer
 from rich.console import Console
 from rich.table import Table
 
+from cull_sh.backends import build_backend
+from cull_sh.backends import VisionBackendError
 from cull_sh.config import BackendConfig, DEFAULT_EXTENSIONS, JPEG_EXTENSIONS, PipelineConfig
+from cull_sh.extractors import PreviewExtractionError
+from cull_sh.extractors import build_default_extractor
 from cull_sh.lightroom_ui import build_adaptive_color_stage
 from cull_sh.lightroom_ui import build_jpeg_auto_stage
 from cull_sh.lightroom_ui import write_adaptive_color_handoff
@@ -20,6 +27,7 @@ from cull_sh.manifests import find_latest_run_dir
 from cull_sh.manifests import load_manifest_records
 from cull_sh.models import AssetKind
 from cull_sh.models import LightroomEditScope
+from cull_sh.models import PreviewImage
 from cull_sh.models import RawAsset
 from cull_sh.pipeline import run_pipeline
 from cull_sh.prompting import GenrePreset
@@ -32,8 +40,15 @@ from cull_sh.quality import support_metric_import_errors
 from cull_sh.reporting import RichPipelineReporter
 from cull_sh.scanner import discover_raw_assets
 from cull_sh.xmp import sidecar_is_rejected
+from cull_sh.xmp import write_develop_sidecar
 from cull_sh.xmp import write_photo_metadata
 from cull_sh.xmp import write_lightroom_edit_sidecar
+
+
+DEFAULT_EDIT_PROMPT = (
+    "Suggest natural, balanced global edits that improve each photo while keeping "
+    "a realistic look."
+)
 
 
 app = typer.Typer(
@@ -96,7 +111,7 @@ def cull(
         help="Ask for genre and preferences when no prompt is provided.",
     ),
     provider: str = typer.Option("ollama", help="Vision backend provider."),
-    model: str = typer.Option("gemma4:latest", help="Vision backend model name."),
+    model: str = typer.Option("gemma4:12b", help="Vision backend model name."),
     backend_url: str = typer.Option(
         "http://localhost:11434",
         help="Base URL for the selected backend.",
@@ -575,6 +590,154 @@ def lightroom_adaptive_color(
         raise typer.Exit(code=2)
 
 
+@app.command("suggest-edits")
+def suggest_edits(
+    path: Path = typer.Option(..., exists=True, file_okay=False, dir_okay=True),
+    prompt: str | None = typer.Option(
+        None,
+        help="Editing instructions for the model. Defaults to a natural, balanced look.",
+    ),
+    prefer: str | None = typer.Option(
+        None,
+        help="Optional short preference appended to the edit prompt.",
+    ),
+    provider: str = typer.Option("ollama", help="Vision backend provider."),
+    model: str = typer.Option("gemma4:12b", help="Vision backend model name."),
+    backend_url: str = typer.Option(
+        "http://localhost:11434",
+        help="Base URL for the selected backend.",
+    ),
+    batch_size: int = typer.Option(
+        4,
+        min=1,
+        help="Maximum images per cohort sent to the model in one request.",
+    ),
+    limit: int | None = typer.Option(
+        None,
+        min=1,
+        help="Only inspect the first N discovered RAW files.",
+    ),
+    extract_workers: int = typer.Option(6, min=1),
+    dry_run: bool = typer.Option(
+        True,
+        "--dry-run/--no-dry-run",
+        help="Show suggestions without writing develop settings into sidecars.",
+    ),
+) -> None:
+    """Suggest gentle Lightroom develop edits for kept RAW files using the vision model.
+
+    Edits are written as standard, fully reversible Camera Raw settings into the
+    XMP sidecar next to each RAW. Rejected RAW files are skipped.
+    """
+    edit_prompt = (prompt or DEFAULT_EDIT_PROMPT).strip()
+    if prefer and prefer.strip():
+        edit_prompt = f"{edit_prompt} Prioritize: {prefer.strip()}."
+
+    assets = discover_raw_assets(path, DEFAULT_EXTENSIONS)
+    if limit is not None:
+        assets = assets[:limit]
+
+    kept: list[RawAsset] = []
+    skipped_rejected = 0
+    read_errors: list[tuple[str, str]] = []
+    for asset in assets:
+        try:
+            rejected = sidecar_is_rejected(asset.xmp_path)
+        except Exception as exc:
+            read_errors.append((asset.filename, f"sidecar read failed: {exc}"))
+            continue
+        if rejected:
+            skipped_rejected += 1
+            continue
+        kept.append(asset)
+
+    console.print(f"Discovered {len(assets)} RAW file(s) under {path}")
+    console.print(f"Backend: provider={provider} model={model}")
+    console.print(f"Edit candidates (kept RAW): {len(kept)}")
+    console.print(f"Rejected RAW skipped: {skipped_rejected}")
+
+    if not kept:
+        console.print("No kept RAW files to edit.")
+        if read_errors:
+            _print_error_table("Sidecar Read Errors", read_errors)
+            raise typer.Exit(code=1)
+        return
+
+    extractor = build_default_extractor()
+    previews, extract_errors = _extract_previews_for_assets(kept, extractor, extract_workers)
+    read_errors.extend(extract_errors)
+    if not previews:
+        console.print("No previews could be extracted; nothing to suggest.")
+        _print_error_table("Preview Extraction Errors", read_errors)
+        raise typer.Exit(code=1)
+
+    backend = build_backend(
+        BackendConfig(provider=provider, model=model, base_url=backend_url)
+    )
+
+    asset_by_filename = {preview.asset.filename: preview.asset for preview in previews}
+    suggestions = []
+    failed_cohorts = 0
+    for cohort in _chunked(previews, batch_size):
+        try:
+            suggestions.extend(backend.suggest_edits(edit_prompt, cohort))
+        except (VisionBackendError, ValueError) as exc:
+            failed_cohorts += 1
+            for preview in cohort:
+                read_errors.append((preview.asset.filename, f"edit suggestion failed: {exc}"))
+
+    run_dir = create_run_dir(Path("runs"))
+    _write_edit_suggestions(run_dir, edit_prompt, suggestions, dry_run)
+
+    written = 0
+    if not dry_run:
+        for suggestion in suggestions:
+            asset = asset_by_filename.get(suggestion.filename)
+            if asset is None:
+                continue
+            try:
+                write_develop_sidecar(asset.xmp_path, suggestion)
+            except Exception as exc:
+                read_errors.append((suggestion.filename, f"sidecar write failed: {exc}"))
+                continue
+            written += 1
+
+    summary = Table(title="Suggest Edits Summary")
+    summary.add_column("Metric")
+    summary.add_column("Value")
+    summary.add_row("Previews extracted", str(len(previews)))
+    summary.add_row("Suggestions returned", str(len(suggestions)))
+    summary.add_row("No-op suggestions", str(sum(1 for s in suggestions if s.is_noop)))
+    summary.add_row("Failed cohorts", str(failed_cohorts))
+    summary.add_row("Sidecars written", str(written))
+    summary.add_row("Dry run", "yes" if dry_run else "no")
+    console.print(summary)
+
+    if suggestions:
+        preview_table = Table(title="Suggested Edits (first 10)")
+        for column in ("Filename", "Exp", "Contr", "High", "Shad", "Vib", "Note"):
+            preview_table.add_column(column)
+        for suggestion in suggestions[:10]:
+            preview_table.add_row(
+                suggestion.filename,
+                f"{suggestion.exposure:+.2f}",
+                str(suggestion.contrast),
+                str(suggestion.highlights),
+                str(suggestion.shadows),
+                str(suggestion.vibrance),
+                (suggestion.summary[:40] + "…")
+                if len(suggestion.summary) > 41
+                else suggestion.summary,
+            )
+        console.print(preview_table)
+
+    console.print(f"Run artifacts: {run_dir}")
+
+    if read_errors:
+        _print_error_table("Suggest Edits Errors", read_errors)
+        raise typer.Exit(code=1)
+
+
 @app.command("repair-sidecars")
 def repair_sidecars(
     run_dir: Path | None = typer.Option(
@@ -642,6 +805,72 @@ def repair_sidecars(
         + ("on" if lightroom_auto_edit else "off")
         + f" (scope={lightroom_edit_scope.value})"
     )
+
+
+def _extract_previews_for_assets(
+    assets: list[RawAsset],
+    extractor,
+    workers: int,
+) -> tuple[list[PreviewImage], list[tuple[str, str]]]:
+    previews: list[PreviewImage] = []
+    errors: list[tuple[str, str]] = []
+    with ThreadPoolExecutor(max_workers=workers) as executor:
+        futures = {
+            executor.submit(extractor.extract_preview_bytes, asset.raw_path): asset
+            for asset in assets
+        }
+        for future in as_completed(futures):
+            asset = futures[future]
+            try:
+                image_bytes = future.result()
+            except PreviewExtractionError as exc:
+                errors.append((asset.filename, f"preview extraction failed: {exc}"))
+                continue
+            except Exception as exc:
+                errors.append((asset.filename, f"unexpected extraction error: {exc}"))
+                continue
+            previews.append(PreviewImage(asset=asset, image_bytes=image_bytes))
+    previews.sort(key=lambda preview: preview.asset.filename)
+    return previews, errors
+
+
+def _chunked(items: list, size: int):
+    for start in range(0, len(items), size):
+        yield items[start : start + size]
+
+
+def _write_edit_suggestions(run_dir: Path, prompt: str, suggestions, dry_run: bool) -> Path:
+    path = run_dir / "edit-suggestions.jsonl"
+    with path.open("w", encoding="utf-8") as handle:
+        handle.write(
+            json.dumps({"prompt": prompt, "dry_run": dry_run}, sort_keys=True) + "\n"
+        )
+        for suggestion in suggestions:
+            handle.write(
+                json.dumps(
+                    {
+                        "filename": suggestion.filename,
+                        "exposure": suggestion.exposure,
+                        "contrast": suggestion.contrast,
+                        "highlights": suggestion.highlights,
+                        "shadows": suggestion.shadows,
+                        "vibrance": suggestion.vibrance,
+                        "summary": suggestion.summary,
+                    },
+                    sort_keys=True,
+                )
+                + "\n"
+            )
+    return path
+
+
+def _print_error_table(title: str, errors: list[tuple[str, str]]) -> None:
+    table = Table(title=title)
+    table.add_column("Filename")
+    table.add_column("Error")
+    for filename, error in errors[:10]:
+        table.add_row(filename, error)
+    console.print(table)
 
 
 def _resolve_prompt_selection(

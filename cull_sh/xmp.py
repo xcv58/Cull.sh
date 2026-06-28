@@ -8,6 +8,7 @@ import xml.etree.ElementTree as ET
 from cull_sh.models import ColorLabel
 from cull_sh.models import DecisionBucket
 from cull_sh.models import DecisionSource
+from cull_sh.models import EditSuggestion
 from cull_sh.models import FinalDecision
 from cull_sh.models import LightroomEditScope
 from cull_sh.models import RawAsset
@@ -117,6 +118,39 @@ def write_lightroom_edit_sidecar(path: Path) -> None:
 
     path.parent.mkdir(parents=True, exist_ok=True)
     tree.write(path, encoding="utf-8", xml_declaration=True)
+
+
+def write_develop_sidecar(path: Path, suggestion: EditSuggestion) -> None:
+    """Write suggested global develop adjustments into an XMP sidecar.
+
+    These are standard Camera Raw settings that Lightroom reads as fully
+    reversible edits; culling state in the sidecar is left untouched.
+    """
+    tree = _load_or_create_tree(path)
+    root = tree.getroot()
+    description = _find_or_create_description(root)
+    apply_develop_settings(description, suggestion)
+
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tree.write(path, encoding="utf-8", xml_declaration=True)
+
+
+def apply_develop_settings(description: ET.Element, suggestion: EditSuggestion) -> None:
+    """Set Camera Raw develop attributes for a suggested global edit."""
+    description.set(
+        f"{{{CRS_NS}}}Version",
+        description.get(f"{{{CRS_NS}}}Version", "18.3"),
+    )
+    description.set(
+        f"{{{CRS_NS}}}ProcessVersion",
+        description.get(f"{{{CRS_NS}}}ProcessVersion", "15.4"),
+    )
+    description.set(f"{{{CRS_NS}}}Exposure2012", f"{suggestion.exposure:+.2f}")
+    description.set(f"{{{CRS_NS}}}Contrast2012", str(suggestion.contrast))
+    description.set(f"{{{CRS_NS}}}Highlights2012", str(suggestion.highlights))
+    description.set(f"{{{CRS_NS}}}Shadows2012", str(suggestion.shadows))
+    description.set(f"{{{CRS_NS}}}Vibrance", str(suggestion.vibrance))
+    description.set(f"{{{CRS_NS}}}HasSettings", "True")
 
 
 def sidecar_is_rejected(path: Path) -> bool:

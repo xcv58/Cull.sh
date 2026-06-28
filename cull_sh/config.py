@@ -26,7 +26,7 @@ JPEG_EXTENSIONS = (
 @dataclass(slots=True)
 class BackendConfig:
     provider: str = "ollama"
-    model: str = "gemma4:latest"
+    model: str = "gemma4:12b"
     base_url: str = "http://localhost:11434"
     timeout_seconds: float = 300.0
 

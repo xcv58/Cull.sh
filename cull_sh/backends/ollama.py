@@ -3,7 +3,9 @@ from __future__ import annotations
 import base64
 import json
 import time
+from typing import Callable
 from typing import Literal
+from typing import TypeVar
 
 import httpx
 from pydantic import BaseModel
@@ -15,7 +17,11 @@ from cull_sh.backends.base import VisionBackendError
 from cull_sh.models import ColorLabel
 from cull_sh.models import DecisionBucket
 from cull_sh.models import DecisionSource
+from cull_sh.models import EditSuggestion
 from cull_sh.models import FinalDecision, PreviewImage
+
+
+T = TypeVar("T")
 
 
 class OllamaDecisionPayload(BaseModel):
@@ -28,6 +34,20 @@ class OllamaDecisionPayload(BaseModel):
 
 class OllamaBatchDecisionPayload(BaseModel):
     decisions: list[OllamaDecisionPayload]
+
+
+class OllamaEditPayload(BaseModel):
+    filename: str
+    exposure: float = Field(ge=-5.0, le=5.0, default=0.0)
+    contrast: int = Field(ge=-100, le=100, default=0)
+    highlights: int = Field(ge=-100, le=100, default=0)
+    shadows: int = Field(ge=-100, le=100, default=0)
+    vibrance: int = Field(ge=-100, le=100, default=0)
+    summary: str = ""
+
+
+class OllamaBatchEditPayload(BaseModel):
+    edits: list[OllamaEditPayload]
 
 
 class OllamaVisionBackend(VisionBackend):
@@ -145,6 +165,105 @@ class OllamaVisionBackend(VisionBackend):
             "options": {"temperature": 0},
         }
 
+        return self._chat_structured(
+            client,
+            request_payload,
+            lambda payload: _parse_batch_payload(payload, previews),
+        )
+
+    def suggest_edits(
+        self,
+        prompt: str,
+        previews: list[PreviewImage],
+    ) -> list[EditSuggestion]:
+        with httpx.Client(timeout=self.timeout_seconds) as client:
+            parsed_batch = self._suggest_cohort(client, prompt, previews)
+
+        returned_by_filename = {edit.filename: edit for edit in parsed_batch.edits}
+        suggestions: list[EditSuggestion] = []
+        for preview in previews:
+            try:
+                parsed = returned_by_filename[preview.asset.filename]
+            except KeyError as exc:
+                raise VisionBackendError(
+                    f"ollama edit response omitted filename: {preview.asset.filename}"
+                ) from exc
+
+            suggestions.append(
+                EditSuggestion(
+                    filename=preview.asset.filename,
+                    exposure=parsed.exposure,
+                    contrast=parsed.contrast,
+                    highlights=parsed.highlights,
+                    shadows=parsed.shadows,
+                    vibrance=parsed.vibrance,
+                    summary=parsed.summary.strip(),
+                )
+            )
+        return suggestions
+
+    def _suggest_cohort(
+        self,
+        client: httpx.Client,
+        prompt: str,
+        previews: list[PreviewImage],
+    ) -> OllamaBatchEditPayload:
+        cohort_lines = []
+        encoded_images = []
+        for index, preview in enumerate(previews, start=1):
+            cohort_lines.append(f"Image {index}: {preview.asset.filename}")
+            encoded_images.append(base64.b64encode(preview.image_bytes).decode("ascii"))
+
+        request_payload = {
+            "model": self.model,
+            "messages": [
+                {
+                    "role": "system",
+                    "content": (
+                        "You are a photo editing assistant for Adobe Lightroom. "
+                        "Suggest gentle, natural global develop adjustments for each image. "
+                        "Return only valid JSON that matches the provided schema. "
+                        "Use the provided filenames exactly and return one result per image. "
+                        "Judge each image on its own merits."
+                    ),
+                },
+                {
+                    "role": "user",
+                    "content": (
+                        "Photos to edit:\n"
+                        + "\n".join(cohort_lines)
+                        + "\n\n"
+                        + f"User instructions: {prompt}\n"
+                        + "Adjustment ranges:\n"
+                        + "- exposure: stops, about -5.0 to 5.0, usually -1.0 to 1.0\n"
+                        + "- contrast, highlights, shadows, vibrance: -100 to 100\n"
+                        + "Editing guidance:\n"
+                        + "- Recover blown skies with negative highlights; open dark areas with positive shadows.\n"
+                        + "- Lift or lower exposure only when the image is clearly under- or over-exposed.\n"
+                        + "- Keep edits subtle and realistic unless the user asks for a stronger look.\n"
+                        + "- Use 0 for any adjustment that does not need to change.\n"
+                        + "Return one set of adjustments per image."
+                    ),
+                    "images": encoded_images,
+                },
+            ],
+            "format": OllamaBatchEditPayload.model_json_schema(),
+            "stream": False,
+            "options": {"temperature": 0},
+        }
+
+        return self._chat_structured(
+            client,
+            request_payload,
+            lambda payload: _parse_edit_payload(payload, previews),
+        )
+
+    def _chat_structured(
+        self,
+        client: httpx.Client,
+        request_payload: dict[str, object],
+        parse_fn: Callable[[dict[str, object]], T],
+    ) -> T:
         last_error: str | None = None
         for attempt in range(1, self.max_attempts + 1):
             try:
@@ -153,7 +272,7 @@ class OllamaVisionBackend(VisionBackend):
                     json=request_payload,
                 )
                 response.raise_for_status()
-            except httpx.TimeoutException as exc:  # pragma: no cover - network/service dependent
+            except httpx.TimeoutException:  # pragma: no cover - network/service dependent
                 last_error = (
                     f"ollama request timed out after {self.timeout_seconds:.0f}s"
                 )
@@ -168,7 +287,7 @@ class OllamaVisionBackend(VisionBackend):
             else:
                 try:
                     payload = response.json()
-                    return _parse_batch_payload(payload, previews)
+                    return parse_fn(payload)
                 except VisionBackendError as exc:
                     last_error = str(exc)
 
@@ -227,6 +346,36 @@ def _parse_batch_payload(
     if set(returned_filenames) != expected_filenames:
         raise VisionBackendError(
             "ollama cohort response did not include the expected filenames"
+        )
+
+    return parsed
+
+
+def _parse_edit_payload(
+    payload: dict[str, object],
+    previews: list[PreviewImage],
+) -> OllamaBatchEditPayload:
+    content = payload.get("message", {}).get("content")
+    if not content:
+        raise VisionBackendError("ollama response did not include message content")
+
+    try:
+        parsed = OllamaBatchEditPayload.model_validate(json.loads(content))
+    except (json.JSONDecodeError, ValidationError) as exc:
+        raise VisionBackendError(
+            f"ollama returned invalid structured output: {exc}"
+        ) from exc
+
+    if len(parsed.edits) != len(previews):
+        raise VisionBackendError(
+            "ollama edit response did not include one result per input image"
+        )
+
+    expected_filenames = {preview.asset.filename for preview in previews}
+    returned_filenames = [edit.filename for edit in parsed.edits]
+    if set(returned_filenames) != expected_filenames:
+        raise VisionBackendError(
+            "ollama edit response did not include the expected filenames"
         )
 
     return parsed
