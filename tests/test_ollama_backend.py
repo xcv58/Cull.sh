@@ -41,7 +41,7 @@ class OllamaBackendTests(unittest.TestCase):
         success_response.json.return_value = {
             "message": {
                 "content": (
-                    '{"decisions":[{"filename":"frame.ARW","bucket":"review",'
+                    '{"decisions":[{"id":"/tmp/frame.ARW","filename":"frame.ARW","bucket":"review",'
                     '"rating":0,"label":null,"summary":""}]}'
                 )
             }
@@ -101,9 +101,9 @@ class OllamaBackendTests(unittest.TestCase):
             "message": {
                 "content": (
                     '{"edits":['
-                    '{"filename":"b.ARW","exposure":0.0,"contrast":0,"highlights":0,'
+                    '{"id":"/tmp/b.ARW","filename":"b.ARW","exposure":0.0,"contrast":0,"highlights":0,'
                     '"shadows":0,"vibrance":0,"summary":"ok"},'
-                    '{"filename":"a.ARW","exposure":0.5,"contrast":10,"highlights":-40,'
+                    '{"id":"/tmp/a.ARW","filename":"a.ARW","exposure":0.5,"contrast":10,"highlights":-40,'
                     '"shadows":25,"vibrance":8,"summary":"recover sky"}]}'
                 )
             }
@@ -126,8 +126,9 @@ class OllamaBackendTests(unittest.TestCase):
         payload = {
             "message": {
                 "content": (
-                    '{"edits":[{"filename":"a.ARW","exposure":0.0,"contrast":0,'
-                    '"highlights":0,"shadows":0,"vibrance":0,"summary":""}]}'
+                    '{"edits":[{"id":"/tmp/a.ARW","filename":"a.ARW","exposure":0.0,"contrast":0,'
+                    '"highlights":0,"shadows":0,"vibrance":0,'
+                    '"summary":"No global adjustment needed."}]}'
                 )
             }
         }
@@ -142,7 +143,7 @@ class OllamaBackendTests(unittest.TestCase):
         payload = {
             "message": {
                 "content": (
-                    '{"decisions":[{"filename":"other.ARW","bucket":"review",'
+                    '{"decisions":[{"id":"/tmp/frame.ARW","filename":"other.ARW","bucket":"review",'
                     '"rating":0,"label":null,"summary":""}]}'
                 )
             }
@@ -153,12 +154,108 @@ class OllamaBackendTests(unittest.TestCase):
 
         self.assertIn("expected filenames", str(context.exception))
 
+    def test_parse_edit_payload_recovers_first_json_object(self) -> None:
+        preview = _build_preview("frame.ARW")
+        payload = {
+            "message": {
+                "content": (
+                    "```json\n"
+                    '{"edits":[{"id":"/tmp/frame.ARW","filename":"frame.ARW",'
+                    '"exposure":0.1,"contrast":4,"highlights":-10,'
+                    '"shadows":5,"vibrance":3,"summary":"Slightly dark foreground."}]}'
+                    "\n```\nextra text"
+                )
+            }
+        }
+
+        parsed = _parse_edit_payload(payload, [preview])
+
+        self.assertEqual(parsed.edits[0].summary, "Slightly dark foreground.")
+        self.assertEqual(parsed.edits[0].exposure, 0.1)
+
+    def test_parse_edit_payload_rejects_missing_required_slider(self) -> None:
+        preview = _build_preview("frame.ARW")
+        payload = {
+            "message": {
+                "content": (
+                    '{"edits":[{"id":"/tmp/frame.ARW","filename":"frame.ARW",'
+                    '"contrast":4,"highlights":-10,"shadows":5,'
+                    '"vibrance":3,"summary":"Slightly dark foreground."}]}'
+                )
+            }
+        }
+
+        with self.assertRaises(VisionBackendError) as context:
+            _parse_edit_payload(payload, [preview])
+
+        self.assertIn("invalid structured output", str(context.exception))
+
+    def test_parse_edit_payload_rejects_blank_summary(self) -> None:
+        preview = _build_preview("frame.ARW")
+        payload = {
+            "message": {
+                "content": (
+                    '{"edits":[{"id":"/tmp/frame.ARW","filename":"frame.ARW",'
+                    '"exposure":0.1,"contrast":4,"highlights":-10,'
+                    '"shadows":5,"vibrance":3,"summary":"   "}]}'
+                )
+            }
+        }
+
+        with self.assertRaises(VisionBackendError) as context:
+            _parse_edit_payload(payload, [preview])
+
+        self.assertIn("invalid structured output", str(context.exception))
+
+    def test_suggest_edits_uses_ids_for_duplicate_filenames(self) -> None:
+        backend = OllamaVisionBackend(
+            base_url="http://localhost:11434",
+            model="gemma4:12b",
+            timeout_seconds=300.0,
+        )
+        previews = [
+            _build_preview_from_path("/tmp/a/frame.ARW"),
+            _build_preview_from_path("/tmp/b/frame.ARW"),
+        ]
+        response = MagicMock()
+        response.raise_for_status.return_value = None
+        response.json.return_value = {
+            "message": {
+                "content": (
+                    '{"edits":['
+                    '{"id":"/tmp/b/frame.ARW","filename":"frame.ARW",'
+                    '"exposure":-0.2,"contrast":1,"highlights":-5,'
+                    '"shadows":2,"vibrance":1,"summary":"Bright upper frame."},'
+                    '{"id":"/tmp/a/frame.ARW","filename":"frame.ARW",'
+                    '"exposure":0.3,"contrast":8,"highlights":-20,'
+                    '"shadows":10,"vibrance":5,"summary":"Dark lower frame."}]}'
+                )
+            }
+        }
+        fake_client = MagicMock()
+        fake_client.__enter__.return_value = fake_client
+        fake_client.post.return_value = response
+
+        with patch("cull_sh.backends.ollama.httpx.Client", return_value=fake_client):
+            suggestions = backend.suggest_edits("prompt", previews)
+
+        self.assertEqual(
+            [suggestion.asset_id for suggestion in suggestions],
+            ["/tmp/a/frame.ARW", "/tmp/b/frame.ARW"],
+        )
+        self.assertEqual([suggestion.exposure for suggestion in suggestions], [0.3, -0.2])
+
 
 def _build_preview(filename: str) -> PreviewImage:
+    return _build_preview_from_path(f"/tmp/{filename}")
+
+
+def _build_preview_from_path(raw_path: str) -> PreviewImage:
+    path = Path(raw_path)
     return PreviewImage(
         asset=RawAsset(
-            raw_path=Path(f"/tmp/{filename}"),
-            xmp_path=Path(f"/tmp/{Path(filename).stem}.xmp"),
+            raw_path=path,
+            xmp_path=path.with_suffix(".xmp"),
         ),
         image_bytes=b"jpeg-bytes",
     )

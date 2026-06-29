@@ -26,6 +26,7 @@ from cull_sh.manifests import decision_from_manifest_record
 from cull_sh.manifests import find_latest_run_dir
 from cull_sh.manifests import load_manifest_records
 from cull_sh.models import AssetKind
+from cull_sh.models import EditSuggestion
 from cull_sh.models import LightroomEditScope
 from cull_sh.models import PreviewImage
 from cull_sh.models import RawAsset
@@ -623,11 +624,17 @@ def suggest_edits(
         "--dry-run/--no-dry-run",
         help="Show suggestions without writing develop settings into sidecars.",
     ),
+    include_unculled: bool = typer.Option(
+        False,
+        "--include-unculled/--skip-unculled",
+        help="Also suggest edits for RAW files with no existing XMP sidecar.",
+    ),
 ) -> None:
-    """Suggest gentle Lightroom develop edits for kept RAW files using the vision model.
+    """Suggest gentle Lightroom develop edits for culled, non-rejected RAW files.
 
     Edits are written as standard, fully reversible Camera Raw settings into the
-    XMP sidecar next to each RAW. Rejected RAW files are skipped.
+    XMP sidecar next to each RAW. Rejected and unculled RAW files are skipped
+    unless --include-unculled is passed.
     """
     edit_prompt = (prompt or DEFAULT_EDIT_PROMPT).strip()
     if prefer and prefer.strip():
@@ -639,8 +646,12 @@ def suggest_edits(
 
     kept: list[RawAsset] = []
     skipped_rejected = 0
+    skipped_unculled = 0
     read_errors: list[tuple[str, str]] = []
     for asset in assets:
+        if not asset.xmp_path.exists() and not include_unculled:
+            skipped_unculled += 1
+            continue
         try:
             rejected = sidecar_is_rejected(asset.xmp_path)
         except Exception as exc:
@@ -653,11 +664,12 @@ def suggest_edits(
 
     console.print(f"Discovered {len(assets)} RAW file(s) under {path}")
     console.print(f"Backend: provider={provider} model={model}")
-    console.print(f"Edit candidates (kept RAW): {len(kept)}")
+    console.print(f"Edit candidates (culled non-rejected RAW): {len(kept)}")
     console.print(f"Rejected RAW skipped: {skipped_rejected}")
+    console.print(f"Unculled RAW skipped: {skipped_unculled}")
 
     if not kept:
-        console.print("No kept RAW files to edit.")
+        console.print("No culled non-rejected RAW files to edit.")
         if read_errors:
             _print_error_table("Sidecar Read Errors", read_errors)
             raise typer.Exit(code=1)
@@ -671,30 +683,44 @@ def suggest_edits(
         _print_error_table("Preview Extraction Errors", read_errors)
         raise typer.Exit(code=1)
 
-    backend = build_backend(
-        BackendConfig(provider=provider, model=model, base_url=backend_url)
-    )
+    try:
+        backend = build_backend(
+            BackendConfig(provider=provider, model=model, base_url=backend_url)
+        )
+    except ValueError as exc:
+        raise typer.BadParameter(str(exc)) from exc
 
-    asset_by_filename = {preview.asset.filename: preview.asset for preview in previews}
-    suggestions = []
+    suggestions: list[tuple[RawAsset, EditSuggestion]] = []
     failed_cohorts = 0
     for cohort in _chunked(previews, batch_size):
         try:
-            suggestions.extend(backend.suggest_edits(edit_prompt, cohort))
+            cohort_suggestions = backend.suggest_edits(edit_prompt, cohort)
         except (VisionBackendError, ValueError) as exc:
             failed_cohorts += 1
             for preview in cohort:
                 read_errors.append((preview.asset.filename, f"edit suggestion failed: {exc}"))
+            continue
+        if len(cohort_suggestions) != len(cohort):
+            failed_cohorts += 1
+            for preview in cohort:
+                read_errors.append(
+                    (
+                        preview.asset.filename,
+                        "edit suggestion failed: backend returned an unexpected number of results",
+                    )
+                )
+            continue
+        suggestions.extend(
+            (preview.asset, suggestion)
+            for preview, suggestion in zip(cohort, cohort_suggestions)
+        )
 
     run_dir = create_run_dir(Path("runs"))
     _write_edit_suggestions(run_dir, edit_prompt, suggestions, dry_run)
 
     written = 0
     if not dry_run:
-        for suggestion in suggestions:
-            asset = asset_by_filename.get(suggestion.filename)
-            if asset is None:
-                continue
+        for asset, suggestion in suggestions:
             try:
                 write_develop_sidecar(asset.xmp_path, suggestion)
             except Exception as exc:
@@ -707,7 +733,10 @@ def suggest_edits(
     summary.add_column("Value")
     summary.add_row("Previews extracted", str(len(previews)))
     summary.add_row("Suggestions returned", str(len(suggestions)))
-    summary.add_row("No-op suggestions", str(sum(1 for s in suggestions if s.is_noop)))
+    summary.add_row(
+        "No-op suggestions",
+        str(sum(1 for _, suggestion in suggestions if suggestion.is_noop)),
+    )
     summary.add_row("Failed cohorts", str(failed_cohorts))
     summary.add_row("Sidecars written", str(written))
     summary.add_row("Dry run", "yes" if dry_run else "no")
@@ -717,7 +746,7 @@ def suggest_edits(
         preview_table = Table(title="Suggested Edits (first 10)")
         for column in ("Filename", "Exp", "Contr", "High", "Shad", "Vib", "Note"):
             preview_table.add_column(column)
-        for suggestion in suggestions[:10]:
+        for _, suggestion in suggestions[:10]:
             preview_table.add_row(
                 suggestion.filename,
                 f"{suggestion.exposure:+.2f}",
@@ -839,17 +868,25 @@ def _chunked(items: list, size: int):
         yield items[start : start + size]
 
 
-def _write_edit_suggestions(run_dir: Path, prompt: str, suggestions, dry_run: bool) -> Path:
+def _write_edit_suggestions(
+    run_dir: Path,
+    prompt: str,
+    suggestions: list[tuple[RawAsset, EditSuggestion]],
+    dry_run: bool,
+) -> Path:
     path = run_dir / "edit-suggestions.jsonl"
     with path.open("w", encoding="utf-8") as handle:
         handle.write(
             json.dumps({"prompt": prompt, "dry_run": dry_run}, sort_keys=True) + "\n"
         )
-        for suggestion in suggestions:
+        for asset, suggestion in suggestions:
             handle.write(
                 json.dumps(
                     {
+                        "asset_id": suggestion.asset_id or asset.raw_path.as_posix(),
                         "filename": suggestion.filename,
+                        "raw_path": str(asset.raw_path),
+                        "xmp_path": str(asset.xmp_path),
                         "exposure": suggestion.exposure,
                         "contrast": suggestion.contrast,
                         "highlights": suggestion.highlights,

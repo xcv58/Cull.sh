@@ -113,6 +113,7 @@ class EditSuggestion:
     """A set of gentle global Lightroom develop adjustments for one photo."""
 
     filename: str
+    asset_id: str = ""
     exposure: float = 0.0  # EV, roughly -5..+5
     contrast: int = 0  # -100..100
     highlights: int = 0  # -100..100

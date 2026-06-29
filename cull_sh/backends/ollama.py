@@ -11,6 +11,7 @@ import httpx
 from pydantic import BaseModel
 from pydantic import Field
 from pydantic import ValidationError
+from pydantic import field_validator
 
 from cull_sh.backends.base import VisionBackend
 from cull_sh.backends.base import VisionBackendError
@@ -25,11 +26,20 @@ T = TypeVar("T")
 
 
 class OllamaDecisionPayload(BaseModel):
+    id: str = Field(min_length=1)
     filename: str
     bucket: Literal["reject", "review", "pick"]
     rating: int = Field(ge=0, le=5)
     label: str | None = None
     summary: str = ""
+
+    @field_validator("id", "filename")
+    @classmethod
+    def _strip_required_text(cls, value: str) -> str:
+        value = value.strip()
+        if not value:
+            raise ValueError("must not be blank")
+        return value
 
 
 class OllamaBatchDecisionPayload(BaseModel):
@@ -37,13 +47,22 @@ class OllamaBatchDecisionPayload(BaseModel):
 
 
 class OllamaEditPayload(BaseModel):
-    filename: str
-    exposure: float = Field(ge=-5.0, le=5.0, default=0.0)
-    contrast: int = Field(ge=-100, le=100, default=0)
-    highlights: int = Field(ge=-100, le=100, default=0)
-    shadows: int = Field(ge=-100, le=100, default=0)
-    vibrance: int = Field(ge=-100, le=100, default=0)
-    summary: str = ""
+    id: str = Field(min_length=1)
+    filename: str = Field(min_length=1)
+    exposure: float = Field(ge=-5.0, le=5.0)
+    contrast: int = Field(ge=-100, le=100)
+    highlights: int = Field(ge=-100, le=100)
+    shadows: int = Field(ge=-100, le=100)
+    vibrance: int = Field(ge=-100, le=100)
+    summary: str = Field(min_length=1)
+
+    @field_validator("id", "filename", "summary")
+    @classmethod
+    def _strip_required_text(cls, value: str) -> str:
+        value = value.strip()
+        if not value:
+            raise ValueError("must not be blank")
+        return value
 
 
 class OllamaBatchEditPayload(BaseModel):
@@ -80,14 +99,14 @@ class OllamaVisionBackend(VisionBackend):
         with httpx.Client(timeout=self.timeout_seconds) as client:
             parsed_batch = self._score_cohort(client, prompt, previews)
 
-        returned_by_filename = {decision.filename: decision for decision in parsed_batch.decisions}
+        returned_by_id = {decision.id: decision for decision in parsed_batch.decisions}
         decisions: list[FinalDecision] = []
         for preview in previews:
             try:
-                parsed = returned_by_filename[preview.asset.filename]
+                parsed = returned_by_id[_preview_id(preview)]
             except KeyError as exc:
                 raise VisionBackendError(
-                    f"ollama cohort response omitted filename: {preview.asset.filename}"
+                    f"ollama cohort response omitted image id: {_preview_id(preview)}"
                 ) from exc
 
             label = _normalize_label(parsed.label)
@@ -116,10 +135,16 @@ class OllamaVisionBackend(VisionBackend):
         prompt: str,
         previews: list[PreviewImage],
     ) -> OllamaBatchDecisionPayload:
-        cohort_lines = []
+        image_specs = []
         encoded_images = []
         for index, preview in enumerate(previews, start=1):
-            cohort_lines.append(f"Image {index}: {preview.asset.filename}")
+            image_specs.append(
+                {
+                    "index": index,
+                    "id": _preview_id(preview),
+                    "filename": preview.asset.filename,
+                }
+            )
             encoded_images.append(base64.b64encode(preview.image_bytes).decode("ascii"))
 
         request_payload = {
@@ -130,8 +155,9 @@ class OllamaVisionBackend(VisionBackend):
                     "content": (
                         "You are a photography culling assistant. "
                         "Evaluate this same-scene cohort together. "
-                        "Return only valid JSON that matches the provided schema. "
-                        "Use the provided filenames exactly and return one result per image. "
+                        "Return only one valid JSON object that matches the provided schema. "
+                        "Do not use markdown or add commentary. "
+                        "Use the provided ids and filenames exactly and return one result per image. "
                         "Compare the images relative to each other before deciding. "
                         "Use triage, not binary culling: reject, review, or pick."
                     ),
@@ -140,7 +166,7 @@ class OllamaVisionBackend(VisionBackend):
                     "role": "user",
                     "content": (
                         "Scene cohort:\n"
-                        + "\n".join(cohort_lines)
+                        + json.dumps(image_specs, ensure_ascii=False, indent=2)
                         + "\n\n"
                         + f"User instructions: {prompt}\n"
                         + "Decision policy:\n"
@@ -179,19 +205,20 @@ class OllamaVisionBackend(VisionBackend):
         with httpx.Client(timeout=self.timeout_seconds) as client:
             parsed_batch = self._suggest_cohort(client, prompt, previews)
 
-        returned_by_filename = {edit.filename: edit for edit in parsed_batch.edits}
+        returned_by_id = {edit.id: edit for edit in parsed_batch.edits}
         suggestions: list[EditSuggestion] = []
         for preview in previews:
             try:
-                parsed = returned_by_filename[preview.asset.filename]
+                parsed = returned_by_id[_preview_id(preview)]
             except KeyError as exc:
                 raise VisionBackendError(
-                    f"ollama edit response omitted filename: {preview.asset.filename}"
+                    f"ollama edit response omitted image id: {_preview_id(preview)}"
                 ) from exc
 
             suggestions.append(
                 EditSuggestion(
                     filename=preview.asset.filename,
+                    asset_id=parsed.id,
                     exposure=parsed.exposure,
                     contrast=parsed.contrast,
                     highlights=parsed.highlights,
@@ -208,10 +235,16 @@ class OllamaVisionBackend(VisionBackend):
         prompt: str,
         previews: list[PreviewImage],
     ) -> OllamaBatchEditPayload:
-        cohort_lines = []
+        image_specs = []
         encoded_images = []
         for index, preview in enumerate(previews, start=1):
-            cohort_lines.append(f"Image {index}: {preview.asset.filename}")
+            image_specs.append(
+                {
+                    "index": index,
+                    "id": _preview_id(preview),
+                    "filename": preview.asset.filename,
+                }
+            )
             encoded_images.append(base64.b64encode(preview.image_bytes).decode("ascii"))
 
         request_payload = {
@@ -221,9 +254,10 @@ class OllamaVisionBackend(VisionBackend):
                     "role": "system",
                     "content": (
                         "You are a photo editing assistant for Adobe Lightroom. "
-                        "Suggest gentle, natural global develop adjustments for each image. "
-                        "Return only valid JSON that matches the provided schema. "
-                        "Use the provided filenames exactly and return one result per image. "
+                        "Suggest subtle, image-specific global Develop adjustments. "
+                        "Return only one valid JSON object that matches the provided schema. "
+                        "Do not use markdown or add commentary. "
+                        "Use the provided ids and filenames exactly and return one result per image. "
                         "Judge each image on its own merits."
                     ),
                 },
@@ -231,17 +265,22 @@ class OllamaVisionBackend(VisionBackend):
                     "role": "user",
                     "content": (
                         "Photos to edit:\n"
-                        + "\n".join(cohort_lines)
+                        + json.dumps(image_specs, ensure_ascii=False, indent=2)
                         + "\n\n"
                         + f"User instructions: {prompt}\n"
                         + "Adjustment ranges:\n"
                         + "- exposure: stops, about -5.0 to 5.0, usually -1.0 to 1.0\n"
                         + "- contrast, highlights, shadows, vibrance: -100 to 100\n"
                         + "Editing guidance:\n"
+                        + "- Fill every required field for every image.\n"
+                        + "- The summary must be one short sentence naming the observed image issue, "
+                        + "or \"No global adjustment needed.\" Never leave it empty.\n"
+                        + "- Inspect exposure, highlight detail, shadow detail, contrast, and color intensity separately.\n"
                         + "- Recover blown skies with negative highlights; open dark areas with positive shadows.\n"
                         + "- Lift or lower exposure only when the image is clearly under- or over-exposed.\n"
                         + "- Keep edits subtle and realistic unless the user asks for a stronger look.\n"
-                        + "- Use 0 for any adjustment that does not need to change.\n"
+                        + "- Use 0 only when that slider already looks correct for that specific image.\n"
+                        + "- Do not copy identical slider values across images unless the summaries explain the same observed issue.\n"
                         + "Return one set of adjustments per image."
                     ),
                     "images": encoded_images,
@@ -321,17 +360,54 @@ def _normalize_label(value: str | None) -> ColorLabel | None:
         raise VisionBackendError(f"unsupported color label from ollama: {value}") from exc
 
 
+def _preview_id(preview: PreviewImage) -> str:
+    return preview.asset.raw_path.as_posix()
+
+
+def _message_content(payload: dict[str, object]) -> str:
+    message = payload.get("message")
+    if not isinstance(message, dict):
+        raise VisionBackendError("ollama response did not include message content")
+
+    content = message.get("content")
+    if not isinstance(content, str) or not content.strip():
+        raise VisionBackendError("ollama response did not include message content")
+    return content
+
+
+def _load_json_object(content: str) -> dict[str, object]:
+    stripped = content.strip()
+    decoder = json.JSONDecoder()
+    first_error: json.JSONDecodeError | None = None
+    for start, character in enumerate(stripped):
+        if character != "{":
+            continue
+        try:
+            parsed, _ = decoder.raw_decode(stripped[start:])
+        except json.JSONDecodeError as exc:
+            if first_error is None:
+                first_error = exc
+            continue
+        if not isinstance(parsed, dict):
+            raise VisionBackendError("ollama structured output root was not a JSON object")
+        return parsed
+
+    if first_error is not None:
+        raise VisionBackendError(
+            f"ollama returned invalid structured output: {first_error}"
+        ) from first_error
+    raise VisionBackendError("ollama returned invalid structured output: no JSON object found")
+
+
 def _parse_batch_payload(
     payload: dict[str, object],
     previews: list[PreviewImage],
 ) -> OllamaBatchDecisionPayload:
-    content = payload.get("message", {}).get("content")
-    if not content:
-        raise VisionBackendError("ollama response did not include message content")
+    content = _message_content(payload)
 
     try:
-        parsed = OllamaBatchDecisionPayload.model_validate(json.loads(content))
-    except (json.JSONDecodeError, ValidationError) as exc:
+        parsed = OllamaBatchDecisionPayload.model_validate(_load_json_object(content))
+    except ValidationError as exc:
         raise VisionBackendError(
             f"ollama returned invalid structured output: {exc}"
         ) from exc
@@ -341,12 +417,17 @@ def _parse_batch_payload(
             "ollama cohort response did not include one decision per input image"
         )
 
-    expected_filenames = {preview.asset.filename for preview in previews}
-    returned_filenames = [decision.filename for decision in parsed.decisions]
-    if set(returned_filenames) != expected_filenames:
+    expected_by_id = {_preview_id(preview): preview.asset.filename for preview in previews}
+    returned_ids = [decision.id for decision in parsed.decisions]
+    if set(returned_ids) != set(expected_by_id):
         raise VisionBackendError(
-            "ollama cohort response did not include the expected filenames"
+            "ollama cohort response did not include the expected image ids"
         )
+    for decision in parsed.decisions:
+        if decision.filename != expected_by_id[decision.id]:
+            raise VisionBackendError(
+                "ollama cohort response did not include the expected filenames"
+            )
 
     return parsed
 
@@ -355,13 +436,11 @@ def _parse_edit_payload(
     payload: dict[str, object],
     previews: list[PreviewImage],
 ) -> OllamaBatchEditPayload:
-    content = payload.get("message", {}).get("content")
-    if not content:
-        raise VisionBackendError("ollama response did not include message content")
+    content = _message_content(payload)
 
     try:
-        parsed = OllamaBatchEditPayload.model_validate(json.loads(content))
-    except (json.JSONDecodeError, ValidationError) as exc:
+        parsed = OllamaBatchEditPayload.model_validate(_load_json_object(content))
+    except ValidationError as exc:
         raise VisionBackendError(
             f"ollama returned invalid structured output: {exc}"
         ) from exc
@@ -371,11 +450,16 @@ def _parse_edit_payload(
             "ollama edit response did not include one result per input image"
         )
 
-    expected_filenames = {preview.asset.filename for preview in previews}
-    returned_filenames = [edit.filename for edit in parsed.edits]
-    if set(returned_filenames) != expected_filenames:
+    expected_by_id = {_preview_id(preview): preview.asset.filename for preview in previews}
+    returned_ids = [edit.id for edit in parsed.edits]
+    if set(returned_ids) != set(expected_by_id):
         raise VisionBackendError(
-            "ollama edit response did not include the expected filenames"
+            "ollama edit response did not include the expected image ids"
         )
+    for edit in parsed.edits:
+        if edit.filename != expected_by_id[edit.id]:
+            raise VisionBackendError(
+                "ollama edit response did not include the expected filenames"
+            )
 
     return parsed

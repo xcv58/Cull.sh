@@ -167,21 +167,24 @@ python main.py lightroom-jpeg-auto --path "/path/to/culled-raws" --lightroom-edi
 
 `suggest-edits` asks the vision model for gentle global develop adjustments and
 writes them as standard, fully reversible Camera Raw settings into the `.xmp`
-sidecar next to each kept RAW. Rejected RAW files are skipped, and existing
-culling state in the sidecar is preserved.
+sidecar next to each culled, non-rejected RAW. Rejected RAW files and RAW files
+without existing sidecars are skipped by default, and existing culling state in
+the sidecar is preserved.
 
 ```bash
 python main.py suggest-edits --path "/path/to/culled-raws"            # dry run: show suggestions only
 python main.py suggest-edits --path "/path/to/culled-raws" --no-dry-run
 python main.py suggest-edits --path "/path/to/culled-raws" --prefer "warm, punchy look"
+python main.py suggest-edits --path "/path/to/raws" --include-unculled
 ```
 
 The model suggests a small set of global sliders — exposure, contrast,
 highlights, shadows, and vibrance — clamped to safe ranges. Suggestions are also
-recorded under `runs/<timestamp>/edit-suggestions.jsonl`. Because these are
-ordinary `crs:` settings, Lightroom shows them as normal Develop edits you can
-adjust or reset. Local/AI edits such as Adaptive Color and masking still require
-the Lightroom UI handoff stages.
+recorded with the source RAW/XMP path under
+`runs/<timestamp>/edit-suggestions.jsonl`. Because these are ordinary `crs:`
+settings, Lightroom shows them as normal Develop edits you can adjust or reset.
+Local/AI edits such as Adaptive Color and masking still require the Lightroom UI
+handoff stages.
 
 `--limit` now applies after whole-folder scene grouping, so `--limit 24` means
 "process the first 24 scenes" rather than "stop after 24 files".
