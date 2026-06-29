@@ -29,6 +29,7 @@ class BackendConfig:
     model: str = "gemma4:12b"
     base_url: str = "http://localhost:11434"
     timeout_seconds: float = 300.0
+    max_attempts: int = 3
 
 
 @dataclass(slots=True)

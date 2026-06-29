@@ -11,6 +11,7 @@ def build_backend(config: BackendConfig) -> VisionBackend:
             base_url=config.base_url,
             model=config.model,
             timeout_seconds=config.timeout_seconds,
+            max_attempts=config.max_attempts,
         )
     raise ValueError(f"unsupported backend provider: {config.provider}")
 

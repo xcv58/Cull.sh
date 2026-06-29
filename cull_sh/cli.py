@@ -608,6 +608,16 @@ def suggest_edits(
         "http://localhost:11434",
         help="Base URL for the selected backend.",
     ),
+    backend_timeout: float = typer.Option(
+        120.0,
+        min=1.0,
+        help="Per-request timeout in seconds for edit suggestion model calls.",
+    ),
+    max_attempts: int = typer.Option(
+        2,
+        min=1,
+        help="Maximum attempts for each edit suggestion model call.",
+    ),
     batch_size: int = typer.Option(
         4,
         min=1,
@@ -685,48 +695,66 @@ def suggest_edits(
 
     try:
         backend = build_backend(
-            BackendConfig(provider=provider, model=model, base_url=backend_url)
+            BackendConfig(
+                provider=provider,
+                model=model,
+                base_url=backend_url,
+                timeout_seconds=backend_timeout,
+                max_attempts=max_attempts,
+            )
         )
     except ValueError as exc:
         raise typer.BadParameter(str(exc)) from exc
 
-    suggestions: list[tuple[RawAsset, EditSuggestion]] = []
-    failed_cohorts = 0
-    for cohort in _chunked(previews, batch_size):
-        try:
-            cohort_suggestions = backend.suggest_edits(edit_prompt, cohort)
-        except (VisionBackendError, ValueError) as exc:
-            failed_cohorts += 1
-            for preview in cohort:
-                read_errors.append((preview.asset.filename, f"edit suggestion failed: {exc}"))
-            continue
-        if len(cohort_suggestions) != len(cohort):
-            failed_cohorts += 1
-            for preview in cohort:
-                read_errors.append(
-                    (
-                        preview.asset.filename,
-                        "edit suggestion failed: backend returned an unexpected number of results",
-                    )
-                )
-            continue
-        suggestions.extend(
-            (preview.asset, suggestion)
-            for preview, suggestion in zip(cohort, cohort_suggestions)
-        )
-
     run_dir = create_run_dir(Path("runs"))
-    _write_edit_suggestions(run_dir, edit_prompt, suggestions, dry_run)
+    suggestions_path = _write_edit_suggestions_header(run_dir, edit_prompt, dry_run)
+    console.print(f"Run artifacts: {run_dir}")
 
+    suggestions: list[tuple[RawAsset, EditSuggestion]] = []
+    failed_requests = 0
+    fallback_requests = 0
     written = 0
-    if not dry_run:
-        for asset, suggestion in suggestions:
-            try:
-                write_develop_sidecar(asset.xmp_path, suggestion)
-            except Exception as exc:
-                read_errors.append((suggestion.filename, f"sidecar write failed: {exc}"))
-                continue
-            written += 1
+    cohorts = list(_chunked(previews, batch_size))
+    for cohort_index, cohort in enumerate(cohorts, start=1):
+        cohort_names = ", ".join(preview.asset.filename for preview in cohort)
+        console.print(
+            f"Suggesting edits cohort {cohort_index}/{len(cohorts)} "
+            f"({len(cohort)} photo(s)): {cohort_names}"
+        )
+        (
+            cohort_pairs,
+            failed_delta,
+            fallback_delta,
+            cohort_errors,
+        ) = _suggest_edit_pairs_with_fallback(backend, edit_prompt, cohort)
+        failed_requests += failed_delta
+        fallback_requests += fallback_delta
+        read_errors.extend(cohort_errors)
+        if fallback_delta:
+            console.print(
+                f"Cohort {cohort_index}/{len(cohorts)} used "
+                f"{fallback_delta} single-image fallback request(s)."
+            )
+
+        suggestions.extend(cohort_pairs)
+        _append_edit_suggestions(suggestions_path, cohort_pairs)
+
+        cohort_written = 0
+        if not dry_run:
+            for asset, suggestion in cohort_pairs:
+                try:
+                    write_develop_sidecar(asset.xmp_path, suggestion)
+                except Exception as exc:
+                    read_errors.append(
+                        (suggestion.filename, f"sidecar write failed: {exc}")
+                    )
+                    continue
+                written += 1
+                cohort_written += 1
+        console.print(
+            f"Completed edit cohort {cohort_index}/{len(cohorts)}: "
+            f"suggestions={len(cohort_pairs)} sidecars_written={cohort_written}"
+        )
 
     summary = Table(title="Suggest Edits Summary")
     summary.add_column("Metric")
@@ -737,7 +765,8 @@ def suggest_edits(
         "No-op suggestions",
         str(sum(1 for _, suggestion in suggestions if suggestion.is_noop)),
     )
-    summary.add_row("Failed cohorts", str(failed_cohorts))
+    summary.add_row("Failed model requests", str(failed_requests))
+    summary.add_row("Fallback single-image requests", str(fallback_requests))
     summary.add_row("Sidecars written", str(written))
     summary.add_row("Dry run", "yes" if dry_run else "no")
     console.print(summary)
@@ -759,8 +788,6 @@ def suggest_edits(
                 else suggestion.summary,
             )
         console.print(preview_table)
-
-    console.print(f"Run artifacts: {run_dir}")
 
     if read_errors:
         _print_error_table("Suggest Edits Errors", read_errors)
@@ -868,17 +895,83 @@ def _chunked(items: list, size: int):
         yield items[start : start + size]
 
 
-def _write_edit_suggestions(
-    run_dir: Path,
+def _suggest_edit_pairs_with_fallback(
+    backend,
     prompt: str,
-    suggestions: list[tuple[RawAsset, EditSuggestion]],
-    dry_run: bool,
-) -> Path:
+    cohort: list[PreviewImage],
+) -> tuple[
+    list[tuple[RawAsset, EditSuggestion]],
+    int,
+    int,
+    list[tuple[str, str]],
+]:
+    failed_requests = 0
+    fallback_requests = 0
+    errors: list[tuple[str, str]] = []
+
+    try:
+        cohort_suggestions = backend.suggest_edits(prompt, cohort)
+    except (VisionBackendError, ValueError) as exc:
+        failed_requests += 1
+        failure = f"edit suggestion failed: {exc}"
+    else:
+        if len(cohort_suggestions) == len(cohort):
+            return (
+                [
+                    (preview.asset, suggestion)
+                    for preview, suggestion in zip(cohort, cohort_suggestions)
+                ],
+                failed_requests,
+                fallback_requests,
+                errors,
+            )
+        failed_requests += 1
+        failure = (
+            "edit suggestion failed: backend returned an unexpected number of results"
+        )
+
+    if len(cohort) == 1:
+        errors.append((cohort[0].asset.filename, failure))
+        return [], failed_requests, fallback_requests, errors
+
+    pairs: list[tuple[RawAsset, EditSuggestion]] = []
+    fallback_requests += len(cohort)
+    for preview in cohort:
+        try:
+            single_suggestions = backend.suggest_edits(prompt, [preview])
+        except (VisionBackendError, ValueError) as exc:
+            failed_requests += 1
+            errors.append(
+                (preview.asset.filename, f"edit suggestion failed: {exc}")
+            )
+            continue
+        if len(single_suggestions) != 1:
+            failed_requests += 1
+            errors.append(
+                (
+                    preview.asset.filename,
+                    "edit suggestion failed: backend returned an unexpected number of results",
+                )
+            )
+            continue
+        pairs.append((preview.asset, single_suggestions[0]))
+    return pairs, failed_requests, fallback_requests, errors
+
+
+def _write_edit_suggestions_header(run_dir: Path, prompt: str, dry_run: bool) -> Path:
     path = run_dir / "edit-suggestions.jsonl"
     with path.open("w", encoding="utf-8") as handle:
         handle.write(
             json.dumps({"prompt": prompt, "dry_run": dry_run}, sort_keys=True) + "\n"
         )
+    return path
+
+
+def _append_edit_suggestions(
+    path: Path,
+    suggestions: list[tuple[RawAsset, EditSuggestion]],
+) -> None:
+    with path.open("a", encoding="utf-8") as handle:
         for asset, suggestion in suggestions:
             handle.write(
                 json.dumps(
@@ -898,6 +991,16 @@ def _write_edit_suggestions(
                 )
                 + "\n"
             )
+
+
+def _write_edit_suggestions(
+    run_dir: Path,
+    prompt: str,
+    suggestions: list[tuple[RawAsset, EditSuggestion]],
+    dry_run: bool,
+) -> Path:
+    path = _write_edit_suggestions_header(run_dir, prompt, dry_run)
+    _append_edit_suggestions(path, suggestions)
     return path
 
 
