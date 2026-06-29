@@ -101,12 +101,13 @@ class OllamaVisionBackend(VisionBackend):
 
         returned_by_id = {decision.id: decision for decision in parsed_batch.decisions}
         decisions: list[FinalDecision] = []
-        for preview in previews:
+        for index, preview in enumerate(previews, start=1):
+            preview_id = _preview_id(index)
             try:
-                parsed = returned_by_id[_preview_id(preview)]
+                parsed = returned_by_id[preview_id]
             except KeyError as exc:
                 raise VisionBackendError(
-                    f"ollama cohort response omitted image id: {_preview_id(preview)}"
+                    f"ollama cohort response omitted image id: {preview_id}"
                 ) from exc
 
             label = _normalize_label(parsed.label)
@@ -141,7 +142,7 @@ class OllamaVisionBackend(VisionBackend):
             image_specs.append(
                 {
                     "index": index,
-                    "id": _preview_id(preview),
+                    "id": _preview_id(index),
                     "filename": preview.asset.filename,
                 }
             )
@@ -157,7 +158,8 @@ class OllamaVisionBackend(VisionBackend):
                         "Evaluate this same-scene cohort together. "
                         "Return only one valid JSON object that matches the provided schema. "
                         "Do not use markdown or add commentary. "
-                        "Use the provided ids and filenames exactly and return one result per image. "
+                        "Use the provided short ids and filenames exactly and return one result per image. "
+                        "Treat the id as the primary key. "
                         "Compare the images relative to each other before deciding. "
                         "Use triage, not binary culling: reject, review, or pick."
                     ),
@@ -207,18 +209,19 @@ class OllamaVisionBackend(VisionBackend):
 
         returned_by_id = {edit.id: edit for edit in parsed_batch.edits}
         suggestions: list[EditSuggestion] = []
-        for preview in previews:
+        for index, preview in enumerate(previews, start=1):
+            preview_id = _preview_id(index)
             try:
-                parsed = returned_by_id[_preview_id(preview)]
+                parsed = returned_by_id[preview_id]
             except KeyError as exc:
                 raise VisionBackendError(
-                    f"ollama edit response omitted image id: {_preview_id(preview)}"
+                    f"ollama edit response omitted image id: {preview_id}"
                 ) from exc
 
             suggestions.append(
                 EditSuggestion(
                     filename=preview.asset.filename,
-                    asset_id=parsed.id,
+                    asset_id=preview.asset.raw_path.as_posix(),
                     exposure=parsed.exposure,
                     contrast=parsed.contrast,
                     highlights=parsed.highlights,
@@ -241,7 +244,7 @@ class OllamaVisionBackend(VisionBackend):
             image_specs.append(
                 {
                     "index": index,
-                    "id": _preview_id(preview),
+                    "id": _preview_id(index),
                     "filename": preview.asset.filename,
                 }
             )
@@ -257,7 +260,8 @@ class OllamaVisionBackend(VisionBackend):
                         "Suggest subtle, image-specific global Develop adjustments. "
                         "Return only one valid JSON object that matches the provided schema. "
                         "Do not use markdown or add commentary. "
-                        "Use the provided ids and filenames exactly and return one result per image. "
+                        "Use the provided short ids and filenames exactly and return one result per image. "
+                        "Treat the id as the primary key. "
                         "Judge each image on its own merits."
                     ),
                 },
@@ -360,8 +364,8 @@ def _normalize_label(value: str | None) -> ColorLabel | None:
         raise VisionBackendError(f"unsupported color label from ollama: {value}") from exc
 
 
-def _preview_id(preview: PreviewImage) -> str:
-    return preview.asset.raw_path.as_posix()
+def _preview_id(index: int) -> str:
+    return f"image-{index}"
 
 
 def _message_content(payload: dict[str, object]) -> str:
@@ -417,7 +421,10 @@ def _parse_batch_payload(
             "ollama cohort response did not include one decision per input image"
         )
 
-    expected_by_id = {_preview_id(preview): preview.asset.filename for preview in previews}
+    expected_by_id = {
+        _preview_id(index): preview.asset.filename
+        for index, preview in enumerate(previews, start=1)
+    }
     returned_ids = [decision.id for decision in parsed.decisions]
     if set(returned_ids) != set(expected_by_id):
         raise VisionBackendError(
@@ -450,7 +457,10 @@ def _parse_edit_payload(
             "ollama edit response did not include one result per input image"
         )
 
-    expected_by_id = {_preview_id(preview): preview.asset.filename for preview in previews}
+    expected_by_id = {
+        _preview_id(index): preview.asset.filename
+        for index, preview in enumerate(previews, start=1)
+    }
     returned_ids = [edit.id for edit in parsed.edits]
     if set(returned_ids) != set(expected_by_id):
         raise VisionBackendError(

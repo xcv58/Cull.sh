@@ -41,7 +41,7 @@ class OllamaBackendTests(unittest.TestCase):
         success_response.json.return_value = {
             "message": {
                 "content": (
-                    '{"decisions":[{"id":"/tmp/frame.ARW","filename":"frame.ARW","bucket":"review",'
+                    '{"decisions":[{"id":"image-1","filename":"frame.ARW","bucket":"review",'
                     '"rating":0,"label":null,"summary":""}]}'
                 )
             }
@@ -101,9 +101,9 @@ class OllamaBackendTests(unittest.TestCase):
             "message": {
                 "content": (
                     '{"edits":['
-                    '{"id":"/tmp/b.ARW","filename":"b.ARW","exposure":0.0,"contrast":0,"highlights":0,'
+                    '{"id":"image-2","filename":"b.ARW","exposure":0.0,"contrast":0,"highlights":0,'
                     '"shadows":0,"vibrance":0,"summary":"ok"},'
-                    '{"id":"/tmp/a.ARW","filename":"a.ARW","exposure":0.5,"contrast":10,"highlights":-40,'
+                    '{"id":"image-1","filename":"a.ARW","exposure":0.5,"contrast":10,"highlights":-40,'
                     '"shadows":25,"vibrance":8,"summary":"recover sky"}]}'
                 )
             }
@@ -115,7 +115,7 @@ class OllamaBackendTests(unittest.TestCase):
         with patch("cull_sh.backends.ollama.httpx.Client", return_value=fake_client):
             suggestions = backend.suggest_edits("prompt", previews)
 
-        # Results are remapped back to input order by filename.
+        # Results are remapped back to input order by the short image id.
         self.assertEqual([s.filename for s in suggestions], ["a.ARW", "b.ARW"])
         self.assertEqual(suggestions[0].exposure, 0.5)
         self.assertEqual(suggestions[0].highlights, -40)
@@ -126,7 +126,7 @@ class OllamaBackendTests(unittest.TestCase):
         payload = {
             "message": {
                 "content": (
-                    '{"edits":[{"id":"/tmp/a.ARW","filename":"a.ARW","exposure":0.0,"contrast":0,'
+                    '{"edits":[{"id":"image-1","filename":"a.ARW","exposure":0.0,"contrast":0,'
                     '"highlights":0,"shadows":0,"vibrance":0,'
                     '"summary":"No global adjustment needed."}]}'
                 )
@@ -143,7 +143,7 @@ class OllamaBackendTests(unittest.TestCase):
         payload = {
             "message": {
                 "content": (
-                    '{"decisions":[{"id":"/tmp/frame.ARW","filename":"other.ARW","bucket":"review",'
+                    '{"decisions":[{"id":"image-1","filename":"other.ARW","bucket":"review",'
                     '"rating":0,"label":null,"summary":""}]}'
                 )
             }
@@ -160,7 +160,7 @@ class OllamaBackendTests(unittest.TestCase):
             "message": {
                 "content": (
                     "```json\n"
-                    '{"edits":[{"id":"/tmp/frame.ARW","filename":"frame.ARW",'
+                    '{"edits":[{"id":"image-1","filename":"frame.ARW",'
                     '"exposure":0.1,"contrast":4,"highlights":-10,'
                     '"shadows":5,"vibrance":3,"summary":"Slightly dark foreground."}]}'
                     "\n```\nextra text"
@@ -178,7 +178,7 @@ class OllamaBackendTests(unittest.TestCase):
         payload = {
             "message": {
                 "content": (
-                    '{"edits":[{"id":"/tmp/frame.ARW","filename":"frame.ARW",'
+                    '{"edits":[{"id":"image-1","filename":"frame.ARW",'
                     '"contrast":4,"highlights":-10,"shadows":5,'
                     '"vibrance":3,"summary":"Slightly dark foreground."}]}'
                 )
@@ -195,7 +195,7 @@ class OllamaBackendTests(unittest.TestCase):
         payload = {
             "message": {
                 "content": (
-                    '{"edits":[{"id":"/tmp/frame.ARW","filename":"frame.ARW",'
+                    '{"edits":[{"id":"image-1","filename":"frame.ARW",'
                     '"exposure":0.1,"contrast":4,"highlights":-10,'
                     '"shadows":5,"vibrance":3,"summary":"   "}]}'
                 )
@@ -223,10 +223,10 @@ class OllamaBackendTests(unittest.TestCase):
             "message": {
                 "content": (
                     '{"edits":['
-                    '{"id":"/tmp/b/frame.ARW","filename":"frame.ARW",'
+                    '{"id":"image-2","filename":"frame.ARW",'
                     '"exposure":-0.2,"contrast":1,"highlights":-5,'
                     '"shadows":2,"vibrance":1,"summary":"Bright upper frame."},'
-                    '{"id":"/tmp/a/frame.ARW","filename":"frame.ARW",'
+                    '{"id":"image-1","filename":"frame.ARW",'
                     '"exposure":0.3,"contrast":8,"highlights":-20,'
                     '"shadows":10,"vibrance":5,"summary":"Dark lower frame."}]}'
                 )
