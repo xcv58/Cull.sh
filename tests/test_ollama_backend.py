@@ -158,7 +158,30 @@ class OllamaBackendTests(unittest.TestCase):
         self.assertEqual(suggestions[0].crop_bottom, 0.95)
         self.assertEqual(suggestions[0].crop_angle, -1.5)
         request_payload = fake_client.post.call_args.kwargs["json"]
-        self.assertIn("Crop guidance", request_payload["messages"][1]["content"])
+        self.assertIn(
+            "actively evaluate composition",
+            request_payload["messages"][0]["content"],
+        )
+        self.assertIn(
+            "first-class optional Develop edit",
+            request_payload["messages"][0]["content"],
+        )
+        self.assertIn(
+            "Composition/crop pass",
+            request_payload["messages"][1]["content"],
+        )
+        self.assertIn(
+            "actively check whether a crop would improve composition",
+            request_payload["messages"][1]["content"],
+        )
+        self.assertIn(
+            "Do not add a generic inset crop",
+            request_payload["messages"][1]["content"],
+        )
+        self.assertIn(
+            "Crop as much or as little as the visible issue warrants",
+            request_payload["messages"][1]["content"],
+        )
         self.assertIn("has_crop", str(request_payload["format"]))
 
     def test_parse_edit_payload_rejects_wrong_count(self) -> None:

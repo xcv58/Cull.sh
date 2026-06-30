@@ -49,8 +49,8 @@ This scaffold includes:
 - run manifests under `runs/<timestamp>/manifest.jsonl`
 - XMP sidecar writing with merge support for existing RAW sidecars
 - embedded JPEG culling metadata
-- optional Lightroom sidecar edits for all RAWs by default
-- AI-suggested Lightroom develop edits written as reversible XMP sidecar settings
+- optional Lightroom sidecar edits for RAWs
+- opt-in AI-suggested Lightroom develop edits written as reversible XMP sidecar settings
 - architecture plan for the full app
 
 ## Current Workflow
@@ -165,11 +165,14 @@ python main.py lightroom-jpeg-auto --path "/path/to/culled-raws" --lightroom-edi
 
 ## AI Develop Edits
 
-`suggest-edits` asks the vision model for gentle global develop adjustments and
-writes them as standard, fully reversible Camera Raw settings into the `.xmp`
-sidecar next to each culled, non-rejected RAW. Rejected RAW files and RAW files
-without existing sidecars are skipped by default, and existing culling state in
-the sidecar is preserved.
+`suggest-edits` is an explicit opt-in stage. Regular culling does not run local
+AI develop edits. When you run this command, it asks the vision model for
+natural global develop adjustments and can write them as standard, fully
+reversible Camera Raw settings into the `.xmp` sidecar next to each culled,
+non-rejected RAW. It is a dry run by default; sidecars are only modified when
+you pass `--no-dry-run`. Rejected RAW files and RAW files without existing
+sidecars are skipped by default, and existing culling state in the sidecar is
+preserved.
 
 ```bash
 python main.py suggest-edits --path "/path/to/culled-raws"            # dry run: show suggestions only
@@ -184,10 +187,10 @@ highlights, shadows, and vibrance — clamped to safe ranges. Suggestions are al
 recorded with the source RAW/XMP path under
 `runs/<timestamp>/edit-suggestions.jsonl`. Because these are ordinary `crs:`
 settings, Lightroom shows them as normal Develop edits you can adjust or reset.
-Crop suggestions are off by default; pass `--with-crop` to allow conservative,
-normalized Camera Raw crop bounds and crop angle suggestions. A no-crop
-suggestion leaves any existing crop tags untouched. Local/AI edits such as
-Adaptive Color and masking still require the Lightroom UI handoff stages.
+Crop suggestions are off by default; pass `--with-crop` to allow normalized
+Camera Raw crop bounds and crop angle suggestions. A no-crop suggestion leaves
+any existing crop tags untouched. Local/AI edits such as Adaptive Color and
+masking still require the Lightroom UI handoff stages.
 
 `--limit` now applies after whole-folder scene grouping, so `--limit 24` means
 "process the first 24 scenes" rather than "stop after 24 files".

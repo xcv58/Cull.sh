@@ -642,10 +642,10 @@ def suggest_edits(
     with_crop: bool = typer.Option(
         False,
         "--with-crop/--no-with-crop",
-        help="Allow the model to suggest conservative global crops.",
+        help="Allow the model to suggest composition crop and leveling settings.",
     ),
 ) -> None:
-    """Suggest gentle Lightroom develop edits for culled, non-rejected RAW files.
+    """Suggest optional Lightroom develop edits for culled, non-rejected RAW files.
 
     Edits are written as standard, fully reversible Camera Raw settings into the
     XMP sidecar next to each RAW. Rejected and unculled RAW files are skipped

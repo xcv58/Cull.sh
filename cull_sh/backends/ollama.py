@@ -304,13 +304,23 @@ class OllamaVisionBackend(VisionBackend):
             )
             encoded_images.append(base64.b64encode(preview.image_bytes).decode("ascii"))
 
+        system_crop_instruction = (
+            " When crop fields are present in the schema, actively evaluate "
+            "composition as a first-class optional Develop edit."
+            if include_crop
+            else ""
+        )
         crop_guidance = (
-            "Crop guidance:\n"
-            "- Use has_crop true only when cropping clearly improves composition by removing empty edges, distractions, or a tilted horizon.\n"
-            "- Keep crops conservative; do not cut important subjects, landmarks, heads, limbs, reflections, or contextual edges.\n"
+            "Composition/crop pass:\n"
+            "- For every image, actively check whether a crop would improve composition before deciding has_crop.\n"
+            "- Use has_crop true when cropping or leveling addresses a specific visible issue: empty edge space, a partial distraction, weak subject placement, clutter, imbalance, or a tilted horizon.\n"
+            "- Use crop_angle for clear horizon or architectural leveling, with crop bounds adjusted to cover rotated edges.\n"
+            "- Crop as much or as little as the visible issue warrants while preserving important subjects, landmarks, heads, limbs, reflections, and useful context.\n"
+            "- Set has_crop false for already well-framed images or when the crop reason is weak.\n"
+            "- Do not add a generic inset crop just because crop fields are available; vary bounds only to match the visible issue in that image.\n"
             "- Crop bounds are normalized: crop_left/top/right/bottom are between 0 and 1.\n"
             "- If no crop is needed, set has_crop false, crop_left 0, crop_top 0, crop_right 1, crop_bottom 1, crop_angle 0.\n"
-            "- Use crop_angle only for obvious horizon leveling; otherwise use 0.\n"
+            "- If has_crop is true, the summary must mention the specific crop or leveling reason.\n"
         )
         payload_schema = (
             OllamaBatchEditWithCropPayload.model_json_schema()
@@ -325,12 +335,13 @@ class OllamaVisionBackend(VisionBackend):
                     "role": "system",
                     "content": (
                         "You are a photo editing assistant for Adobe Lightroom. "
-                        "Suggest subtle, image-specific Develop adjustments. "
+                        "Suggest natural, image-specific Develop adjustments. "
                         "Return only one valid JSON object that matches the provided schema. "
                         "Do not use markdown or add commentary. "
                         "Use the provided short ids and filenames exactly and return one result per image. "
                         "Treat the id as the primary key. "
                         "Judge each image on its own merits."
+                        + system_crop_instruction
                     ),
                 },
                 {
@@ -349,8 +360,8 @@ class OllamaVisionBackend(VisionBackend):
                         + "or \"No global adjustment needed.\" Never leave it empty.\n"
                         + "- Inspect exposure, highlight detail, shadow detail, contrast, and color intensity separately.\n"
                         + "- Recover blown skies with negative highlights; open dark areas with positive shadows.\n"
-                        + "- Lift or lower exposure only when the image is clearly under- or over-exposed.\n"
-                        + "- Keep edits subtle and realistic unless the user asks for a stronger look.\n"
+                        + "- Lift or lower exposure when it improves the overall tonal balance.\n"
+                        + "- Keep edits realistic unless the user asks for a stronger look.\n"
                         + "- Use 0 only when that slider already looks correct for that specific image.\n"
                         + "- Do not copy identical slider values across images unless the summaries explain the same observed issue.\n"
                         + (crop_guidance if include_crop else "")
