@@ -121,6 +121,46 @@ class OllamaBackendTests(unittest.TestCase):
         self.assertEqual(suggestions[0].highlights, -40)
         self.assertTrue(suggestions[1].is_noop)
 
+    def test_suggest_edits_maps_crop_adjustments_when_requested(self) -> None:
+        backend = OllamaVisionBackend(
+            base_url="http://localhost:11434",
+            model="gemma4:12b",
+            timeout_seconds=300.0,
+        )
+        preview = _build_preview("frame.ARW")
+        response = MagicMock()
+        response.raise_for_status.return_value = None
+        response.json.return_value = {
+            "message": {
+                "content": (
+                    '{"edits":[{"id":"image-1","filename":"frame.ARW",'
+                    '"exposure":0.2,"contrast":4,"highlights":-8,'
+                    '"shadows":6,"vibrance":3,"has_crop":true,'
+                    '"crop_left":0.1,"crop_top":0.05,'
+                    '"crop_right":0.9,"crop_bottom":0.95,'
+                    '"crop_angle":-1.5,'
+                    '"summary":"Level horizon and tighten edges."}]}'
+                )
+            }
+        }
+        fake_client = MagicMock()
+        fake_client.__enter__.return_value = fake_client
+        fake_client.post.return_value = response
+
+        with patch("cull_sh.backends.ollama.httpx.Client", return_value=fake_client):
+            suggestions = backend.suggest_edits("prompt", [preview], include_crop=True)
+
+        self.assertEqual(len(suggestions), 1)
+        self.assertTrue(suggestions[0].has_crop)
+        self.assertEqual(suggestions[0].crop_left, 0.1)
+        self.assertEqual(suggestions[0].crop_top, 0.05)
+        self.assertEqual(suggestions[0].crop_right, 0.9)
+        self.assertEqual(suggestions[0].crop_bottom, 0.95)
+        self.assertEqual(suggestions[0].crop_angle, -1.5)
+        request_payload = fake_client.post.call_args.kwargs["json"]
+        self.assertIn("Crop guidance", request_payload["messages"][1]["content"])
+        self.assertIn("has_crop", str(request_payload["format"]))
+
     def test_parse_edit_payload_rejects_wrong_count(self) -> None:
         previews = [_build_preview("a.ARW"), _build_preview("b.ARW")]
         payload = {
@@ -172,6 +212,74 @@ class OllamaBackendTests(unittest.TestCase):
 
         self.assertEqual(parsed.edits[0].summary, "Slightly dark foreground.")
         self.assertEqual(parsed.edits[0].exposure, 0.1)
+
+    def test_parse_edit_payload_accepts_crop_fields_when_requested(self) -> None:
+        preview = _build_preview("frame.ARW")
+        payload = {
+            "message": {
+                "content": (
+                    '{"edits":[{"id":"image-1","filename":"frame.ARW",'
+                    '"exposure":0.1,"contrast":4,"highlights":-10,'
+                    '"shadows":5,"vibrance":3,"has_crop":true,'
+                    '"crop_left":0.1,"crop_top":0.05,'
+                    '"crop_right":0.9,"crop_bottom":0.95,'
+                    '"crop_angle":-1.5,'
+                    '"summary":"Slightly dark foreground."}]}'
+                )
+            }
+        }
+
+        parsed = _parse_edit_payload(payload, [preview], include_crop=True)
+
+        self.assertTrue(parsed.edits[0].has_crop)
+        self.assertEqual(parsed.edits[0].crop_left, 0.1)
+        self.assertEqual(parsed.edits[0].crop_angle, -1.5)
+
+    def test_parse_edit_payload_normalizes_disabled_crop_fields(self) -> None:
+        preview = _build_preview("frame.ARW")
+        payload = {
+            "message": {
+                "content": (
+                    '{"edits":[{"id":"image-1","filename":"frame.ARW",'
+                    '"exposure":0.1,"contrast":4,"highlights":-10,'
+                    '"shadows":5,"vibrance":3,"has_crop":false,'
+                    '"crop_left":0.2,"crop_top":0.2,'
+                    '"crop_right":0.8,"crop_bottom":0.8,'
+                    '"crop_angle":12,'
+                    '"summary":"Slightly dark foreground."}]}'
+                )
+            }
+        }
+
+        parsed = _parse_edit_payload(payload, [preview], include_crop=True)
+
+        self.assertFalse(parsed.edits[0].has_crop)
+        self.assertEqual(parsed.edits[0].crop_left, 0.0)
+        self.assertEqual(parsed.edits[0].crop_top, 0.0)
+        self.assertEqual(parsed.edits[0].crop_right, 1.0)
+        self.assertEqual(parsed.edits[0].crop_bottom, 1.0)
+        self.assertEqual(parsed.edits[0].crop_angle, 0.0)
+
+    def test_parse_edit_payload_rejects_invalid_crop_rectangle(self) -> None:
+        preview = _build_preview("frame.ARW")
+        payload = {
+            "message": {
+                "content": (
+                    '{"edits":[{"id":"image-1","filename":"frame.ARW",'
+                    '"exposure":0.1,"contrast":4,"highlights":-10,'
+                    '"shadows":5,"vibrance":3,"has_crop":true,'
+                    '"crop_left":0.8,"crop_top":0.05,'
+                    '"crop_right":0.1,"crop_bottom":0.95,'
+                    '"crop_angle":0,'
+                    '"summary":"Slightly dark foreground."}]}'
+                )
+            }
+        }
+
+        with self.assertRaises(VisionBackendError) as context:
+            _parse_edit_payload(payload, [preview], include_crop=True)
+
+        self.assertIn("invalid structured output", str(context.exception))
 
     def test_parse_edit_payload_rejects_missing_required_slider(self) -> None:
         preview = _build_preview("frame.ARW")

@@ -12,6 +12,7 @@ from pydantic import BaseModel
 from pydantic import Field
 from pydantic import ValidationError
 from pydantic import field_validator
+from pydantic import model_validator
 
 from cull_sh.backends.base import VisionBackend
 from cull_sh.backends.base import VisionBackendError
@@ -65,8 +66,48 @@ class OllamaEditPayload(BaseModel):
         return value
 
 
+class OllamaEditWithCropPayload(OllamaEditPayload):
+    has_crop: bool
+    crop_left: float = Field(ge=0.0, le=1.0)
+    crop_top: float = Field(ge=0.0, le=1.0)
+    crop_right: float = Field(ge=0.0, le=1.0)
+    crop_bottom: float = Field(ge=0.0, le=1.0)
+    crop_angle: float = Field(ge=-45.0, le=45.0)
+
+    @model_validator(mode="after")
+    def _validate_crop_rectangle(self) -> "OllamaEditWithCropPayload":
+        if not self.has_crop:
+            self.crop_left = 0.0
+            self.crop_top = 0.0
+            self.crop_right = 1.0
+            self.crop_bottom = 1.0
+            self.crop_angle = 0.0
+            return self
+        if self.crop_left >= self.crop_right:
+            raise ValueError("crop_left must be less than crop_right")
+        if self.crop_top >= self.crop_bottom:
+            raise ValueError("crop_top must be less than crop_bottom")
+        width = self.crop_right - self.crop_left
+        height = self.crop_bottom - self.crop_top
+        if width < 0.2 or height < 0.2:
+            raise ValueError("crop rectangle is too small")
+        if (
+            self.crop_left == 0.0
+            and self.crop_top == 0.0
+            and self.crop_right == 1.0
+            and self.crop_bottom == 1.0
+            and self.crop_angle == 0.0
+        ):
+            self.has_crop = False
+        return self
+
+
 class OllamaBatchEditPayload(BaseModel):
     edits: list[OllamaEditPayload]
+
+
+class OllamaBatchEditWithCropPayload(BaseModel):
+    edits: list[OllamaEditWithCropPayload]
 
 
 class OllamaVisionBackend(VisionBackend):
@@ -203,9 +244,15 @@ class OllamaVisionBackend(VisionBackend):
         self,
         prompt: str,
         previews: list[PreviewImage],
+        include_crop: bool = False,
     ) -> list[EditSuggestion]:
         with httpx.Client(timeout=self.timeout_seconds) as client:
-            parsed_batch = self._suggest_cohort(client, prompt, previews)
+            parsed_batch = self._suggest_cohort(
+                client,
+                prompt,
+                previews,
+                include_crop=include_crop,
+            )
 
         returned_by_id = {edit.id: edit for edit in parsed_batch.edits}
         suggestions: list[EditSuggestion] = []
@@ -227,6 +274,12 @@ class OllamaVisionBackend(VisionBackend):
                     highlights=parsed.highlights,
                     shadows=parsed.shadows,
                     vibrance=parsed.vibrance,
+                    has_crop=getattr(parsed, "has_crop", False),
+                    crop_left=getattr(parsed, "crop_left", 0.0),
+                    crop_top=getattr(parsed, "crop_top", 0.0),
+                    crop_right=getattr(parsed, "crop_right", 1.0),
+                    crop_bottom=getattr(parsed, "crop_bottom", 1.0),
+                    crop_angle=getattr(parsed, "crop_angle", 0.0),
                     summary=parsed.summary.strip(),
                 )
             )
@@ -237,7 +290,8 @@ class OllamaVisionBackend(VisionBackend):
         client: httpx.Client,
         prompt: str,
         previews: list[PreviewImage],
-    ) -> OllamaBatchEditPayload:
+        include_crop: bool = False,
+    ) -> OllamaBatchEditPayload | OllamaBatchEditWithCropPayload:
         image_specs = []
         encoded_images = []
         for index, preview in enumerate(previews, start=1):
@@ -250,6 +304,20 @@ class OllamaVisionBackend(VisionBackend):
             )
             encoded_images.append(base64.b64encode(preview.image_bytes).decode("ascii"))
 
+        crop_guidance = (
+            "Crop guidance:\n"
+            "- Use has_crop true only when cropping clearly improves composition by removing empty edges, distractions, or a tilted horizon.\n"
+            "- Keep crops conservative; do not cut important subjects, landmarks, heads, limbs, reflections, or contextual edges.\n"
+            "- Crop bounds are normalized: crop_left/top/right/bottom are between 0 and 1.\n"
+            "- If no crop is needed, set has_crop false, crop_left 0, crop_top 0, crop_right 1, crop_bottom 1, crop_angle 0.\n"
+            "- Use crop_angle only for obvious horizon leveling; otherwise use 0.\n"
+        )
+        payload_schema = (
+            OllamaBatchEditWithCropPayload.model_json_schema()
+            if include_crop
+            else OllamaBatchEditPayload.model_json_schema()
+        )
+
         request_payload = {
             "model": self.model,
             "messages": [
@@ -257,7 +325,7 @@ class OllamaVisionBackend(VisionBackend):
                     "role": "system",
                     "content": (
                         "You are a photo editing assistant for Adobe Lightroom. "
-                        "Suggest subtle, image-specific global Develop adjustments. "
+                        "Suggest subtle, image-specific Develop adjustments. "
                         "Return only one valid JSON object that matches the provided schema. "
                         "Do not use markdown or add commentary. "
                         "Use the provided short ids and filenames exactly and return one result per image. "
@@ -285,12 +353,13 @@ class OllamaVisionBackend(VisionBackend):
                         + "- Keep edits subtle and realistic unless the user asks for a stronger look.\n"
                         + "- Use 0 only when that slider already looks correct for that specific image.\n"
                         + "- Do not copy identical slider values across images unless the summaries explain the same observed issue.\n"
+                        + (crop_guidance if include_crop else "")
                         + "Return one set of adjustments per image."
                     ),
                     "images": encoded_images,
                 },
             ],
-            "format": OllamaBatchEditPayload.model_json_schema(),
+            "format": payload_schema,
             "stream": False,
             "options": {"temperature": 0},
         }
@@ -298,7 +367,11 @@ class OllamaVisionBackend(VisionBackend):
         return self._chat_structured(
             client,
             request_payload,
-            lambda payload: _parse_edit_payload(payload, previews),
+            lambda payload: _parse_edit_payload(
+                payload,
+                previews,
+                include_crop=include_crop,
+            ),
         )
 
     def _chat_structured(
@@ -442,11 +515,17 @@ def _parse_batch_payload(
 def _parse_edit_payload(
     payload: dict[str, object],
     previews: list[PreviewImage],
-) -> OllamaBatchEditPayload:
+    include_crop: bool = False,
+) -> OllamaBatchEditPayload | OllamaBatchEditWithCropPayload:
     content = _message_content(payload)
 
     try:
-        parsed = OllamaBatchEditPayload.model_validate(_load_json_object(content))
+        payload_model = (
+            OllamaBatchEditWithCropPayload
+            if include_crop
+            else OllamaBatchEditPayload
+        )
+        parsed = payload_model.model_validate(_load_json_object(content))
     except ValidationError as exc:
         raise VisionBackendError(
             f"ollama returned invalid structured output: {exc}"

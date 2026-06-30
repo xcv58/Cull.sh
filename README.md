@@ -175,6 +175,7 @@ the sidecar is preserved.
 python main.py suggest-edits --path "/path/to/culled-raws"            # dry run: show suggestions only
 python main.py suggest-edits --path "/path/to/culled-raws" --no-dry-run
 python main.py suggest-edits --path "/path/to/culled-raws" --prefer "warm, punchy look"
+python main.py suggest-edits --path "/path/to/culled-raws" --with-crop --batch-size 1
 python main.py suggest-edits --path "/path/to/raws" --include-unculled
 ```
 
@@ -183,8 +184,10 @@ highlights, shadows, and vibrance — clamped to safe ranges. Suggestions are al
 recorded with the source RAW/XMP path under
 `runs/<timestamp>/edit-suggestions.jsonl`. Because these are ordinary `crs:`
 settings, Lightroom shows them as normal Develop edits you can adjust or reset.
-Local/AI edits such as Adaptive Color and masking still require the Lightroom UI
-handoff stages.
+Crop suggestions are off by default; pass `--with-crop` to allow conservative,
+normalized Camera Raw crop bounds and crop angle suggestions. A no-crop
+suggestion leaves any existing crop tags untouched. Local/AI edits such as
+Adaptive Color and masking still require the Lightroom UI handoff stages.
 
 `--limit` now applies after whole-folder scene grouping, so `--limit 24` means
 "process the first 24 scenes" rather than "stop after 24 files".

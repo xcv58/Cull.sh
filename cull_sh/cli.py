@@ -639,6 +639,11 @@ def suggest_edits(
         "--include-unculled/--skip-unculled",
         help="Also suggest edits for RAW files with no existing XMP sidecar.",
     ),
+    with_crop: bool = typer.Option(
+        False,
+        "--with-crop/--no-with-crop",
+        help="Allow the model to suggest conservative global crops.",
+    ),
 ) -> None:
     """Suggest gentle Lightroom develop edits for culled, non-rejected RAW files.
 
@@ -707,7 +712,12 @@ def suggest_edits(
         raise typer.BadParameter(str(exc)) from exc
 
     run_dir = create_run_dir(Path("runs"))
-    suggestions_path = _write_edit_suggestions_header(run_dir, edit_prompt, dry_run)
+    suggestions_path = _write_edit_suggestions_header(
+        run_dir,
+        edit_prompt,
+        dry_run,
+        with_crop=with_crop,
+    )
     console.print(f"Run artifacts: {run_dir}")
 
     suggestions: list[tuple[RawAsset, EditSuggestion]] = []
@@ -726,7 +736,12 @@ def suggest_edits(
             failed_delta,
             fallback_delta,
             cohort_errors,
-        ) = _suggest_edit_pairs_with_fallback(backend, edit_prompt, cohort)
+        ) = _suggest_edit_pairs_with_fallback(
+            backend,
+            edit_prompt,
+            cohort,
+            include_crop=with_crop,
+        )
         failed_requests += failed_delta
         fallback_requests += fallback_delta
         read_errors.extend(cohort_errors)
@@ -765,6 +780,10 @@ def suggest_edits(
         "No-op suggestions",
         str(sum(1 for _, suggestion in suggestions if suggestion.is_noop)),
     )
+    summary.add_row(
+        "Crop suggestions",
+        str(sum(1 for _, suggestion in suggestions if suggestion.has_crop)),
+    )
     summary.add_row("Failed model requests", str(failed_requests))
     summary.add_row("Fallback single-image requests", str(fallback_requests))
     summary.add_row("Sidecars written", str(written))
@@ -773,7 +792,7 @@ def suggest_edits(
 
     if suggestions:
         preview_table = Table(title="Suggested Edits (first 10)")
-        for column in ("Filename", "Exp", "Contr", "High", "Shad", "Vib", "Note"):
+        for column in ("Filename", "Exp", "Contr", "High", "Shad", "Vib", "Crop", "Note"):
             preview_table.add_column(column)
         for _, suggestion in suggestions[:10]:
             preview_table.add_row(
@@ -783,6 +802,7 @@ def suggest_edits(
                 str(suggestion.highlights),
                 str(suggestion.shadows),
                 str(suggestion.vibrance),
+                "yes" if suggestion.has_crop else "no",
                 (suggestion.summary[:40] + "…")
                 if len(suggestion.summary) > 41
                 else suggestion.summary,
@@ -899,6 +919,7 @@ def _suggest_edit_pairs_with_fallback(
     backend,
     prompt: str,
     cohort: list[PreviewImage],
+    include_crop: bool = False,
 ) -> tuple[
     list[tuple[RawAsset, EditSuggestion]],
     int,
@@ -910,7 +931,11 @@ def _suggest_edit_pairs_with_fallback(
     errors: list[tuple[str, str]] = []
 
     try:
-        cohort_suggestions = backend.suggest_edits(prompt, cohort)
+        cohort_suggestions = backend.suggest_edits(
+            prompt,
+            cohort,
+            include_crop=include_crop,
+        )
     except (VisionBackendError, ValueError) as exc:
         failed_requests += 1
         failure = f"edit suggestion failed: {exc}"
@@ -938,7 +963,11 @@ def _suggest_edit_pairs_with_fallback(
     fallback_requests += len(cohort)
     for preview in cohort:
         try:
-            single_suggestions = backend.suggest_edits(prompt, [preview])
+            single_suggestions = backend.suggest_edits(
+                prompt,
+                [preview],
+                include_crop=include_crop,
+            )
         except (VisionBackendError, ValueError) as exc:
             failed_requests += 1
             errors.append(
@@ -958,11 +987,20 @@ def _suggest_edit_pairs_with_fallback(
     return pairs, failed_requests, fallback_requests, errors
 
 
-def _write_edit_suggestions_header(run_dir: Path, prompt: str, dry_run: bool) -> Path:
+def _write_edit_suggestions_header(
+    run_dir: Path,
+    prompt: str,
+    dry_run: bool,
+    with_crop: bool = False,
+) -> Path:
     path = run_dir / "edit-suggestions.jsonl"
     with path.open("w", encoding="utf-8") as handle:
         handle.write(
-            json.dumps({"prompt": prompt, "dry_run": dry_run}, sort_keys=True) + "\n"
+            json.dumps(
+                {"prompt": prompt, "dry_run": dry_run, "with_crop": with_crop},
+                sort_keys=True,
+            )
+            + "\n"
         )
     return path
 
@@ -985,6 +1023,12 @@ def _append_edit_suggestions(
                         "highlights": suggestion.highlights,
                         "shadows": suggestion.shadows,
                         "vibrance": suggestion.vibrance,
+                        "has_crop": suggestion.has_crop,
+                        "crop_left": suggestion.crop_left,
+                        "crop_top": suggestion.crop_top,
+                        "crop_right": suggestion.crop_right,
+                        "crop_bottom": suggestion.crop_bottom,
+                        "crop_angle": suggestion.crop_angle,
                         "summary": suggestion.summary,
                     },
                     sort_keys=True,
@@ -998,8 +1042,14 @@ def _write_edit_suggestions(
     prompt: str,
     suggestions: list[tuple[RawAsset, EditSuggestion]],
     dry_run: bool,
+    with_crop: bool = False,
 ) -> Path:
-    path = _write_edit_suggestions_header(run_dir, prompt, dry_run)
+    path = _write_edit_suggestions_header(
+        run_dir,
+        prompt,
+        dry_run,
+        with_crop=with_crop,
+    )
     _append_edit_suggestions(path, suggestions)
     return path
 

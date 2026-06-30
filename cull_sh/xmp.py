@@ -150,7 +150,27 @@ def apply_develop_settings(description: ET.Element, suggestion: EditSuggestion) 
     description.set(f"{{{CRS_NS}}}Highlights2012", str(suggestion.highlights))
     description.set(f"{{{CRS_NS}}}Shadows2012", str(suggestion.shadows))
     description.set(f"{{{CRS_NS}}}Vibrance", str(suggestion.vibrance))
+    if suggestion.has_crop:
+        description.set(f"{{{CRS_NS}}}HasCrop", "True")
+        description.set(f"{{{CRS_NS}}}CropTop", _format_crop_value(suggestion.crop_top))
+        description.set(f"{{{CRS_NS}}}CropLeft", _format_crop_value(suggestion.crop_left))
+        description.set(
+            f"{{{CRS_NS}}}CropBottom",
+            _format_crop_value(suggestion.crop_bottom),
+        )
+        description.set(
+            f"{{{CRS_NS}}}CropRight",
+            _format_crop_value(suggestion.crop_right),
+        )
+        description.set(
+            f"{{{CRS_NS}}}CropAngle",
+            _format_crop_value(suggestion.crop_angle),
+        )
     description.set(f"{{{CRS_NS}}}HasSettings", "True")
+
+
+def _format_crop_value(value: float) -> str:
+    return f"{value:.6f}".rstrip("0").rstrip(".")
 
 
 def sidecar_is_rejected(path: Path) -> bool:

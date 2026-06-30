@@ -29,6 +29,7 @@ class VisionBackend(ABC):
         self,
         prompt: str,
         previews: list[PreviewImage],
+        include_crop: bool = False,
     ) -> list[EditSuggestion]:
         """
         Suggest gentle global develop adjustments, one per preview in input order.

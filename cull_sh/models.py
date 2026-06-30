@@ -119,6 +119,12 @@ class EditSuggestion:
     highlights: int = 0  # -100..100
     shadows: int = 0  # -100..100
     vibrance: int = 0  # -100..100
+    has_crop: bool = False
+    crop_left: float = 0.0  # normalized 0..1
+    crop_top: float = 0.0  # normalized 0..1
+    crop_right: float = 1.0  # normalized 0..1
+    crop_bottom: float = 1.0  # normalized 0..1
+    crop_angle: float = 0.0  # degrees
     summary: str = ""
 
     @property
@@ -129,6 +135,7 @@ class EditSuggestion:
             and self.highlights == 0
             and self.shadows == 0
             and self.vibrance == 0
+            and not self.has_crop
         )
 
 

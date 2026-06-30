@@ -31,10 +31,21 @@ class CliHelperTests(unittest.TestCase):
                 highlights=-10,
                 shadows=4,
                 vibrance=3,
+                has_crop=True,
+                crop_left=0.1,
+                crop_top=0.05,
+                crop_right=0.9,
+                crop_bottom=0.95,
+                crop_angle=-1.5,
                 summary="Slightly dark foreground.",
             )
 
-            path = _write_edit_suggestions_header(run_dir, "prompt", dry_run=False)
+            path = _write_edit_suggestions_header(
+                run_dir,
+                "prompt",
+                dry_run=False,
+                with_crop=True,
+            )
             self.assertEqual(path.read_text(encoding="utf-8").count("\n"), 1)
 
             _append_edit_suggestions(path, [(asset, suggestion)])
@@ -43,9 +54,18 @@ class CliHelperTests(unittest.TestCase):
                 json.loads(line)
                 for line in path.read_text(encoding="utf-8").splitlines()
             ]
-            self.assertEqual(rows[0], {"prompt": "prompt", "dry_run": False})
+            self.assertEqual(
+                rows[0],
+                {"prompt": "prompt", "dry_run": False, "with_crop": True},
+            )
             self.assertEqual(rows[1]["filename"], "frame.ARW")
             self.assertEqual(rows[1]["raw_path"], str(asset.raw_path))
+            self.assertTrue(rows[1]["has_crop"])
+            self.assertEqual(rows[1]["crop_left"], 0.1)
+            self.assertEqual(rows[1]["crop_top"], 0.05)
+            self.assertEqual(rows[1]["crop_right"], 0.9)
+            self.assertEqual(rows[1]["crop_bottom"], 0.95)
+            self.assertEqual(rows[1]["crop_angle"], -1.5)
             self.assertEqual(rows[1]["summary"], "Slightly dark foreground.")
 
     def test_edit_suggestion_fallback_retries_each_image(self) -> None:
@@ -64,6 +84,7 @@ class CliHelperTests(unittest.TestCase):
             backend,
             "prompt",
             previews,
+            include_crop=True,
         )
 
         self.assertEqual([asset.filename for asset, _ in pairs], ["a.ARW", "b.ARW"])
@@ -71,6 +92,14 @@ class CliHelperTests(unittest.TestCase):
         self.assertEqual(fallback, 2)
         self.assertEqual(errors, [])
         self.assertEqual(backend.suggest_edits.call_count, 3)
+        self.assertEqual(
+            [call.kwargs for call in backend.suggest_edits.call_args_list],
+            [
+                {"include_crop": True},
+                {"include_crop": True},
+                {"include_crop": True},
+            ],
+        )
 
 
 def _build_preview(raw_path: str) -> PreviewImage:

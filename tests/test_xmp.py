@@ -193,6 +193,7 @@ class XmpSidecarTests(unittest.TestCase):
             self.assertEqual(description.get(f"{{{CRS_NS}}}Shadows2012"), "25")
             self.assertEqual(description.get(f"{{{CRS_NS}}}Vibrance"), "8")
             self.assertEqual(description.get(f"{{{CRS_NS}}}HasSettings"), "True")
+            self.assertIsNone(description.get(f"{{{CRS_NS}}}HasCrop"))
 
     def test_write_develop_sidecar_preserves_cull_decision(self) -> None:
         with TemporaryDirectory() as tmp_dir:
@@ -225,6 +226,80 @@ class XmpSidecarTests(unittest.TestCase):
             self.assertEqual(description.get(f"{{{CRS_NS}}}Exposure2012"), "-0.30")
             self.assertEqual(description.get(f"{{{CRS_NS}}}Highlights2012"), "-30")
             self.assertFalse(sidecar_is_rejected(target))
+
+    def test_write_develop_sidecar_writes_crop_when_requested(self) -> None:
+        with TemporaryDirectory() as tmp_dir:
+            target = Path(tmp_dir) / "frame.xmp"
+            write_xmp_sidecar(
+                target,
+                FinalDecision(
+                    filename="frame.ARW",
+                    rating=5,
+                    label=ColorLabel.GREEN,
+                    bucket=DecisionBucket.PICK,
+                    source=DecisionSource.VISION,
+                ),
+            )
+            suggestion = EditSuggestion(
+                filename="frame.ARW",
+                exposure=0.2,
+                contrast=4,
+                highlights=-8,
+                shadows=6,
+                vibrance=3,
+                has_crop=True,
+                crop_left=0.1,
+                crop_top=0.05,
+                crop_right=0.9,
+                crop_bottom=0.95,
+                crop_angle=-1.5,
+            )
+
+            write_develop_sidecar(target, suggestion)
+
+            tree = ET.parse(target)
+            description = tree.getroot().find("rdf:RDF/rdf:Description", NAMESPACES)
+            assert description is not None
+            self.assertEqual(description.get(f"{{{CRS_NS}}}HasCrop"), "True")
+            self.assertEqual(description.get(f"{{{CRS_NS}}}CropLeft"), "0.1")
+            self.assertEqual(description.get(f"{{{CRS_NS}}}CropTop"), "0.05")
+            self.assertEqual(description.get(f"{{{CRS_NS}}}CropRight"), "0.9")
+            self.assertEqual(description.get(f"{{{CRS_NS}}}CropBottom"), "0.95")
+            self.assertEqual(description.get(f"{{{CRS_NS}}}CropAngle"), "-1.5")
+            self.assertEqual(
+                description.get("{http://ns.adobe.com/xmp/1.0/DynamicMedia/}Pick"),
+                "1",
+            )
+
+    def test_write_develop_sidecar_without_crop_preserves_existing_crop(self) -> None:
+        with TemporaryDirectory() as tmp_dir:
+            target = Path(tmp_dir) / "frame.xmp"
+            target.write_text(
+                """<?xml version="1.0" encoding="UTF-8"?>
+<x:xmpmeta xmlns:x="adobe:ns:meta/" xmlns:rdf="http://www.w3.org/1999/02/22-rdf-syntax-ns#" xmlns:crs="http://ns.adobe.com/camera-raw-settings/1.0/">
+  <rdf:RDF>
+    <rdf:Description rdf:about="" crs:HasCrop="True" crs:CropLeft="0.2" crs:CropTop="0.1" crs:CropRight="0.8" crs:CropBottom="0.9" crs:CropAngle="1.25"/>
+  </rdf:RDF>
+</x:xmpmeta>
+""",
+                encoding="utf-8",
+            )
+
+            write_develop_sidecar(
+                target,
+                EditSuggestion(filename="frame.ARW", exposure=-0.3, highlights=-30),
+            )
+
+            tree = ET.parse(target)
+            description = tree.getroot().find("rdf:RDF/rdf:Description", NAMESPACES)
+            assert description is not None
+            self.assertEqual(description.get(f"{{{CRS_NS}}}HasCrop"), "True")
+            self.assertEqual(description.get(f"{{{CRS_NS}}}CropLeft"), "0.2")
+            self.assertEqual(description.get(f"{{{CRS_NS}}}CropTop"), "0.1")
+            self.assertEqual(description.get(f"{{{CRS_NS}}}CropRight"), "0.8")
+            self.assertEqual(description.get(f"{{{CRS_NS}}}CropBottom"), "0.9")
+            self.assertEqual(description.get(f"{{{CRS_NS}}}CropAngle"), "1.25")
+            self.assertEqual(description.get(f"{{{CRS_NS}}}Exposure2012"), "-0.30")
 
     def test_write_lightroom_edit_sidecar_applies_lens_corrections(self) -> None:
         with TemporaryDirectory() as tmp_dir:
