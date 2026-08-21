@@ -10,3 +10,4 @@ runs/
 backups/
 cache/
 tmp/
+.worktrees/

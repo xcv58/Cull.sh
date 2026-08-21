@@ -8,7 +8,7 @@ from unittest.mock import MagicMock
 
 from cull_sh.backends.base import VisionBackendError
 from cull_sh.cli import _append_edit_suggestions
-from cull_sh.cli import _suggest_edit_pairs_with_fallback
+from cull_sh.cli import _suggest_edit_pairs_fail_fast
 from cull_sh.cli import _write_edit_suggestions_header
 from cull_sh.models import EditSuggestion
 from cull_sh.models import PreviewImage
@@ -68,38 +68,42 @@ class CliHelperTests(unittest.TestCase):
             self.assertEqual(rows[1]["crop_angle"], -1.5)
             self.assertEqual(rows[1]["summary"], "Slightly dark foreground.")
 
-    def test_edit_suggestion_fallback_retries_each_image(self) -> None:
+    def test_edit_suggestion_failure_does_not_retry_or_fallback(self) -> None:
         previews = [
             _build_preview("/tmp/a.ARW"),
             _build_preview("/tmp/b.ARW"),
         ]
         backend = MagicMock()
-        backend.suggest_edits.side_effect = [
-            VisionBackendError("bad cohort"),
-            [EditSuggestion(filename="a.ARW", summary="A needs contrast.")],
-            [EditSuggestion(filename="b.ARW", summary="B needs shadows.")],
-        ]
+        backend.suggest_edits.side_effect = VisionBackendError("bad cohort")
 
-        pairs, failed, fallback, errors = _suggest_edit_pairs_with_fallback(
-            backend,
-            "prompt",
-            previews,
-            include_crop=True,
-        )
+        with self.assertRaisesRegex(VisionBackendError, "bad cohort"):
+            _suggest_edit_pairs_fail_fast(
+                backend,
+                "prompt",
+                previews,
+                include_crop=True,
+            )
 
-        self.assertEqual([asset.filename for asset, _ in pairs], ["a.ARW", "b.ARW"])
-        self.assertEqual(failed, 1)
-        self.assertEqual(fallback, 2)
-        self.assertEqual(errors, [])
-        self.assertEqual(backend.suggest_edits.call_count, 3)
+        self.assertEqual(backend.suggest_edits.call_count, 1)
         self.assertEqual(
             [call.kwargs for call in backend.suggest_edits.call_args_list],
-            [
-                {"include_crop": True},
-                {"include_crop": True},
-                {"include_crop": True},
-            ],
+            [{"include_crop": True}],
         )
+
+    def test_edit_suggestion_count_mismatch_fails_fast(self) -> None:
+        previews = [
+            _build_preview("/tmp/a.ARW"),
+            _build_preview("/tmp/b.ARW"),
+        ]
+        backend = MagicMock()
+        backend.suggest_edits.return_value = [
+            EditSuggestion(filename="a.ARW", summary="A needs contrast.")
+        ]
+
+        with self.assertRaisesRegex(VisionBackendError, "unexpected number"):
+            _suggest_edit_pairs_fail_fast(backend, "prompt", previews)
+
+        self.assertEqual(backend.suggest_edits.call_count, 1)
 
 
 def _build_preview(raw_path: str) -> PreviewImage:
