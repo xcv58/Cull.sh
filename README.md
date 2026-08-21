@@ -84,6 +84,9 @@ python main.py repair-sidecars --run-dir runs/20260411-220756-823242
 `orcarouter/Qwen3.8-27B-Uncensored` model by default. Model calls are fail-fast:
 the command makes no fallback-model or per-image recovery request, and stops on
 the first failed cohort so the underlying local-model problem can be fixed.
+Both culling and editing also send a bounded Ollama `num_predict` value
+(`--backend-max-output-tokens`, default 1024) so a malformed structured response
+cannot generate indefinitely while keeping the HTTP connection active.
 
 `benchmark` reads existing Lightroom XMP picks, ratings, and rejects as human
 ground truth without modifying photos or sidecars. It compares the current

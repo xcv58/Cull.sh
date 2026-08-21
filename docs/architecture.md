@@ -59,7 +59,9 @@ The provider-agnostic backend receives only viable, scene-ranked previews and a
 resolved prompt. Responses are schema-validated and normalized into ratings,
 labels, pick/review/reject buckets, and audit text. The current Qwen 27B model is
 not used for this phase because its independent culling benchmark materially
-underperformed the frozen production pipeline.
+underperformed the frozen production pipeline. Ollama generation is capped with
+`num_predict`; this bounds malformed responses that continue streaming and
+therefore do not trigger an inactivity timeout.
 
 ### 5. Persistence
 

@@ -545,6 +545,21 @@ def cull(
         "http://localhost:11434",
         help="Base URL for the selected backend.",
     ),
+    backend_timeout: float = typer.Option(
+        300.0,
+        min=1.0,
+        help="Per-request Ollama inactivity timeout in seconds.",
+    ),
+    backend_max_attempts: int = typer.Option(
+        3,
+        min=1,
+        help="Maximum attempts for a failed or malformed culling response.",
+    ),
+    backend_max_output_tokens: int = typer.Option(
+        1024,
+        min=1,
+        help="Hard Ollama generation ceiling for each structured response.",
+    ),
     batch_size: int = typer.Option(
         4,
         min=1,
@@ -693,6 +708,9 @@ def cull(
             provider=provider,
             model=model,
             base_url=backend_url,
+            timeout_seconds=backend_timeout,
+            max_attempts=backend_max_attempts,
+            max_output_tokens=backend_max_output_tokens,
         ),
         limit=limit,
         batch_size=batch_size,
@@ -1130,6 +1148,11 @@ def suggest_edits(
         min=1,
         help="Maximum attempts for each edit suggestion model call; defaults to fail-fast.",
     ),
+    backend_max_output_tokens: int = typer.Option(
+        1024,
+        min=1,
+        help="Hard Ollama generation ceiling for each structured edit response.",
+    ),
     batch_size: int = typer.Option(
         4,
         min=1,
@@ -1219,6 +1242,7 @@ def suggest_edits(
                 base_url=backend_url,
                 timeout_seconds=backend_timeout,
                 max_attempts=max_attempts,
+                max_output_tokens=backend_max_output_tokens,
             )
         )
     except ValueError as exc:

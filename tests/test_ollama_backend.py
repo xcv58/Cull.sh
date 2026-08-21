@@ -69,6 +69,7 @@ class OllamaBackendTests(unittest.TestCase):
             max_attempts=1,
             temperature=0.25,
             think=False,
+            max_output_tokens=321,
         )
         preview = _build_preview("frame.ARW")
         response = MagicMock()
@@ -90,6 +91,7 @@ class OllamaBackendTests(unittest.TestCase):
 
         payload = fake_client.post.call_args.kwargs["json"]
         self.assertEqual(payload["options"]["temperature"], 0.25)
+        self.assertEqual(payload["options"]["num_predict"], 321)
         self.assertFalse(payload["think"])
 
     def test_score_batch_raises_after_repeated_server_errors(self) -> None:

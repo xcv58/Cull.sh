@@ -45,6 +45,9 @@ class ManifestTests(unittest.TestCase):
             self.assertEqual(payload["topiq_shadow_low_percentile"], 0.2)
             self.assertEqual(payload["topiq_shadow_high_percentile"], 0.8)
             self.assertEqual(payload["topiq_shadow_max_items"], 80)
+            self.assertEqual(payload["backend_timeout_seconds"], 300.0)
+            self.assertEqual(payload["backend_max_attempts"], 3)
+            self.assertEqual(payload["backend_max_output_tokens"], 1024)
 
     def test_find_latest_run_dir_returns_last_directory(self) -> None:
         with TemporaryDirectory() as tmp_dir:

@@ -127,6 +127,7 @@ class OllamaVisionBackend(VisionBackend):
         retry_backoff_seconds: float = 2.0,
         temperature: float = 0.0,
         think: bool | str | None = None,
+        max_output_tokens: int = 1024,
     ) -> None:
         self.base_url = base_url.rstrip("/")
         self.model = model
@@ -135,6 +136,9 @@ class OllamaVisionBackend(VisionBackend):
         self.retry_backoff_seconds = retry_backoff_seconds
         self.temperature = temperature
         self.think = think
+        if max_output_tokens < 1:
+            raise ValueError("max_output_tokens must be at least 1")
+        self.max_output_tokens = max_output_tokens
 
     def score_batch(
         self,
@@ -235,7 +239,10 @@ class OllamaVisionBackend(VisionBackend):
             ],
             "format": OllamaBatchDecisionPayload.model_json_schema(),
             "stream": False,
-            "options": {"temperature": self.temperature},
+            "options": {
+                "temperature": self.temperature,
+                "num_predict": self.max_output_tokens,
+            },
         }
         if self.think is not None:
             request_payload["think"] = self.think
@@ -378,7 +385,10 @@ class OllamaVisionBackend(VisionBackend):
             ],
             "format": payload_schema,
             "stream": False,
-            "options": {"temperature": self.temperature},
+            "options": {
+                "temperature": self.temperature,
+                "num_predict": self.max_output_tokens,
+            },
         }
         if self.think is not None:
             request_payload["think"] = self.think
