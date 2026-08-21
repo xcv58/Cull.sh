@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import unittest
+from unittest.mock import patch
 
 import cv2
 import numpy as np
@@ -9,9 +10,44 @@ from cull_sh.models import LocalQualityMetrics
 from cull_sh.quality import analyze_local_quality
 from cull_sh.quality import build_local_decision_trace
 from cull_sh.quality import should_reject_for_local_quality
+from cull_sh.quality import compute_local_rank_score
+from cull_sh.quality import score_topiq_quality
 
 
 class LocalQualityTests(unittest.TestCase):
+    def test_topiq_shadow_score_is_normalized_to_ten_point_scale(self) -> None:
+        image = np.zeros((80, 80, 3), dtype=np.uint8)
+        ok, encoded = cv2.imencode(".jpg", image)
+        self.assertTrue(ok)
+
+        class Metric:
+            def __call__(self, _tensor):
+                import torch
+
+                return torch.tensor(0.65)
+
+        with patch("cull_sh.quality._load_topiq_metric", return_value=Metric()):
+            score = score_topiq_quality(encoded.tobytes())
+
+        self.assertAlmostEqual(score, 6.5, places=5)
+
+    def test_topiq_does_not_change_hard_gate_local_rank_score(self) -> None:
+        baseline = LocalQualityMetrics(
+            blur_score=100.0,
+            tenengrad_score=30.0,
+            musiq_score=60.0,
+            nima_score=5.0,
+        )
+        shadow = LocalQualityMetrics(
+            blur_score=100.0,
+            tenengrad_score=30.0,
+            musiq_score=60.0,
+            nima_score=5.0,
+            topiq_score=1.0,
+        )
+
+        self.assertEqual(compute_local_rank_score(baseline), compute_local_rank_score(shadow))
+
     def test_analyze_local_quality_returns_multiple_metrics(self) -> None:
         image = np.zeros((80, 80, 3), dtype=np.uint8)
         image[:, :40] = 255

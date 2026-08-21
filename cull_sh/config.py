@@ -50,6 +50,13 @@ class PipelineConfig:
     min_blur_score: float = 110.0
     min_tenengrad_score: float = 45.0
     enable_learned_iqa: bool = True
+    enable_topiq_ranking: bool = True
+    topiq_rank_weight: float = 0.25
+    enable_topiq_shadow: bool = True
+    topiq_shadow_workers: int = 2
+    topiq_shadow_low_percentile: float = 0.2
+    topiq_shadow_high_percentile: float = 0.8
+    topiq_shadow_max_items: int = 80
     min_musiq_score: float = 50.0
     min_nima_score: float = 4.6
     enable_brisque: bool = True

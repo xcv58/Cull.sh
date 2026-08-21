@@ -4,6 +4,7 @@ httpx>=0.28,<1.0
 pydantic>=2.11,<3.0
 opencv-python>=4.12,<5.0
 numpy>=2.3,<3.0
+Pillow>=11,<13
 pyiqa>=0.1.15,<0.2
 brisque>=0.2,<0.3
 cpbd>=1.0.7,<2.0

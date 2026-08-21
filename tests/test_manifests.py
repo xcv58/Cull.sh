@@ -38,6 +38,13 @@ class ManifestTests(unittest.TestCase):
             self.assertEqual(payload["lightroom_edit_scope"], "all")
             self.assertTrue(payload["include_jpegs"])
             self.assertTrue(payload["mirror_paired_jpegs"])
+            self.assertTrue(payload["enable_topiq_shadow"])
+            self.assertTrue(payload["enable_topiq_ranking"])
+            self.assertEqual(payload["topiq_rank_weight"], 0.25)
+            self.assertEqual(payload["topiq_shadow_workers"], 2)
+            self.assertEqual(payload["topiq_shadow_low_percentile"], 0.2)
+            self.assertEqual(payload["topiq_shadow_high_percentile"], 0.8)
+            self.assertEqual(payload["topiq_shadow_max_items"], 80)
 
     def test_find_latest_run_dir_returns_last_directory(self) -> None:
         with TemporaryDirectory() as tmp_dir:

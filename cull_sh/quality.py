@@ -8,6 +8,8 @@ from cull_sh.models import LocalQualityMetrics
 
 _IQA_METRICS: dict[str, object] | None = None
 _IQA_IMPORT_ERROR: str | None = None
+_TOPIQ_METRIC: object | None = None
+_TOPIQ_IMPORT_ERROR: str | None = None
 _SUPPORT_METRICS: dict[str, object] | None = None
 _SUPPORT_IMPORT_ERRORS: dict[str, str] = {}
 
@@ -188,10 +190,42 @@ def learned_iqa_import_error() -> str | None:
     return _IQA_IMPORT_ERROR
 
 
+def topiq_shadow_available() -> bool:
+    return _load_topiq_metric() is not None
+
+
+def topiq_shadow_import_error() -> str | None:
+    if _TOPIQ_IMPORT_ERROR is None:
+        _load_topiq_metric()
+    return _TOPIQ_IMPORT_ERROR
+
+
 def support_metric_import_errors() -> dict[str, str]:
     if _SUPPORT_METRICS is None and not _SUPPORT_IMPORT_ERRORS:
         _load_support_metrics()
     return dict(_SUPPORT_IMPORT_ERRORS)
+
+
+def score_topiq_quality(image_bytes: bytes) -> float:
+    import cv2
+
+    cv2.setNumThreads(1)
+    array = np.frombuffer(image_bytes, dtype=np.uint8)
+    bgr = cv2.imdecode(array, cv2.IMREAD_COLOR)
+    if bgr is None:
+        raise ValueError("failed to decode preview bytes for TOPIQ NR scoring")
+    scorer = _load_topiq_metric()
+    if scorer is None:
+        raise RuntimeError(_TOPIQ_IMPORT_ERROR or "TOPIQ NR is unavailable")
+
+    import torch
+
+    torch.set_num_threads(1)
+    rgb = cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB)
+    image_tensor = _topiq_tensor(rgb, maximum=1024)
+    with torch.inference_mode():
+        raw_topiq = float(scorer(image_tensor).detach().cpu().item())
+    return max(0.0, min(10.0, raw_topiq * 10.0))
 
 
 def _learned_iqa_scores(bgr: np.ndarray) -> tuple[float | None, float | None]:
@@ -212,6 +246,25 @@ def _learned_iqa_scores(bgr: np.ndarray) -> tuple[float | None, float | None]:
         musiq_score = float(musiq_metric(image_tensor).detach().cpu().item())
         nima_score = float(nima_metric(image_tensor).detach().cpu().item())
     return musiq_score, nima_score
+
+
+def _topiq_tensor(rgb: np.ndarray, maximum: int):
+    from PIL import Image
+    import torch
+
+    image = Image.fromarray(rgb)
+    width, height = image.size
+    long_edge = max(width, height)
+    if long_edge <= maximum:
+        resized = image
+    else:
+        scale = maximum / long_edge
+        resized = image.resize(
+            (max(1, int(width * scale)), max(1, int(height * scale))),
+            Image.Resampling.LANCZOS,
+        )
+    array = np.asarray(resized, dtype=np.float32) / 255.0
+    return torch.from_numpy(array).permute(2, 0, 1).unsqueeze(0)
 
 
 def build_local_decision_trace(
@@ -277,6 +330,7 @@ def build_local_decision_trace(
             "tenengrad": metrics.tenengrad_score,
             "musiq": metrics.musiq_score,
             "nima": metrics.nima_score,
+            "topiq_nr": metrics.topiq_score,
             "brisque": metrics.brisque_score,
             "cpbd": metrics.cpbd_score,
             "brightness_mean": metrics.brightness_mean,
@@ -305,7 +359,6 @@ def build_local_decision_trace(
 def _load_iqa_metrics() -> dict[str, object] | None:
     global _IQA_METRICS
     global _IQA_IMPORT_ERROR
-
     if _IQA_METRICS is not None:
         return _IQA_METRICS
     if _IQA_IMPORT_ERROR is not None:
@@ -328,6 +381,24 @@ def _load_iqa_metrics() -> dict[str, object] | None:
         return None
 
     return _IQA_METRICS
+
+
+def _load_topiq_metric() -> object | None:
+    global _TOPIQ_METRIC
+    global _TOPIQ_IMPORT_ERROR
+
+    if _TOPIQ_METRIC is not None:
+        return _TOPIQ_METRIC
+    if _TOPIQ_IMPORT_ERROR is not None:
+        return None
+    try:
+        import pyiqa
+
+        _TOPIQ_METRIC = pyiqa.create_metric("topiq_nr", device="cpu")
+    except Exception as exc:  # pragma: no cover - optional dependency/runtime
+        _TOPIQ_IMPORT_ERROR = str(exc)
+        _TOPIQ_METRIC = None
+    return _TOPIQ_METRIC
 
 
 def _load_support_metrics() -> dict[str, object] | None:

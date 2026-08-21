@@ -125,12 +125,16 @@ class OllamaVisionBackend(VisionBackend):
         timeout_seconds: float = 300.0,
         max_attempts: int = 3,
         retry_backoff_seconds: float = 2.0,
+        temperature: float = 0.0,
+        think: bool | str | None = None,
     ) -> None:
         self.base_url = base_url.rstrip("/")
         self.model = model
         self.timeout_seconds = timeout_seconds
         self.max_attempts = max_attempts
         self.retry_backoff_seconds = retry_backoff_seconds
+        self.temperature = temperature
+        self.think = think
 
     def score_batch(
         self,
@@ -231,8 +235,10 @@ class OllamaVisionBackend(VisionBackend):
             ],
             "format": OllamaBatchDecisionPayload.model_json_schema(),
             "stream": False,
-            "options": {"temperature": 0},
+            "options": {"temperature": self.temperature},
         }
+        if self.think is not None:
+            request_payload["think"] = self.think
 
         return self._chat_structured(
             client,
@@ -372,8 +378,10 @@ class OllamaVisionBackend(VisionBackend):
             ],
             "format": payload_schema,
             "stream": False,
-            "options": {"temperature": 0},
+            "options": {"temperature": self.temperature},
         }
+        if self.think is not None:
+            request_payload["think"] = self.think
 
         return self._chat_structured(
             client,

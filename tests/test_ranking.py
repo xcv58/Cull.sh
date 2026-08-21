@@ -11,6 +11,7 @@ from cull_sh.models import RawAsset
 from cull_sh.models import WorkItem
 from cull_sh.models import WorkStatus
 from cull_sh.pipeline import apply_local_rejection
+from cull_sh.ranking import apply_topiq_rank_blend
 from cull_sh.ranking import build_scene_cohorts
 from cull_sh.ranking import rescue_scene_review_candidates
 from cull_sh.ranking import sort_candidates_for_vision
@@ -22,6 +23,7 @@ def _item(
     scene_id: str,
     rank_score: float,
     perceptual_hash: str,
+    topiq_score: float | None = None,
 ) -> WorkItem:
     path = Path("/tmp") / filename
     return WorkItem(
@@ -32,12 +34,39 @@ def _item(
             blur_score=rank_score,
             tenengrad_score=rank_score / 10.0,
             local_rank_score=rank_score,
+            topiq_score=topiq_score,
             perceptual_hash=perceptual_hash,
         ),
     )
 
 
 class SceneRankingTests(unittest.TestCase):
+    def test_topiq_blend_uses_calibrated_folder_percentiles(self) -> None:
+        items = [
+            _item("A.ARW", "scene-0001", 300.0, "0000000000000000", 10.0),
+            _item("B.ARW", "scene-0001", 400.0, "1111111111111111", 1.0),
+            _item("C.ARW", "scene-0002", 100.0, "2222222222222222", 3.0),
+            _item("D.ARW", "scene-0002", 200.0, "3333333333333333", 5.0),
+            _item("E.ARW", "scene-0002", 500.0, "4444444444444444", 7.0),
+        ]
+
+        scored = apply_topiq_rank_blend(items, topiq_weight=0.25)
+        ordered = sort_candidates_for_vision(items)
+
+        self.assertEqual(scored, 5)
+        self.assertEqual([item.filename for item in ordered[:2]], ["A.ARW", "B.ARW"])
+        assert items[0].metrics is not None
+        self.assertAlmostEqual(items[0].metrics.combined_rank_score or 0.0, 0.625)
+
+    def test_topiq_blend_requires_complete_scores_when_enabled(self) -> None:
+        items = [
+            _item("A.ARW", "scene-0001", 300.0, "0000000000000000", 8.0),
+            _item("B.ARW", "scene-0001", 400.0, "1111111111111111"),
+        ]
+
+        with self.assertRaisesRegex(ValueError, "missing 1"):
+            apply_topiq_rank_blend(items, topiq_weight=0.25)
+
     def test_duplicate_suppression_rejects_lower_ranked_match(self) -> None:
         items = [
             _item("A.ARW", "scene-0001", 400.0, "0000000000000000"),

@@ -62,6 +62,36 @@ class OllamaBackendTests(unittest.TestCase):
         self.assertEqual(fake_client.post.call_count, 2)
         sleep.assert_called_once_with(2.0)
 
+    def test_score_batch_forwards_benchmark_inference_controls(self) -> None:
+        backend = OllamaVisionBackend(
+            base_url="http://localhost:11434",
+            model="qwen3.8:27b",
+            max_attempts=1,
+            temperature=0.25,
+            think=False,
+        )
+        preview = _build_preview("frame.ARW")
+        response = MagicMock()
+        response.raise_for_status.return_value = None
+        response.json.return_value = {
+            "message": {
+                "content": (
+                    '{"decisions":[{"id":"image-1","filename":"frame.ARW",'
+                    '"bucket":"review","rating":0,"label":null,"summary":""}]}'
+                )
+            }
+        }
+        fake_client = MagicMock()
+        fake_client.__enter__.return_value = fake_client
+        fake_client.post.return_value = response
+
+        with patch("cull_sh.backends.ollama.httpx.Client", return_value=fake_client):
+            backend.score_batch("prompt", [preview])
+
+        payload = fake_client.post.call_args.kwargs["json"]
+        self.assertEqual(payload["options"]["temperature"], 0.25)
+        self.assertFalse(payload["think"])
+
     def test_score_batch_raises_after_repeated_server_errors(self) -> None:
         backend = OllamaVisionBackend(
             base_url="http://localhost:11434",
