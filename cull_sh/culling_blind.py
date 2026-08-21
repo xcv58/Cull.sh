@@ -160,16 +160,31 @@ def write_blind_culling_review(
     }
     rng = random.Random(seed)
     cards: list[str] = []
-    assignments: dict[str, dict[str, str]] = {}
+    assignments: dict[str, dict[str, object]] = {}
     for cohort in cohorts:
         for asset in cohort.assets:
             filename = asset.filename
             labels = [model_specs[0].label, model_specs[1].label]
             if rng.choice((False, True)):
                 labels.reverse()
-            assignments[filename] = {"A": labels[0], "B": labels[1]}
             variant_a = predictions[labels[0]].get(filename, _unavailable_decision())
             variant_b = predictions[labels[1]].get(filename, _unavailable_decision())
+            scoreable = all(
+                str(variant.get("bucket") or "unavailable") != "unavailable"
+                for variant in (variant_a, variant_b)
+            )
+            assignments[filename] = {
+                "A": labels[0],
+                "B": labels[1],
+                "scoreable": scoreable,
+            }
+            choice_html = (
+                f"<div class='choices' data-file='{escape(filename)}' data-scene='{escape(cohort.scene_id)}'>"
+                f"<button data-choice='A'>A is better</button><button data-choice='B'>B is better</button><button data-choice='tie'>Tie</button><strong id='choice-{escape(filename)}'></strong>"
+                "</div>"
+                if scoreable
+                else "<div class='not-scoreable'><strong>Excluded from preference scoring: one variant did not return a valid decision.</strong></div>"
+            )
             cards.append(
                 "<article>"
                 f"<h2>{escape(filename)} <span>{escape(cohort.scene_id)}</span></h2>"
@@ -178,15 +193,14 @@ def write_blind_culling_review(
                 + _decision_html("A", variant_a)
                 + _decision_html("B", variant_b)
                 + "</div>"
-                f"<div class='choices' data-file='{escape(filename)}' data-scene='{escape(cohort.scene_id)}'>"
-                f"<button data-choice='A'>A is better</button><button data-choice='B'>B is better</button><button data-choice='tie'>Tie</button><strong id='choice-{escape(filename)}'></strong>"
-                "</div></article>"
+                + choice_html
+                + "</article>"
             )
     answer_key_path = run_dir / "blind-culling-answer-key.json"
-    _write_or_verify_json(
+    _write_or_upgrade_answer_key(
         answer_key_path,
         {
-            "schema_version": 1,
+            "schema_version": 2,
             "seed": seed,
             "models": [asdict(spec) for spec in model_specs],
             "assignments": assignments,
@@ -213,13 +227,18 @@ def score_blind_culling_choices(
         for row in csv.DictReader(handle):
             filename = str(row.get("filename") or "")
             choice = str(row.get("choice") or "").strip()
-            if filename not in assignments or choice not in {"A", "B", "tie"}:
+            assignment = assignments.get(filename)
+            if (
+                not isinstance(assignment, dict)
+                or not assignment.get("scoreable")
+                or choice not in {"A", "B", "tie"}
+            ):
                 continue
             reviewed += 1
             if choice == "tie":
                 counts["tie"] += 1
             else:
-                counts[str(assignments[filename][choice])] += 1
+                counts[str(assignment[choice])] += 1
     payload: dict[str, object] = {
         "reviewed": reviewed,
         "counts": counts,
@@ -293,12 +312,12 @@ button{padding:9px 13px;border-radius:8px;border:1px solid #555;background:#2929
 article{background:#191919;border:1px solid #333;border-radius:14px;padding:16px;margin:18px 0}h2{font-size:1rem}h2 span{color:#999;font-weight:normal}
 .comparison{display:grid;grid-template-columns:1.4fr 1fr 1fr;gap:14px}figure{margin:0}img{display:block;width:100%;height:420px;object-fit:contain;background:#080808;border-radius:8px}
 .decision{border:1px solid #444;border-radius:10px;padding:14px}.bucket{font-weight:700}.pick{color:#52b788}.review{color:#e9c46a}.reject{color:#e76f51}.unavailable{color:#aaa}
-.choices{display:flex;gap:10px;align-items:center;margin-top:12px}@media(max-width:900px){.comparison{grid-template-columns:1fr}.choices{flex-wrap:wrap}img{height:auto}}
+.choices{display:flex;gap:10px;align-items:center;margin-top:12px}.not-scoreable{margin-top:12px;color:#e9c46a}@media(max-width:900px){.comparison{grid-template-columns:1fr}.choices{flex-wrap:wrap}img{height:auto}}
 </style></head><body><h1>Blind culling-model review</h1>
 <p class='note'>For each photograph, choose which hidden model gives the more appropriate pick/review/reject judgment. The answer key is not embedded in this page. No XMP was read or written.</p>
 <div class='toolbar'><button id='download'>Download choices CSV</button><strong id='count'></strong></div>""" + cards + """
 <script>const key='cull-sh-blind-culling-'+location.pathname;const saved=JSON.parse(localStorage.getItem(key)||'{}');
-function refresh(){let n=0;document.querySelectorAll('.choices').forEach(group=>{const value=saved[group.dataset.file];group.querySelectorAll('button').forEach(button=>button.classList.toggle('selected',button.dataset.choice===value));const out=document.getElementById('choice-'+CSS.escape(group.dataset.file));out.textContent=value?('Selected: '+value):'';if(value)n++;});document.getElementById('count').textContent=n+' reviewed';localStorage.setItem(key,JSON.stringify(saved));}
+function refresh(){let n=0;const groups=document.querySelectorAll('.choices');groups.forEach(group=>{const value=saved[group.dataset.file];group.querySelectorAll('button').forEach(button=>button.classList.toggle('selected',button.dataset.choice===value));const out=document.getElementById('choice-'+CSS.escape(group.dataset.file));out.textContent=value?('Selected: '+value):'';if(value)n++;});document.getElementById('count').textContent=n+' of '+groups.length+' reviewed';localStorage.setItem(key,JSON.stringify(saved));}
 document.querySelectorAll('.choices button').forEach(button=>button.onclick=()=>{const group=button.closest('.choices');saved[group.dataset.file]=button.dataset.choice;refresh();});
 document.getElementById('download').onclick=()=>{const rows=[['filename','scene_id','choice']];document.querySelectorAll('.choices').forEach(group=>rows.push([group.dataset.file,group.dataset.scene,saved[group.dataset.file]||'']));const csv=rows.map(row=>row.map(value=>'"'+String(value).replaceAll('"','""')+'"').join(',')).join('\n');const link=document.createElement('a');link.href=URL.createObjectURL(new Blob([csv],{type:'text/csv'}));link.download='blind-culling-choices.csv';link.click();URL.revokeObjectURL(link.href);};refresh();</script></body></html>"""
 
@@ -322,6 +341,31 @@ def _write_or_verify_json(path: Path, payload: object) -> None:
         if existing != payload:
             raise ValueError(f"existing locked artifact does not match: {path}")
         return
+    path.write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+
+
+def _write_or_upgrade_answer_key(path: Path, payload: dict[str, object]) -> None:
+    if not path.exists():
+        _write_or_verify_json(path, payload)
+        return
+    existing = json.loads(path.read_text(encoding="utf-8"))
+    if existing == payload:
+        return
+    if existing.get("schema_version") != 1:
+        raise ValueError(f"existing locked artifact does not match: {path}")
+    existing_assignments = existing.get("assignments")
+    updated_assignments = payload.get("assignments")
+    if not isinstance(existing_assignments, dict) or not isinstance(updated_assignments, dict):
+        raise ValueError(f"existing locked artifact does not match: {path}")
+    expected_legacy = {
+        filename: {"A": assignment["A"], "B": assignment["B"]}
+        for filename, assignment in updated_assignments.items()
+    }
+    legacy_payload = dict(payload)
+    legacy_payload["schema_version"] = 1
+    legacy_payload["assignments"] = expected_legacy
+    if existing != legacy_payload:
+        raise ValueError(f"existing locked artifact does not match: {path}")
     path.write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n", encoding="utf-8")
 
 

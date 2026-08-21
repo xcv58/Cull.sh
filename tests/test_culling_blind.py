@@ -125,6 +125,59 @@ class CullingBlindTests(unittest.TestCase):
             self.assertEqual(score["counts"][winner], 1)
             self.assertEqual(score["counts"]["tie"], 1)
 
+    def test_unavailable_variant_is_visible_but_excluded_from_scoring(self) -> None:
+        with TemporaryDirectory() as tmp_dir:
+            run_dir = Path(tmp_dir)
+            asset = RawAsset(
+                raw_path=run_dir / "DSC0001.ARW",
+                xmp_path=run_dir / "DSC0001.xmp",
+            )
+            cohort = VLMCohort(
+                cohort_id="scene-0001-blind-001",
+                scene_id="scene-0001",
+                assets=(asset,),
+                human_labels=("unreviewed",),
+            )
+            specs = [
+                VLMModelSpec(label="gemma4-12b", model="gemma4:12b"),
+                VLMModelSpec(label="qwen3-8-27b-nothink", model="qwen:test"),
+            ]
+            (run_dir / "gemma4-12b.jsonl").write_text(
+                json.dumps({"cohort_id": cohort.cohort_id, "status": "failed"}) + "\n",
+                encoding="utf-8",
+            )
+            (run_dir / "qwen3-8-27b-nothink.jsonl").write_text(
+                json.dumps(
+                    {
+                        "cohort_id": cohort.cohort_id,
+                        "status": "success",
+                        "decisions": [
+                            {
+                                "filename": asset.filename,
+                                "bucket": "review",
+                                "rating": 1,
+                                "label": "Yellow",
+                                "summary": "Usable frame.",
+                            }
+                        ],
+                    }
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+
+            page, _ = write_blind_culling_review(run_dir, [cohort], specs, seed=1)
+            choices_path = run_dir / "choices.csv"
+            choices_path.write_text(
+                "filename,scene_id,choice\nDSC0001.ARW,scene-0001,A\n",
+                encoding="utf-8",
+            )
+            score = score_blind_culling_choices(run_dir, choices_path)
+
+            self.assertIn("Excluded from preference scoring", page.read_text(encoding="utf-8"))
+            self.assertEqual(score["reviewed"], 0)
+            self.assertEqual(sum(score["counts"].values()), 0)
+
 
 if __name__ == "__main__":
     unittest.main()
