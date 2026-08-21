@@ -17,6 +17,8 @@ from cull_sh.backends import build_backend
 from cull_sh.backends import VisionBackendError
 from cull_sh.benchmark import run_internal_benchmark
 from cull_sh.config import BackendConfig, DEFAULT_EXTENSIONS, JPEG_EXTENSIONS, PipelineConfig
+from cull_sh.culling_blind import run_culling_blind_test
+from cull_sh.culling_blind import score_blind_culling_choices
 from cull_sh.extractors import PreviewExtractionError
 from cull_sh.extractors import build_default_extractor
 from cull_sh.edit_benchmark import EditDatasetSpec
@@ -348,6 +350,96 @@ def model_benchmark(
     console.print(table)
     console.print(f"Run artifacts: {run_dir}")
     console.print(f"Report: {run_dir / 'vlm-benchmark.md'}")
+
+
+@app.command("blind-culling-test")
+def blind_culling_test(
+    frozen_run: Path = typer.Option(
+        ...,
+        exists=True,
+        file_okay=False,
+        dir_okay=True,
+        help="Frozen prospective Cull.sh run that defines semantic candidates.",
+    ),
+    gemma_model: str = typer.Option("gemma4:12b"),
+    qwen_model: str = typer.Option("orcarouter/Qwen3.8-27B-Uncensored"),
+    batch_size: int = typer.Option(4, min=1),
+    seed: int = typer.Option(20260821),
+    timeout_seconds: float = typer.Option(600.0, min=1.0),
+    max_attempts: int = typer.Option(2, min=1),
+    resume_run: Path | None = typer.Option(
+        None,
+        exists=True,
+        file_okay=False,
+        dir_okay=True,
+    ),
+    runs_root: Path = typer.Option(
+        Path("runs/culling-blind-tests"),
+        file_okay=False,
+        dir_okay=True,
+    ),
+) -> None:
+    """Create a hidden-identity Gemma/Qwen culling review without reading XMP."""
+    specs = [
+        VLMModelSpec(label="gemma4-12b", model=gemma_model),
+        VLMModelSpec(
+            label="qwen3-8-27b-nothink",
+            model=qwen_model,
+            think=False,
+        ),
+    ]
+    console.print("Blind culling test is read-only for photos and does not read XMP.")
+    try:
+        page, _answer_key = run_culling_blind_test(
+            frozen_run,
+            specs,
+            runs_root,
+            batch_size=batch_size,
+            seed=seed,
+            timeout_seconds=timeout_seconds,
+            max_attempts=max_attempts,
+            cull_sh_commit=_current_git_commit(),
+            resume_run=resume_run,
+            progress=console.print,
+        )
+    except (FileNotFoundError, VisionBackendError, ValueError) as exc:
+        console.print(f"Blind culling test failed: {exc}")
+        raise typer.Exit(code=1) from exc
+    console.print(f"Blind review page: {page}")
+    console.print(
+        "The hidden answer key is stored beside the page; do not open it until "
+        "after downloading blind-culling-choices.csv."
+    )
+
+
+@app.command("score-blind-culling")
+def score_blind_culling(
+    run_dir: Path = typer.Option(
+        ...,
+        exists=True,
+        file_okay=False,
+        dir_okay=True,
+    ),
+    choices: Path = typer.Option(
+        ...,
+        exists=True,
+        file_okay=True,
+        dir_okay=False,
+        help="blind-culling-choices.csv downloaded from the review page.",
+    ),
+) -> None:
+    """Reveal and score a completed blind culling-model review."""
+    payload = score_blind_culling_choices(run_dir, choices)
+    counts = payload["counts"]
+    assert isinstance(counts, dict)
+    table = Table(title="Blind culling review")
+    table.add_column("Outcome")
+    table.add_column("Count", justify="right")
+    for label, count in counts.items():
+        table.add_row(str(label), str(count))
+    console.print(table)
+    console.print(f"Scored {payload['reviewed']} reviewed photo(s).")
+    console.print(f"Report: {run_dir / 'blind-culling-score.md'}")
 
 
 @app.command("edit-model-benchmark")

@@ -116,7 +116,8 @@ exports.
 - `cull_sh.quality`: local and TOPIQ scoring.
 - `cull_sh.ranking`: scene-relative ranking and TOPIQ percentile blend.
 - `cull_sh.backends`: structured provider contracts and Ollama implementation.
-- `cull_sh.benchmark`, `edit_benchmark`, `vlm_benchmark`: frozen evaluations.
+- `cull_sh.benchmark`, `edit_benchmark`, `vlm_benchmark`, `culling_blind`:
+  frozen evaluations and hidden-identity human review.
 - `cull_sh.shadow`: capped local/TOPIQ disagreement review.
 - `cull_sh.rapidraw`: isolated staging, real-render review, approval enforcement,
   export provenance, and resume state.

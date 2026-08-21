@@ -62,6 +62,8 @@ This scaffold includes:
 python main.py doctor
 python main.py benchmark --path /path/to/human-reviewed/raws --facet-db /path/to/facet.db
 python main.py benchmark --path /path/to/newly-reviewed/raws --shadow-run runs/<original-cull-run>
+python main.py blind-culling-test --frozen-run runs/<prospective-cull-run>
+python main.py score-blind-culling --run-dir runs/culling-blind-tests/<timestamp> --choices ~/Downloads/blind-culling-choices.csv
 python main.py cull --path /path/to/raws --prompt "Keep the sharpest wildlife photos"
 python main.py cull --path /path/to/raws --genre portrait
 python main.py cull --path /path/to/raws --genre street --prefer "interesting gestures and layering"
@@ -94,6 +96,13 @@ MUSIQ/NIMA/local-quality signals with any cached Facet signals, writes a
 resumable current-signal cache, and reports global AUC, within-burst ranking,
 false-reject safety, and the behavior of the current local reject gate under
 `runs/<timestamp>/`.
+
+`blind-culling-test` compares Gemma 4 and Qwen 27B on the semantic candidates
+already locked by a prospective dry run. It reuses the frozen prompt, reads no
+XMP, writes no photo metadata, randomizes the per-photo A/B assignment, and
+keeps the answer key outside the generated HTML. Complete the review page,
+download `blind-culling-choices.csv`, and reveal the result only with
+`score-blind-culling`.
 
 Regular `cull` runs enable `--topiq-ranking` by default. Folder-relative TOPIQ
 and local-score percentiles are blended with a 25% TOPIQ weight for candidate
