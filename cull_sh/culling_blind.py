@@ -180,7 +180,10 @@ def write_blind_culling_review(
             }
             choice_html = (
                 f"<div class='choices' data-file='{escape(filename)}' data-scene='{escape(cohort.scene_id)}'>"
-                f"<button data-choice='A'>A is better</button><button data-choice='B'>B is better</button><button data-choice='tie'>Tie</button><strong id='choice-{escape(filename)}'></strong>"
+                "<button type='button' data-choice='A' aria-pressed='false'>A is better</button>"
+                "<button type='button' data-choice='B' aria-pressed='false'>B is better</button>"
+                "<button type='button' data-choice='tie' aria-pressed='false'>Tie</button>"
+                "<strong class='choice-status' aria-live='polite'></strong>"
                 "</div>"
                 if scoreable
                 else "<div class='not-scoreable'><strong>Excluded from preference scoring: one variant did not return a valid decision.</strong></div>"
@@ -308,7 +311,7 @@ def _review_html(cards: str) -> str:
 <title>Blind Gemma/Qwen culling review</title><style>
 :root{color-scheme:dark;font-family:system-ui,sans-serif;background:#101010;color:#eee}body{max-width:1700px;margin:auto;padding:28px}
 .note{color:#bbb}.toolbar{position:sticky;top:0;z-index:2;background:#101010ee;padding:12px 0;display:flex;gap:12px;align-items:center}
-button{padding:9px 13px;border-radius:8px;border:1px solid #555;background:#292929;color:#eee;cursor:pointer}button.selected{border-color:#2a9d8f;background:#174b45}
+button{padding:9px 13px;border-radius:8px;border:1px solid #666;background:#292929;color:#eee;cursor:pointer}button.selected{border-color:#8ff5df;background:#087f6f;color:#fff;box-shadow:0 0 0 3px #2a9d8f66;font-weight:700}
 article{background:#191919;border:1px solid #333;border-radius:14px;padding:16px;margin:18px 0}h2{font-size:1rem}h2 span{color:#999;font-weight:normal}
 .comparison{display:grid;grid-template-columns:1.4fr 1fr 1fr;gap:14px}figure{margin:0}img{display:block;width:100%;height:420px;object-fit:contain;background:#080808;border-radius:8px}
 .decision{border:1px solid #444;border-radius:10px;padding:14px}.bucket{font-weight:700}.pick{color:#52b788}.review{color:#e9c46a}.reject{color:#e76f51}.unavailable{color:#aaa}
@@ -316,10 +319,12 @@ article{background:#191919;border:1px solid #333;border-radius:14px;padding:16px
 </style></head><body><h1>Blind culling-model review</h1>
 <p class='note'>For each photograph, choose which hidden model gives the more appropriate pick/review/reject judgment. The answer key is not embedded in this page. No XMP was read or written.</p>
 <div class='toolbar'><button id='download'>Download choices CSV</button><strong id='count'></strong></div>""" + cards + """
-<script>const key='cull-sh-blind-culling-'+location.pathname;const saved=JSON.parse(localStorage.getItem(key)||'{}');
-function refresh(){let n=0;const groups=document.querySelectorAll('.choices');groups.forEach(group=>{const value=saved[group.dataset.file];group.querySelectorAll('button').forEach(button=>button.classList.toggle('selected',button.dataset.choice===value));const out=document.getElementById('choice-'+CSS.escape(group.dataset.file));out.textContent=value?('Selected: '+value):'';if(value)n++;});document.getElementById('count').textContent=n+' of '+groups.length+' reviewed';localStorage.setItem(key,JSON.stringify(saved));}
-document.querySelectorAll('.choices button').forEach(button=>button.onclick=()=>{const group=button.closest('.choices');saved[group.dataset.file]=button.dataset.choice;refresh();});
-document.getElementById('download').onclick=()=>{const rows=[['filename','scene_id','choice']];document.querySelectorAll('.choices').forEach(group=>rows.push([group.dataset.file,group.dataset.scene,saved[group.dataset.file]||'']));const csv=rows.map(row=>row.map(value=>'"'+String(value).replaceAll('"','""')+'"').join(',')).join('\n');const link=document.createElement('a');link.href=URL.createObjectURL(new Blob([csv],{type:'text/csv'}));link.download='blind-culling-choices.csv';link.click();URL.revokeObjectURL(link.href);};refresh();</script></body></html>"""
+<script>const key='cull-sh-blind-culling-'+location.pathname;const saved={};
+try{Object.assign(saved,JSON.parse(localStorage.getItem(key)||'{}'));}catch(_error){}
+function persist(){try{localStorage.setItem(key,JSON.stringify(saved));}catch(_error){}}
+function refresh(){let n=0;const groups=document.querySelectorAll('.choices');groups.forEach(group=>{const value=saved[group.dataset.file];group.querySelectorAll('button').forEach(button=>{const selected=button.dataset.choice===value;button.classList.toggle('selected',selected);button.setAttribute('aria-pressed',String(selected));});const out=group.querySelector('.choice-status');out.textContent=value?('Selected: '+value):'';if(value)n++;});document.getElementById('count').textContent=n+' of '+groups.length+' reviewed';persist();}
+document.querySelectorAll('.choices button').forEach(button=>button.addEventListener('click',()=>{const group=button.closest('.choices');saved[group.dataset.file]=button.dataset.choice;refresh();}));
+document.getElementById('download').onclick=()=>{const rows=[['filename','scene_id','choice']];document.querySelectorAll('.choices').forEach(group=>rows.push([group.dataset.file,group.dataset.scene,saved[group.dataset.file]||'']));const csv=rows.map(row=>row.map(value=>'"'+String(value).replaceAll('"','""')+'"').join(',')).join('\\n');const link=document.createElement('a');link.href=URL.createObjectURL(new Blob([csv],{type:'text/csv'}));link.download='blind-culling-choices.csv';link.click();URL.revokeObjectURL(link.href);};refresh();</script></body></html>"""
 
 
 def _write_cohorts(path: Path, cohorts: list[VLMCohort]) -> None:

@@ -109,6 +109,11 @@ class CullingBlindTests(unittest.TestCase):
             self.assertIn("Variant B", html)
             self.assertNotIn("gemma4-12b", html)
             self.assertNotIn("qwen3-8-27b-nothink", html)
+            self.assertIn("try{Object.assign(saved", html)
+            self.assertIn("button.setAttribute('aria-pressed'", html)
+            self.assertIn(".join('\\n')", html)
+            self.assertNotIn(".join('\n')", html)
+            self.assertNotIn("CSS.escape", html)
             answer_key = json.loads(answer_key_path.read_text(encoding="utf-8"))
             choices_path = run_dir / "choices.csv"
             with choices_path.open("w", encoding="utf-8", newline="") as handle:
