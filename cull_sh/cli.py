@@ -16,7 +16,11 @@ from rich.table import Table
 from cull_sh.backends import build_backend
 from cull_sh.backends import VisionBackendError
 from cull_sh.benchmark import run_internal_benchmark
-from cull_sh.config import BackendConfig, DEFAULT_EXTENSIONS, JPEG_EXTENSIONS, PipelineConfig
+from cull_sh.config import BackendConfig
+from cull_sh.config import DEFAULT_EXTENSIONS
+from cull_sh.config import DEFAULT_PRODUCTION_MODEL
+from cull_sh.config import JPEG_EXTENSIONS
+from cull_sh.config import PipelineConfig
 from cull_sh.culling_blind import run_culling_blind_test
 from cull_sh.culling_blind import run_ground_truth_culling_test
 from cull_sh.culling_blind import run_sampled_culling_blind_test
@@ -69,7 +73,6 @@ DEFAULT_EDIT_PROMPT = (
     "Suggest natural, balanced global edits that improve each photo while keeping "
     "a realistic look."
 )
-DEFAULT_EDIT_MODEL = "orcarouter/Qwen3.8-27B-Uncensored"
 DEFAULT_RAPIDRAW_BINARY = (
     Path.home() / "Applications/RapidRAW.app/Contents/MacOS/RapidRAW"
 )
@@ -798,14 +801,14 @@ def doctor(
             for model in models
             if isinstance(model, dict)
         }
-        edit_model_ready = DEFAULT_EDIT_MODEL in installed_names or any(
-            name.startswith(f"{DEFAULT_EDIT_MODEL}:") for name in installed_names
+        production_model_ready = DEFAULT_PRODUCTION_MODEL in installed_names or any(
+            name.startswith(f"{DEFAULT_PRODUCTION_MODEL}:") for name in installed_names
         )
         health.add_row(
-            "Edit model",
-            f"ready ({DEFAULT_EDIT_MODEL})"
-            if edit_model_ready
-            else f"missing ({DEFAULT_EDIT_MODEL})",
+            "Production model",
+            f"ready ({DEFAULT_PRODUCTION_MODEL})"
+            if production_model_ready
+            else f"missing ({DEFAULT_PRODUCTION_MODEL})",
         )
     except Exception as exc:  # pragma: no cover - environment dependent
         health.add_row("Ollama API", f"unreachable: {exc}")
@@ -835,7 +838,7 @@ def cull(
         help="Ask for genre and preferences when no prompt is provided.",
     ),
     provider: str = typer.Option("ollama", help="Vision backend provider."),
-    model: str = typer.Option("gemma4:12b", help="Vision backend model name."),
+    model: str = typer.Option(DEFAULT_PRODUCTION_MODEL, help="Vision backend model name."),
     backend_url: str = typer.Option(
         "http://localhost:11434",
         help="Base URL for the selected backend.",
@@ -846,9 +849,19 @@ def cull(
         help="Per-request Ollama inactivity timeout in seconds.",
     ),
     backend_max_attempts: int = typer.Option(
-        3,
+        1,
         min=1,
-        help="Maximum attempts for a failed or malformed culling response.",
+        help="Maximum attempts for a failed or malformed culling response; defaults to fail-fast.",
+    ),
+    backend_think: bool = typer.Option(
+        True,
+        "--backend-think/--no-backend-think",
+        help="Enable the production model's thinking mode.",
+    ),
+    backend_fail_fast: bool = typer.Option(
+        True,
+        "--backend-fail-fast/--continue-on-backend-error",
+        help="Stop after the first failed or malformed vision cohort.",
     ),
     backend_max_output_tokens: int = typer.Option(
         1024,
@@ -1005,6 +1018,8 @@ def cull(
             base_url=backend_url,
             timeout_seconds=backend_timeout,
             max_attempts=backend_max_attempts,
+            think=backend_think,
+            fail_fast=backend_fail_fast,
             max_output_tokens=backend_max_output_tokens,
         ),
         limit=limit,
@@ -1040,8 +1055,13 @@ def cull(
         dry_run=dry_run,
     )
 
-    with RichPipelineReporter(console) as reporter:
-        items, summary, run_dir = run_pipeline(config, reporter=reporter)
+    try:
+        with RichPipelineReporter(console) as reporter:
+            items, summary, run_dir = run_pipeline(config, reporter=reporter)
+    except VisionBackendError as exc:
+        console.print(f"Culling stopped after the first vision-model failure: {exc}")
+        console.print("No fallback model or additional cohort was attempted.")
+        raise typer.Exit(code=1) from exc
     console.print(f"Discovered {summary.discovered} photo file(s) under {path}")
     console.print(
         f"Assets: RAW={summary.raw_discovered}, JPEG={summary.jpeg_discovered}"
@@ -1428,7 +1448,7 @@ def suggest_edits(
         help="Optional short preference appended to the edit prompt.",
     ),
     provider: str = typer.Option("ollama", help="Vision backend provider."),
-    model: str = typer.Option(DEFAULT_EDIT_MODEL, help="Vision backend model name."),
+    model: str = typer.Option(DEFAULT_PRODUCTION_MODEL, help="Vision backend model name."),
     backend_url: str = typer.Option(
         "http://localhost:11434",
         help="Base URL for the selected backend.",
@@ -1442,6 +1462,11 @@ def suggest_edits(
         1,
         min=1,
         help="Maximum attempts for each edit suggestion model call; defaults to fail-fast.",
+    ),
+    backend_think: bool = typer.Option(
+        True,
+        "--backend-think/--no-backend-think",
+        help="Enable the production model's thinking mode.",
     ),
     backend_max_output_tokens: int = typer.Option(
         1024,
@@ -1537,6 +1562,8 @@ def suggest_edits(
                 base_url=backend_url,
                 timeout_seconds=backend_timeout,
                 max_attempts=max_attempts,
+                think=backend_think,
+                fail_fast=True,
                 max_output_tokens=backend_max_output_tokens,
             )
         )
@@ -1552,6 +1579,8 @@ def suggest_edits(
         provider=provider,
         model=model,
         source_root=path,
+        backend_think=backend_think,
+        backend_max_attempts=max_attempts,
     )
     console.print(f"Run artifacts: {run_dir}")
 
@@ -1912,6 +1941,8 @@ def _write_edit_suggestions_header(
     provider: str | None = None,
     model: str | None = None,
     source_root: Path | None = None,
+    backend_think: bool | str | None = None,
+    backend_max_attempts: int | None = None,
 ) -> Path:
     path = run_dir / "edit-suggestions.jsonl"
     header: dict[str, object] = {
@@ -1927,6 +1958,10 @@ def _write_edit_suggestions_header(
         header["model"] = model
     if source_root is not None:
         header["source_root"] = str(source_root.expanduser().resolve())
+    if backend_think is not None:
+        header["backend_think"] = backend_think
+    if backend_max_attempts is not None:
+        header["backend_max_attempts"] = backend_max_attempts
     with path.open("w", encoding="utf-8") as handle:
         handle.write(
             json.dumps(header, sort_keys=True)

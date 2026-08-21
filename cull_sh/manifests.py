@@ -146,6 +146,8 @@ def write_run_config(run_dir: Path, config: PipelineConfig) -> Path:
         "backend_url": config.backend.base_url,
         "backend_timeout_seconds": config.backend.timeout_seconds,
         "backend_max_attempts": config.backend.max_attempts,
+        "backend_think": config.backend.think,
+        "backend_fail_fast": config.backend.fail_fast,
         "backend_max_output_tokens": config.backend.max_output_tokens,
         "batch_size": config.batch_size,
         "extract_workers": config.extract_workers,

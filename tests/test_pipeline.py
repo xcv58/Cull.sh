@@ -1,15 +1,21 @@
 from __future__ import annotations
 
 from pathlib import Path
+from tempfile import TemporaryDirectory
 import unittest
+from unittest.mock import MagicMock
 from unittest.mock import patch
 
+from cull_sh.backends import VisionBackendError
+from cull_sh.config import BackendConfig
+from cull_sh.config import PipelineConfig
 from cull_sh.models import AssetKind
 from cull_sh.models import ColorLabel
 from cull_sh.models import DecisionBucket
 from cull_sh.models import DecisionSource
 from cull_sh.models import FinalDecision
 from cull_sh.models import LocalQualityMetrics
+from cull_sh.models import PreviewImage
 from cull_sh.models import RawAsset
 from cull_sh.models import WorkItem
 from cull_sh.models import WorkStatus
@@ -18,10 +24,37 @@ from cull_sh.pipeline import apply_vision_decision
 from cull_sh.pipeline import limit_items_to_scenes
 from cull_sh.pipeline import mirror_paired_jpeg_decisions
 from cull_sh.pipeline import persist_decisions
-from cull_sh.config import PipelineConfig
+from cull_sh.pipeline import score_with_backend
+from cull_sh.reporting import NullReporter
 
 
 class PipelineDecisionTests(unittest.TestCase):
+    def test_vision_model_failure_aborts_before_next_cohort(self) -> None:
+        first = _ready_item("first.ARW", "scene-0001")
+        second = _ready_item("second.ARW", "scene-0002")
+        backend = MagicMock()
+        backend.score_batch.side_effect = VisionBackendError("malformed response")
+        config = PipelineConfig(
+            path=Path("/tmp"),
+            prompt="test",
+            backend=BackendConfig(max_attempts=1, fail_fast=True),
+            batch_size=1,
+        )
+
+        with TemporaryDirectory() as tmp_dir:
+            with patch("cull_sh.pipeline.build_backend", return_value=backend):
+                with self.assertRaisesRegex(VisionBackendError, "scene-0001"):
+                    score_with_backend(
+                        [first, second],
+                        config,
+                        Path(tmp_dir),
+                        NullReporter(),
+                    )
+
+        backend.score_batch.assert_called_once()
+        self.assertEqual(first.status, WorkStatus.FAILED)
+        self.assertEqual(second.status, WorkStatus.READY_FOR_VISION)
+
     def test_apply_local_rejection_marks_red(self) -> None:
         item = WorkItem(
             asset=RawAsset(
@@ -209,6 +242,19 @@ class PipelineDecisionTests(unittest.TestCase):
         write_metadata.assert_called_once()
         self.assertTrue(item.sidecar_written)
         self.assertFalse(item.lightroom_edit_written)
+
+
+def _ready_item(filename: str, scene_id: str) -> WorkItem:
+    asset = RawAsset(
+        raw_path=Path("/tmp") / filename,
+        xmp_path=(Path("/tmp") / filename).with_suffix(".xmp"),
+    )
+    return WorkItem(
+        asset=asset,
+        status=WorkStatus.READY_FOR_VISION,
+        scene_id=scene_id,
+        preview=PreviewImage(asset=asset, image_bytes=b"jpeg-bytes"),
+    )
 
 
 if __name__ == "__main__":

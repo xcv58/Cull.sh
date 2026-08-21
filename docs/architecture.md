@@ -20,7 +20,7 @@ The current production split is:
 - Dry run is the default for culling and XMP edit commands.
 - Merge existing XMP rather than replacing unrelated metadata.
 - Keep TOPIQ out of the hard quality-reject vote.
-- Fail fast when required TOPIQ scores or Qwen edit responses are unavailable.
+- Fail fast when required TOPIQ scores or Qwen production responses are unavailable.
 - Stage RapidRAW work in a new isolated directory.
 - Require a manifest-matched approval file before final RapidRAW export, unless
   the caller explicitly passes `--approve-all`.
@@ -57,11 +57,12 @@ changing decisions. `--no-topiq-ranking` restores local-only ordering;
 
 The provider-agnostic backend receives only viable, scene-ranked previews and a
 resolved prompt. Responses are schema-validated and normalized into ratings,
-labels, pick/review/reject buckets, and audit text. The current Qwen 27B model is
-not used for this phase because its independent culling benchmark materially
-underperformed the frozen production pipeline. Ollama generation is capped with
-`num_predict`; this bounds malformed responses that continue streaming and
-therefore do not trigger an inactivity timeout.
+labels, pick/review/reject buckets, and audit text. Qwen 27B is the shared
+production semantic model for culling and editing. It runs with thinking enabled,
+one attempt, no fallback model, and aborts the run after the first failed cohort.
+The deterministic local gate and TOPIQ-assisted ranking remain the primary culling
+structure; Qwen supplies the final semantic triage rather than acting as a
+standalone selector. Ollama generation is capped with `num_predict`.
 
 ### 5. Persistence
 
@@ -103,10 +104,11 @@ exports.
 
 ## Model Policy
 
-- Culling: retain the validated existing local/semantic pipeline.
+- Culling: retain the validated local/TOPIQ structure with Qwen 27B semantic triage.
 - Candidate rank: local percentile 75%, TOPIQ-NR percentile 25%.
 - Hard reject: deterministic multi-signal technical gate; no TOPIQ vote.
-- Editing: Qwen 27B, fail-fast, no fallback.
+- Production model: Qwen 27B with thinking enabled, one attempt, fail-fast, no fallback.
+- Gemma: historical benchmark support only; not a production dependency.
 - Facet: benchmark/reference source only; do not depend on its complete pipeline.
 
 ## Primary Modules

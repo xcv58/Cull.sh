@@ -52,7 +52,7 @@ This scaffold includes:
 - XMP sidecar writing with merge support for existing RAW sidecars
 - embedded JPEG culling metadata
 - optional Lightroom sidecar edits for RAWs
-- opt-in Qwen develop suggestions with no fallback model
+- shared Qwen culling and develop suggestions with thinking enabled and no fallback model
 - approval-gated RapidRAW staging, preview rendering, and final export
 - architecture plan for the full app
 
@@ -85,11 +85,11 @@ python main.py repair-sidecars
 python main.py repair-sidecars --run-dir runs/20260411-220756-823242
 ```
 
-`suggest-edits` uses the local
-`orcarouter/Qwen3.8-27B-Uncensored` model by default. Model calls are fail-fast:
-the command makes no fallback-model or per-image recovery request, and stops on
-the first failed cohort so the underlying local-model problem can be fixed.
-Both culling and editing also send a bounded Ollama `num_predict` value
+Both `cull` and `suggest-edits` use the local
+`orcarouter/Qwen3.8-27B-Uncensored` model by default, with thinking enabled.
+Production model calls are fail-fast: each command makes one attempt, uses no
+fallback model, and stops on the first failed cohort so the underlying local-model
+problem can be fixed. Both culling and editing also send a bounded Ollama `num_predict` value
 (`--backend-max-output-tokens`, default 1024) so a malformed structured response
 cannot generate indefinitely while keeping the HTTP connection active.
 
@@ -242,8 +242,10 @@ python main.py suggest-edits --path "/path/to/raws" --include-unculled
 
 The model suggests exposure, contrast, highlights, shadows, vibrance, and an
 optional crop, all validated before a renderer receives them. Crop suggestions
-are off by default. The selected Qwen model is intentionally fail-fast: Cull.sh
-does not fall back to Gemma or retry failed photographs individually.
+are off by default. The selected Qwen model runs with thinking enabled and is
+intentionally fail-fast: Cull.sh does not use a fallback model or retry failed
+photographs individually. Gemma remains supported by historical benchmark commands,
+but is not a production dependency.
 
 ## RapidRAW Develop Workflow
 

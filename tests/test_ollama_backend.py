@@ -7,11 +7,14 @@ from unittest.mock import patch
 
 import httpx
 
+from cull_sh.backends import build_backend
 from cull_sh.backends.base import VisionBackendError
 from cull_sh.backends.ollama import OllamaVisionBackend
 from cull_sh.backends.ollama import _parse_batch_payload
 from cull_sh.backends.ollama import _parse_edit_payload
 from cull_sh.backends.ollama import _normalize_label
+from cull_sh.config import BackendConfig
+from cull_sh.config import DEFAULT_PRODUCTION_MODEL
 from cull_sh.models import ColorLabel
 from cull_sh.models import DecisionBucket
 from cull_sh.models import PreviewImage
@@ -19,6 +22,15 @@ from cull_sh.models import RawAsset
 
 
 class OllamaBackendTests(unittest.TestCase):
+    def test_production_backend_defaults_to_qwen_thinking_and_one_attempt(self) -> None:
+        backend = build_backend(BackendConfig())
+
+        self.assertIsInstance(backend, OllamaVisionBackend)
+        assert isinstance(backend, OllamaVisionBackend)
+        self.assertEqual(backend.model, DEFAULT_PRODUCTION_MODEL)
+        self.assertEqual(backend.max_attempts, 1)
+        self.assertTrue(backend.think)
+
     def test_normalize_label_accepts_null_like_values(self) -> None:
         self.assertIsNone(_normalize_label(None))
         self.assertIsNone(_normalize_label(""))

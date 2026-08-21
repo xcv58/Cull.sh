@@ -357,6 +357,9 @@ def score_with_backend(
         for item in ready_items:
             item.status = WorkStatus.FAILED
             item.error = f"vision backend setup failed: {exc}"
+        write_manifest(run_dir, items)
+        if config.backend.fail_fast:
+            raise VisionBackendError(f"vision backend setup failed: {exc}") from exc
         return
 
     cohorts = build_scene_cohorts(items, config.batch_size)
@@ -389,6 +392,11 @@ def score_with_backend(
                 "Persisted failed vision cohort "
                 f"{index}/{total_cohorts} for {scene_id} with {len(cohort)} item(s)."
             )
+            if config.backend.fail_fast:
+                reporter.complete_phase("vision", "Scoring with vision backend")
+                raise VisionBackendError(
+                    f"vision scoring failed for {scene_id}: {exc}"
+                ) from exc
             continue
 
         if len(decisions) != len(cohort):
@@ -401,6 +409,11 @@ def score_with_backend(
                 "Persisted failed vision cohort "
                 f"{index}/{total_cohorts} for {scene_id} with {len(cohort)} item(s)."
             )
+            if config.backend.fail_fast:
+                reporter.complete_phase("vision", "Scoring with vision backend")
+                raise VisionBackendError(
+                    f"vision scoring failed for {scene_id}: unexpected result count"
+                )
             continue
 
         for item, decision in zip(cohort, decisions):

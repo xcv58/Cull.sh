@@ -5,6 +5,7 @@ from pathlib import Path
 from tempfile import TemporaryDirectory
 import unittest
 
+from cull_sh.config import DEFAULT_PRODUCTION_MODEL
 from cull_sh.config import PipelineConfig
 from cull_sh.manifests import decision_from_manifest_record
 from cull_sh.manifests import find_latest_run_dir
@@ -46,7 +47,10 @@ class ManifestTests(unittest.TestCase):
             self.assertEqual(payload["topiq_shadow_high_percentile"], 0.8)
             self.assertEqual(payload["topiq_shadow_max_items"], 80)
             self.assertEqual(payload["backend_timeout_seconds"], 300.0)
-            self.assertEqual(payload["backend_max_attempts"], 3)
+            self.assertEqual(payload["model"], DEFAULT_PRODUCTION_MODEL)
+            self.assertEqual(payload["backend_max_attempts"], 1)
+            self.assertTrue(payload["backend_think"])
+            self.assertTrue(payload["backend_fail_fast"])
             self.assertEqual(payload["backend_max_output_tokens"], 1024)
 
     def test_find_latest_run_dir_returns_last_directory(self) -> None:
