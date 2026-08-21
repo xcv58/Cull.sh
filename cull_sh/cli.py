@@ -864,7 +864,7 @@ def cull(
         help="Stop after the first failed or malformed vision cohort.",
     ),
     backend_max_output_tokens: int = typer.Option(
-        1024,
+        2048,
         min=1,
         help="Hard Ollama generation ceiling for each structured response.",
     ),
@@ -1469,7 +1469,7 @@ def suggest_edits(
         help="Enable the production model's thinking mode.",
     ),
     backend_max_output_tokens: int = typer.Option(
-        1024,
+        2048,
         min=1,
         help="Hard Ollama generation ceiling for each structured edit response.",
     ),

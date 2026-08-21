@@ -51,7 +51,7 @@ class ManifestTests(unittest.TestCase):
             self.assertEqual(payload["backend_max_attempts"], 1)
             self.assertTrue(payload["backend_think"])
             self.assertTrue(payload["backend_fail_fast"])
-            self.assertEqual(payload["backend_max_output_tokens"], 1024)
+            self.assertEqual(payload["backend_max_output_tokens"], 2048)
 
     def test_find_latest_run_dir_returns_last_directory(self) -> None:
         with TemporaryDirectory() as tmp_dir:

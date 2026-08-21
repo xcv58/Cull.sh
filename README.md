@@ -90,7 +90,8 @@ Both `cull` and `suggest-edits` use the local
 Production model calls are fail-fast: each command makes one attempt, uses no
 fallback model, and stops on the first failed cohort so the underlying local-model
 problem can be fixed. Both culling and editing also send a bounded Ollama `num_predict` value
-(`--backend-max-output-tokens`, default 1024) so a malformed structured response
+(`--backend-max-output-tokens`, default 2048) so thinking has room to finish while
+a malformed structured response
 cannot generate indefinitely while keeping the HTTP connection active.
 
 `benchmark` reads existing Lightroom XMP picks, ratings, and rejects as human

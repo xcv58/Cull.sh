@@ -62,7 +62,8 @@ production semantic model for culling and editing. It runs with thinking enabled
 one attempt, no fallback model, and aborts the run after the first failed cohort.
 The deterministic local gate and TOPIQ-assisted ranking remain the primary culling
 structure; Qwen supplies the final semantic triage rather than acting as a
-standalone selector. Ollama generation is capped with `num_predict`.
+standalone selector. Ollama generation is capped at 2,048 tokens with
+`num_predict`; this leaves bounded space for thinking plus the final JSON response.
 
 ### 5. Persistence
 

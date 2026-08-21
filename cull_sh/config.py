@@ -34,7 +34,7 @@ class BackendConfig:
     max_attempts: int = 1
     think: bool | str | None = True
     fail_fast: bool = True
-    max_output_tokens: int = 1024
+    max_output_tokens: int = 2048
 
 
 @dataclass(slots=True)

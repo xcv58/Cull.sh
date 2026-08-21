@@ -30,6 +30,7 @@ class OllamaBackendTests(unittest.TestCase):
         self.assertEqual(backend.model, DEFAULT_PRODUCTION_MODEL)
         self.assertEqual(backend.max_attempts, 1)
         self.assertTrue(backend.think)
+        self.assertEqual(backend.max_output_tokens, 2048)
 
     def test_normalize_label_accepts_null_like_values(self) -> None:
         self.assertIsNone(_normalize_label(None))
