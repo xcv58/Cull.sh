@@ -64,7 +64,9 @@ python main.py benchmark --path /path/to/human-reviewed/raws --facet-db /path/to
 python main.py benchmark --path /path/to/newly-reviewed/raws --shadow-run runs/<original-cull-run>
 python main.py blind-culling-test --frozen-run runs/<prospective-cull-run>
 python main.py blind-culling-sample --folder-count 12 --photos-per-folder 1 --exclude-folder "2026-05-06 Kuala Lumpur"
+python main.py culling-ground-truth-test --folder-count 13 --total-photos 30 --exclude-run runs/culling-blind-tests/<earlier-run>
 python main.py score-blind-culling --run-dir runs/culling-blind-tests/<timestamp> --choices ~/Downloads/blind-culling-choices.csv
+python main.py score-culling-ground-truth --run-dir runs/culling-ground-truth-tests/<timestamp> --choices ~/Downloads/culling-ground-truth-choices.csv
 python main.py cull --path /path/to/raws --prompt "Keep the sharpest wildlife photos"
 python main.py cull --path /path/to/raws --genre portrait
 python main.py cull --path /path/to/raws --genre street --prefer "interesting gestures and layering"
@@ -110,6 +112,13 @@ top-level photo folders without reading XMP. Completed `DONE`/`EXPORTED`
 folders, hidden files, and explicitly excluded folders are skipped. Use one
 photo per folder for maximum subject diversity, or multiple photos with
 `--min-sequence-gap` to prevent adjacent filename runs.
+
+For model-selection decisions, prefer `culling-ground-truth-test`. Its review
+page shows only each photograph and asks the reviewer to independently assign
+reject, review, or pick. Model decisions, explanations, and identities remain
+hidden until scoring, avoiding explanation-quality and A/B anchoring bias.
+`--total-photos` is balanced across the requested folder count, and repeated
+`--exclude-run` options prevent reuse of earlier blind-test photos.
 
 Regular `cull` runs enable `--topiq-ranking` by default. Folder-relative TOPIQ
 and local-score percentiles are blended with a 25% TOPIQ weight for candidate

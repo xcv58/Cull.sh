@@ -18,8 +18,10 @@ from cull_sh.backends import VisionBackendError
 from cull_sh.benchmark import run_internal_benchmark
 from cull_sh.config import BackendConfig, DEFAULT_EXTENSIONS, JPEG_EXTENSIONS, PipelineConfig
 from cull_sh.culling_blind import run_culling_blind_test
+from cull_sh.culling_blind import run_ground_truth_culling_test
 from cull_sh.culling_blind import run_sampled_culling_blind_test
 from cull_sh.culling_blind import score_blind_culling_choices
+from cull_sh.culling_blind import score_ground_truth_culling_choices
 from cull_sh.extractors import PreviewExtractionError
 from cull_sh.extractors import build_default_extractor
 from cull_sh.edit_benchmark import EditDatasetSpec
@@ -520,6 +522,127 @@ def blind_culling_sample(
         "The hidden answer key is stored beside the page; do not open it until "
         "after downloading blind-culling-choices.csv."
     )
+
+
+@app.command("culling-ground-truth-test")
+def culling_ground_truth_test(
+    photos_root: Path = typer.Option(
+        Path("/Volumes/Sandisk 4T/RAW Photos"),
+        exists=True,
+        file_okay=False,
+        dir_okay=True,
+    ),
+    folder_count: int = typer.Option(13, min=1),
+    total_photos: int = typer.Option(30, min=1),
+    min_sequence_gap: int = typer.Option(25, min=1),
+    exclude_folder: list[str] = typer.Option([], "--exclude-folder"),
+    exclude_run: list[Path] = typer.Option(
+        [],
+        "--exclude-run",
+        exists=True,
+        file_okay=False,
+        dir_okay=True,
+        help="Earlier blind-test run whose sampled RAW files must be excluded.",
+    ),
+    prompt: str | None = typer.Option(None),
+    gemma_model: str = typer.Option("gemma4:12b"),
+    qwen_model: str = typer.Option("orcarouter/Qwen3.8-27B-Uncensored"),
+    seed: int = typer.Option(20260822),
+    timeout_seconds: float = typer.Option(600.0, min=1.0),
+    max_attempts: int = typer.Option(2, min=1),
+    resume_run: Path | None = typer.Option(
+        None,
+        exists=True,
+        file_okay=False,
+        dir_okay=True,
+    ),
+    runs_root: Path = typer.Option(
+        Path("runs/culling-ground-truth-tests"),
+        file_okay=False,
+        dir_okay=True,
+    ),
+) -> None:
+    """Run a photo-only human ground-truth test with all model output hidden."""
+    resolved_prompt = (prompt or resolve_prompt(None, GenrePreset.AUTO).prompt).strip()
+    specs = [
+        VLMModelSpec(label="gemma4-12b", model=gemma_model),
+        VLMModelSpec(
+            label="qwen3-8-27b-nothink",
+            model=qwen_model,
+            think=False,
+        ),
+    ]
+    console.print(
+        "Ground-truth test is read-only for photos, does not read XMP, and hides "
+        "all model output during review."
+    )
+    try:
+        page, _key = run_ground_truth_culling_test(
+            photos_root,
+            resolved_prompt,
+            specs,
+            runs_root,
+            folder_count=folder_count,
+            total_photos=total_photos,
+            min_sequence_gap=min_sequence_gap,
+            seed=seed,
+            excluded_folders=tuple(exclude_folder),
+            excluded_runs=tuple(exclude_run),
+            timeout_seconds=timeout_seconds,
+            max_attempts=max_attempts,
+            cull_sh_commit=_current_git_commit(),
+            resume_run=resume_run,
+            progress=console.print,
+        )
+    except (FileNotFoundError, VisionBackendError, ValueError) as exc:
+        console.print(f"Ground-truth culling test failed: {exc}")
+        raise typer.Exit(code=1) from exc
+    console.print(f"Independent review page: {page}")
+    console.print(
+        "Choose your own reject/review/pick labels, download "
+        "culling-ground-truth-choices.csv, and score only after review."
+    )
+
+
+@app.command("score-culling-ground-truth")
+def score_culling_ground_truth(
+    run_dir: Path = typer.Option(
+        ...,
+        exists=True,
+        file_okay=False,
+        dir_okay=True,
+    ),
+    choices: Path = typer.Option(
+        ...,
+        exists=True,
+        file_okay=True,
+        dir_okay=False,
+    ),
+) -> None:
+    """Compare hidden model decisions with independent human culling labels."""
+    payload = score_ground_truth_culling_choices(run_dir, choices)
+    table = Table(title="Independent culling ground truth")
+    table.add_column("Model")
+    table.add_column("Exact", justify="right")
+    table.add_column("Accuracy", justify="right")
+    table.add_column("Ordinal error", justify="right")
+    table.add_column("False rejects", justify="right")
+    table.add_column("Missed picks", justify="right")
+    models = payload["models"]
+    assert isinstance(models, dict)
+    for label, metrics in models.items():
+        assert isinstance(metrics, dict)
+        table.add_row(
+            str(label),
+            f"{metrics['exact_matches']}/{metrics['covered']}",
+            f"{float(metrics['accuracy']):.1%}",
+            f"{float(metrics['mean_ordinal_error']):.3f}",
+            str(metrics["false_rejects"]),
+            str(metrics["missed_picks"]),
+        )
+    console.print(table)
+    console.print(f"Paired result: {payload['paired']}")
+    console.print(f"Report: {run_dir / 'culling-ground-truth-score.md'}")
 
 
 @app.command("edit-model-benchmark")

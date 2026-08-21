@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from collections import Counter
 from collections import defaultdict
 import csv
 from dataclasses import asdict
@@ -87,9 +88,11 @@ def run_sampled_culling_blind_test(
     *,
     folder_count: int = 6,
     photos_per_folder: int = 2,
+    total_photos: int | None = None,
     min_sequence_gap: int = 10,
     seed: int = 20260821,
     excluded_folders: tuple[str, ...] = (),
+    excluded_runs: tuple[Path, ...] = (),
     timeout_seconds: float = 600.0,
     max_attempts: int = 2,
     cull_sh_commit: str | None = None,
@@ -101,13 +104,16 @@ def run_sampled_culling_blind_test(
     if len(model_specs) != 2:
         raise ValueError("blind culling requires exactly two models")
     photos_root = photos_root.expanduser().resolve()
+    excluded_paths, excluded_run_artifacts = _load_excluded_run_paths(excluded_runs)
     cohorts = build_random_folder_cohorts(
         photos_root,
         folder_count=folder_count,
         photos_per_folder=photos_per_folder,
+        total_photos=total_photos,
         min_sequence_gap=min_sequence_gap,
         seed=seed,
         excluded_folders=excluded_folders,
+        excluded_raw_paths=excluded_paths,
     )
     run_dir = resume_run or create_run_dir(runs_root)
     run_dir.mkdir(parents=True, exist_ok=True)
@@ -118,8 +124,10 @@ def run_sampled_culling_blind_test(
         "selection_method": "seeded-folder-stratified-filename-gap",
         "folder_count": folder_count,
         "photos_per_folder": photos_per_folder,
+        "total_photos": total_photos,
         "min_sequence_gap": min_sequence_gap,
         "excluded_folders": list(excluded_folders),
+        "excluded_runs": excluded_run_artifacts,
         "prompt": prompt,
         "batch_size": 1,
         "seed": seed,
@@ -144,19 +152,105 @@ def run_sampled_culling_blind_test(
     )
 
 
+def run_ground_truth_culling_test(
+    photos_root: Path,
+    prompt: str,
+    model_specs: list[VLMModelSpec],
+    runs_root: Path,
+    *,
+    folder_count: int,
+    total_photos: int,
+    min_sequence_gap: int = 25,
+    seed: int = 20260822,
+    excluded_folders: tuple[str, ...] = (),
+    excluded_runs: tuple[Path, ...] = (),
+    timeout_seconds: float = 600.0,
+    max_attempts: int = 2,
+    cull_sh_commit: str | None = None,
+    resume_run: Path | None = None,
+    progress: ProgressCallback | None = None,
+) -> tuple[Path, Path]:
+    """Collect independent human culling labels for a hidden model comparison."""
+    progress = progress or (lambda _message: None)
+    if len(model_specs) != 2:
+        raise ValueError("ground-truth culling test requires exactly two models")
+    photos_root = photos_root.expanduser().resolve()
+    excluded_paths, excluded_run_artifacts = _load_excluded_run_paths(excluded_runs)
+    cohorts = build_random_folder_cohorts(
+        photos_root,
+        folder_count=folder_count,
+        photos_per_folder=1,
+        total_photos=total_photos,
+        min_sequence_gap=min_sequence_gap,
+        seed=seed,
+        excluded_folders=excluded_folders,
+        excluded_raw_paths=excluded_paths,
+    )
+    run_dir = resume_run or create_run_dir(runs_root)
+    run_dir.mkdir(parents=True, exist_ok=True)
+    config = {
+        "schema_version": 1,
+        "kind": "blind-culling-independent-ground-truth",
+        "photos_root": str(photos_root),
+        "selection_method": "seeded-balanced-folder-stratified-filename-gap",
+        "folder_count": folder_count,
+        "total_photos": total_photos,
+        "min_sequence_gap": min_sequence_gap,
+        "excluded_folders": list(excluded_folders),
+        "excluded_runs": excluded_run_artifacts,
+        "prompt": prompt,
+        "batch_size": 1,
+        "seed": seed,
+        "timeout_seconds": timeout_seconds,
+        "max_attempts": max_attempts,
+        "max_output_tokens": 1024,
+        "cull_sh_commit": cull_sh_commit,
+        "models": [asdict(spec) for spec in model_specs],
+        "review_surface": "photo-only-independent-reject-review-pick",
+        "model_outputs_visible_during_review": False,
+        "photo_metadata_reads": False,
+        "photo_metadata_writes": False,
+    }
+    _write_or_verify_json(run_dir / "blind-culling-config.json", config)
+    _write_cohorts(run_dir / "blind-culling-cohorts.json", cohorts)
+    progress(
+        f"Locked {len(cohorts)} photo(s) across "
+        f"{len({cohort.scene_id for cohort in cohorts})} folder(s); "
+        "XMP is neither read nor written."
+    )
+    previews = _prepare_previews(cohorts, run_dir / "previews", progress)
+    for spec in model_specs:
+        _run_model(
+            spec,
+            cohorts,
+            previews,
+            prompt,
+            run_dir,
+            timeout_seconds=timeout_seconds,
+            max_attempts=max_attempts,
+            progress=progress,
+        )
+    page, key = write_ground_truth_culling_review(run_dir, cohorts, model_specs)
+    return page, key
+
+
 def build_random_folder_cohorts(
     photos_root: Path,
     *,
     folder_count: int,
     photos_per_folder: int,
+    total_photos: int | None = None,
     min_sequence_gap: int,
     seed: int,
     excluded_folders: tuple[str, ...] = (),
+    excluded_raw_paths: frozenset[Path] = frozenset(),
 ) -> list[VLMCohort]:
     if folder_count < 1 or photos_per_folder < 1:
         raise ValueError("folder and photo counts must be at least 1")
     if min_sequence_gap < 1:
         raise ValueError("minimum sequence gap must be at least 1")
+    if total_photos is not None and total_photos < folder_count:
+        raise ValueError("total photo count must be at least the folder count")
     excluded = {name.casefold() for name in excluded_folders}
     candidates: list[tuple[Path, list[Path]]] = []
     for folder in sorted(photos_root.iterdir(), key=lambda path: path.name.casefold()):
@@ -172,10 +266,11 @@ def build_random_folder_cohorts(
                 if path.is_file()
                 and not path.name.startswith(".")
                 and path.suffix.casefold() in DEFAULT_EXTENSIONS
+                and path.resolve() not in excluded_raw_paths
             ),
             key=lambda path: path.name.casefold(),
         )
-        if len(raws) >= photos_per_folder:
+        if raws:
             candidates.append((folder, raws))
     if len(candidates) < folder_count:
         raise ValueError(
@@ -184,11 +279,22 @@ def build_random_folder_cohorts(
     rng = random.Random(seed)
     rng.shuffle(candidates)
     selected_folders = candidates[:folder_count]
+    if total_photos is None:
+        per_folder_counts = [photos_per_folder] * folder_count
+    else:
+        base_count, remainder = divmod(total_photos, folder_count)
+        per_folder_counts = [
+            base_count + (1 if index < remainder else 0)
+            for index in range(folder_count)
+        ]
     cohorts: list[VLMCohort] = []
-    for folder_index, (folder, raws) in enumerate(selected_folders, start=1):
+    for folder_index, ((folder, raws), selected_count) in enumerate(
+        zip(selected_folders, per_folder_counts, strict=True),
+        start=1,
+    ):
         selected = _sample_with_sequence_gap(
             raws,
-            count=photos_per_folder,
+            count=selected_count,
             min_sequence_gap=min_sequence_gap,
             rng=rng,
         )
@@ -206,6 +312,25 @@ def build_random_folder_cohorts(
                 )
             )
     return cohorts
+
+
+def _load_excluded_run_paths(
+    excluded_runs: tuple[Path, ...],
+) -> tuple[frozenset[Path], list[dict[str, str]]]:
+    paths: set[Path] = set()
+    artifacts: list[dict[str, str]] = []
+    for run_dir in excluded_runs:
+        manifest = run_dir.expanduser().resolve() / "blind-culling-cohorts.json"
+        payload = json.loads(manifest.read_text(encoding="utf-8"))
+        for cohort in payload:
+            paths.update(Path(raw_path).resolve() for raw_path in cohort["raw_paths"])
+        artifacts.append(
+            {
+                "run_dir": str(manifest.parent),
+                "cohort_manifest_sha256": _file_sha256(manifest),
+            }
+        )
+    return frozenset(paths), artifacts
 
 
 def _execute_blind_culling(
@@ -446,6 +571,172 @@ def score_blind_culling_choices(
     return payload
 
 
+def write_ground_truth_culling_review(
+    run_dir: Path,
+    cohorts: list[VLMCohort],
+    model_specs: list[VLMModelSpec],
+) -> tuple[Path, Path]:
+    cards: list[str] = []
+    items: list[dict[str, str]] = []
+    for cohort in cohorts:
+        for asset in cohort.assets:
+            filename = asset.filename
+            items.append({"filename": filename, "scene_id": cohort.scene_id})
+            cards.append(
+                "<article>"
+                f"<h2>{escape(filename)} <span>{escape(cohort.scene_id)}</span></h2>"
+                f"<img src='previews/{escape(filename)}.jpg' alt='{escape(filename)}'>"
+                f"<div class='ground-truth-choices' data-file='{escape(filename)}' data-scene='{escape(cohort.scene_id)}'>"
+                "<button type='button' data-choice='reject' aria-pressed='false'>Reject</button>"
+                "<button type='button' data-choice='review' aria-pressed='false'>Review</button>"
+                "<button type='button' data-choice='pick' aria-pressed='false'>Pick</button>"
+                "<strong class='choice-status' aria-live='polite'></strong>"
+                "</div></article>"
+            )
+    key_path = run_dir / "culling-ground-truth-key.json"
+    _write_or_verify_json(
+        key_path,
+        {
+            "schema_version": 1,
+            "kind": "independent-culling-ground-truth-key",
+            "models": [asdict(spec) for spec in model_specs],
+            "items": items,
+        },
+    )
+    page = run_dir / "culling-ground-truth-review.html"
+    page.write_text(_ground_truth_review_html("".join(cards)), encoding="utf-8")
+    return page, key_path
+
+
+def score_ground_truth_culling_choices(
+    run_dir: Path,
+    choices_path: Path,
+) -> dict[str, object]:
+    key = json.loads(
+        (run_dir / "culling-ground-truth-key.json").read_text(encoding="utf-8")
+    )
+    expected = {str(item["filename"]) for item in key["items"]}
+    with choices_path.open("r", encoding="utf-8", newline="") as handle:
+        rows = list(csv.DictReader(handle))
+    filenames = [str(row.get("filename") or "") for row in rows]
+    valid_choices = {"reject", "review", "pick"}
+    if len(filenames) != len(set(filenames)):
+        raise ValueError("ground-truth choices contain duplicate filenames")
+    if set(filenames) != expected:
+        missing = sorted(expected - set(filenames))
+        unexpected = sorted(set(filenames) - expected)
+        raise ValueError(
+            f"ground-truth choices do not match the locked sample; "
+            f"missing={missing}, unexpected={unexpected}"
+        )
+    if any(str(row.get("choice") or "") not in valid_choices for row in rows):
+        raise ValueError("every ground-truth choice must be reject, review, or pick")
+    human = {str(row["filename"]): str(row["choice"]) for row in rows}
+    ordinal = {"reject": 0, "review": 1, "pick": 2}
+    models: dict[str, dict[str, object]] = {}
+    predictions_by_model: dict[str, dict[str, str]] = {}
+    for model in key["models"]:
+        label = str(model["label"])
+        predictions = _load_latest_bucket_predictions(run_dir / f"{_slug(label)}.jsonl")
+        predictions_by_model[label] = predictions
+        covered = [filename for filename in expected if filename in predictions]
+        exact = sum(predictions[filename] == human[filename] for filename in covered)
+        errors = [
+            abs(ordinal[predictions[filename]] - ordinal[human[filename]])
+            for filename in covered
+        ]
+        false_rejects = sum(
+            predictions[filename] == "reject" and human[filename] != "reject"
+            for filename in covered
+        )
+        missed_picks = sum(
+            human[filename] == "pick" and predictions[filename] != "pick"
+            for filename in covered
+        )
+        models[label] = {
+            "covered": len(covered),
+            "exact_matches": exact,
+            "accuracy": exact / len(covered) if covered else None,
+            "mean_ordinal_error": sum(errors) / len(errors) if errors else None,
+            "false_rejects": false_rejects,
+            "missed_picks": missed_picks,
+            "prediction_counts": dict(Counter(predictions[name] for name in covered)),
+        }
+    labels = [str(model["label"]) for model in key["models"]]
+    paired = {labels[0]: 0, labels[1]: 0, "tie": 0}
+    for filename in expected:
+        if any(filename not in predictions_by_model[label] for label in labels):
+            continue
+        errors = {
+            label: abs(
+                ordinal[predictions_by_model[label][filename]] - ordinal[human[filename]]
+            )
+            for label in labels
+        }
+        if errors[labels[0]] == errors[labels[1]]:
+            paired["tie"] += 1
+        else:
+            paired[min(labels, key=lambda label: errors[label])] += 1
+    payload: dict[str, object] = {
+        "reviewed": len(rows),
+        "human_counts": dict(Counter(human.values())),
+        "models": models,
+        "paired": paired,
+        "choices": str(choices_path),
+    }
+    (run_dir / "culling-ground-truth-score.json").write_text(
+        json.dumps(payload, indent=2, sort_keys=True) + "\n",
+        encoding="utf-8",
+    )
+    lines = [
+        "# Independent culling ground-truth result",
+        "",
+        f"Reviewed: {len(rows)}",
+        "",
+        "| Model | Covered | Exact accuracy | Mean ordinal error | False rejects | Missed picks |",
+        "|---|---:|---:|---:|---:|---:|",
+    ]
+    for label in labels:
+        metrics = models[label]
+        accuracy = metrics["accuracy"]
+        mean_error = metrics["mean_ordinal_error"]
+        lines.append(
+            f"| {label} | {metrics['covered']} | "
+            f"{float(accuracy):.1%} | {float(mean_error):.3f} | "
+            f"{metrics['false_rejects']} | {metrics['missed_picks']} |"
+        )
+    lines.extend(
+        [
+            "",
+            "## Paired ordinal-distance wins",
+            "",
+            *(f"- {label}: {count}" for label, count in paired.items()),
+        ]
+    )
+    (run_dir / "culling-ground-truth-score.md").write_text(
+        "\n".join(lines) + "\n",
+        encoding="utf-8",
+    )
+    return payload
+
+
+def _load_latest_bucket_predictions(path: Path) -> dict[str, str]:
+    latest: dict[str, dict[str, object]] = {}
+    with path.open("r", encoding="utf-8") as handle:
+        for line in handle:
+            record = json.loads(line)
+            latest[str(record["cohort_id"])] = record
+    predictions: dict[str, str] = {}
+    for record in latest.values():
+        if record.get("status") != "success":
+            continue
+        for decision in record.get("decisions", []):
+            bucket = str(decision.get("bucket") or "")
+            if bucket in {"reject", "review", "pick"}:
+                predictions[str(decision["filename"])] = bucket
+    return predictions
+
+
 def _load_predictions(
     path: Path,
     cohorts: list[VLMCohort],
@@ -511,6 +802,27 @@ function persist(){try{localStorage.setItem(key,JSON.stringify(saved));}catch(_e
 function refresh(){let n=0;const groups=document.querySelectorAll('.choices');groups.forEach(group=>{const value=saved[group.dataset.file];group.querySelectorAll('button').forEach(button=>{const selected=button.dataset.choice===value;button.classList.toggle('selected',selected);button.setAttribute('aria-pressed',String(selected));});const out=group.querySelector('.choice-status');out.textContent=value?('Selected: '+value):'';if(value)n++;});document.getElementById('count').textContent=n+' of '+groups.length+' reviewed';persist();}
 document.querySelectorAll('.choices button').forEach(button=>button.addEventListener('click',()=>{const group=button.closest('.choices');saved[group.dataset.file]=button.dataset.choice;refresh();}));
 document.getElementById('download').onclick=()=>{const rows=[['filename','scene_id','choice']];document.querySelectorAll('.choices').forEach(group=>rows.push([group.dataset.file,group.dataset.scene,saved[group.dataset.file]||'']));const csv=rows.map(row=>row.map(value=>'"'+String(value).replaceAll('"','""')+'"').join(',')).join('\\n');const link=document.createElement('a');link.href=URL.createObjectURL(new Blob([csv],{type:'text/csv'}));link.download='blind-culling-choices.csv';link.click();URL.revokeObjectURL(link.href);};refresh();</script></body></html>"""
+
+
+def _ground_truth_review_html(cards: str) -> str:
+    return """<!doctype html><html lang='en'><head><meta charset='utf-8'>
+<meta name='viewport' content='width=device-width,initial-scale=1'>
+<title>Independent culling ground-truth review</title><style>
+:root{color-scheme:dark;font-family:system-ui,sans-serif;background:#101010;color:#eee}body{max-width:1500px;margin:auto;padding:28px}
+.note{color:#bbb}.toolbar{position:sticky;top:0;z-index:2;background:#101010ee;padding:12px 0;display:flex;gap:12px;align-items:center}
+button{padding:10px 16px;border-radius:8px;border:1px solid #666;background:#292929;color:#eee;cursor:pointer}button.selected{border-color:#8ff5df;background:#087f6f;color:#fff;box-shadow:0 0 0 3px #2a9d8f66;font-weight:700}
+article{background:#191919;border:1px solid #333;border-radius:14px;padding:16px;margin:18px 0}h2{font-size:1rem}h2 span{color:#999;font-weight:normal}
+img{display:block;width:100%;height:620px;object-fit:contain;background:#080808;border-radius:8px}.ground-truth-choices{display:flex;gap:12px;align-items:center;margin-top:14px}
+@media(max-width:900px){img{height:auto}.ground-truth-choices{flex-wrap:wrap}}
+</style></head><body><h1>Independent culling review</h1>
+<p class='note'>Choose the outcome you would assign to each photo. Neither model's decision, explanation, nor identity appears on this page. No XMP was read or written.</p>
+<div class='toolbar'><button id='download'>Download choices CSV</button><strong id='count'></strong></div>""" + cards + """
+<script>const key='cull-sh-ground-truth-'+location.pathname;const saved={};
+try{Object.assign(saved,JSON.parse(localStorage.getItem(key)||'{}'));}catch(_error){}
+function persist(){try{localStorage.setItem(key,JSON.stringify(saved));}catch(_error){}}
+function refresh(){let n=0;const groups=document.querySelectorAll('.ground-truth-choices');groups.forEach(group=>{const value=saved[group.dataset.file];group.querySelectorAll('button').forEach(button=>{const selected=button.dataset.choice===value;button.classList.toggle('selected',selected);button.setAttribute('aria-pressed',String(selected));});group.querySelector('.choice-status').textContent=value?('Selected: '+value.toUpperCase()):'';if(value)n++;});document.getElementById('count').textContent=n+' of '+groups.length+' reviewed';persist();}
+document.querySelectorAll('.ground-truth-choices button').forEach(button=>button.addEventListener('click',()=>{const group=button.closest('.ground-truth-choices');saved[group.dataset.file]=button.dataset.choice;refresh();}));
+document.getElementById('download').onclick=()=>{const rows=[['filename','scene_id','choice']];document.querySelectorAll('.ground-truth-choices').forEach(group=>rows.push([group.dataset.file,group.dataset.scene,saved[group.dataset.file]||'']));const csv=rows.map(row=>row.map(value=>'"'+String(value).replaceAll('"','""')+'"').join(',')).join('\\n');const link=document.createElement('a');link.href=URL.createObjectURL(new Blob([csv],{type:'text/csv'}));link.download='culling-ground-truth-choices.csv';link.click();URL.revokeObjectURL(link.href);};refresh();</script></body></html>"""
 
 
 def _write_cohorts(path: Path, cohorts: list[VLMCohort]) -> None:
