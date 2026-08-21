@@ -18,6 +18,7 @@ from cull_sh.backends import VisionBackendError
 from cull_sh.benchmark import run_internal_benchmark
 from cull_sh.config import BackendConfig, DEFAULT_EXTENSIONS, JPEG_EXTENSIONS, PipelineConfig
 from cull_sh.culling_blind import run_culling_blind_test
+from cull_sh.culling_blind import run_sampled_culling_blind_test
 from cull_sh.culling_blind import score_blind_culling_choices
 from cull_sh.extractors import PreviewExtractionError
 from cull_sh.extractors import build_default_extractor
@@ -440,6 +441,85 @@ def score_blind_culling(
     console.print(table)
     console.print(f"Scored {payload['reviewed']} reviewed photo(s).")
     console.print(f"Report: {run_dir / 'blind-culling-score.md'}")
+
+
+@app.command("blind-culling-sample")
+def blind_culling_sample(
+    photos_root: Path = typer.Option(
+        Path("/Volumes/Sandisk 4T/RAW Photos"),
+        exists=True,
+        file_okay=False,
+        dir_okay=True,
+        help="Root containing candidate photo folders.",
+    ),
+    folder_count: int = typer.Option(6, min=1),
+    photos_per_folder: int = typer.Option(2, min=1),
+    min_sequence_gap: int = typer.Option(
+        10,
+        min=1,
+        help="Minimum numeric filename distance within each selected folder.",
+    ),
+    exclude_folder: list[str] = typer.Option(
+        [],
+        "--exclude-folder",
+        help="Exact folder name to exclude; may be repeated.",
+    ),
+    prompt: str | None = typer.Option(None),
+    gemma_model: str = typer.Option("gemma4:12b"),
+    qwen_model: str = typer.Option("orcarouter/Qwen3.8-27B-Uncensored"),
+    seed: int = typer.Option(20260821),
+    timeout_seconds: float = typer.Option(600.0, min=1.0),
+    max_attempts: int = typer.Option(2, min=1),
+    resume_run: Path | None = typer.Option(
+        None,
+        exists=True,
+        file_okay=False,
+        dir_okay=True,
+    ),
+    runs_root: Path = typer.Option(
+        Path("runs/culling-blind-tests"),
+        file_okay=False,
+        dir_okay=True,
+    ),
+) -> None:
+    """Blind-test a spaced random sample drawn across multiple folders."""
+    resolved_prompt = (prompt or resolve_prompt(None, GenrePreset.AUTO).prompt).strip()
+    specs = [
+        VLMModelSpec(label="gemma4-12b", model=gemma_model),
+        VLMModelSpec(
+            label="qwen3-8-27b-nothink",
+            model=qwen_model,
+            think=False,
+        ),
+    ]
+    console.print(
+        "Random multi-folder blind test is read-only for photos and does not read XMP."
+    )
+    try:
+        page, _answer_key = run_sampled_culling_blind_test(
+            photos_root,
+            resolved_prompt,
+            specs,
+            runs_root,
+            folder_count=folder_count,
+            photos_per_folder=photos_per_folder,
+            min_sequence_gap=min_sequence_gap,
+            seed=seed,
+            excluded_folders=tuple(exclude_folder),
+            timeout_seconds=timeout_seconds,
+            max_attempts=max_attempts,
+            cull_sh_commit=_current_git_commit(),
+            resume_run=resume_run,
+            progress=console.print,
+        )
+    except (FileNotFoundError, VisionBackendError, ValueError) as exc:
+        console.print(f"Random blind culling test failed: {exc}")
+        raise typer.Exit(code=1) from exc
+    console.print(f"Blind review page: {page}")
+    console.print(
+        "The hidden answer key is stored beside the page; do not open it until "
+        "after downloading blind-culling-choices.csv."
+    )
 
 
 @app.command("edit-model-benchmark")

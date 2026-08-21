@@ -63,6 +63,7 @@ python main.py doctor
 python main.py benchmark --path /path/to/human-reviewed/raws --facet-db /path/to/facet.db
 python main.py benchmark --path /path/to/newly-reviewed/raws --shadow-run runs/<original-cull-run>
 python main.py blind-culling-test --frozen-run runs/<prospective-cull-run>
+python main.py blind-culling-sample --folder-count 12 --photos-per-folder 1 --exclude-folder "2026-05-06 Kuala Lumpur"
 python main.py score-blind-culling --run-dir runs/culling-blind-tests/<timestamp> --choices ~/Downloads/blind-culling-choices.csv
 python main.py cull --path /path/to/raws --prompt "Keep the sharpest wildlife photos"
 python main.py cull --path /path/to/raws --genre portrait
@@ -103,6 +104,12 @@ XMP, writes no photo metadata, randomizes the per-photo A/B assignment, and
 keeps the answer key outside the generated HTML. Complete the review page,
 download `blind-culling-choices.csv`, and reveal the result only with
 `score-blind-culling`.
+
+`blind-culling-sample` builds a seeded, reproducible sample across incomplete
+top-level photo folders without reading XMP. Completed `DONE`/`EXPORTED`
+folders, hidden files, and explicitly excluded folders are skipped. Use one
+photo per folder for maximum subject diversity, or multiple photos with
+`--min-sequence-gap` to prevent adjacent filename runs.
 
 Regular `cull` runs enable `--topiq-ranking` by default. Folder-relative TOPIQ
 and local-score percentiles are blended with a 25% TOPIQ weight for candidate

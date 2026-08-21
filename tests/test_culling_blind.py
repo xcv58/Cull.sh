@@ -7,6 +7,7 @@ from tempfile import TemporaryDirectory
 import unittest
 
 from cull_sh.culling_blind import build_frozen_semantic_cohorts
+from cull_sh.culling_blind import build_random_folder_cohorts
 from cull_sh.culling_blind import score_blind_culling_choices
 from cull_sh.culling_blind import write_blind_culling_review
 from cull_sh.models import RawAsset
@@ -15,6 +16,55 @@ from cull_sh.vlm_benchmark import VLMModelSpec
 
 
 class CullingBlindTests(unittest.TestCase):
+    def test_random_folder_sample_is_seeded_spaced_and_excludes_completed_folders(self) -> None:
+        with TemporaryDirectory() as tmp_dir:
+            root = Path(tmp_dir)
+            for folder_name in (
+                "Trip A",
+                "Trip B",
+                "Trip C",
+                "Trip D DONE",
+                "Trip E EXPORTED",
+            ):
+                folder = root / folder_name
+                folder.mkdir()
+                for number in range(100, 130):
+                    (folder / f"DSC{number:04d}.ARW").write_bytes(b"raw")
+                (folder / "._DSC9999.ARW").write_bytes(b"apple-double")
+
+            first = build_random_folder_cohorts(
+                root,
+                folder_count=2,
+                photos_per_folder=2,
+                min_sequence_gap=10,
+                seed=42,
+                excluded_folders=("Trip C",),
+            )
+            second = build_random_folder_cohorts(
+                root,
+                folder_count=2,
+                photos_per_folder=2,
+                min_sequence_gap=10,
+                seed=42,
+                excluded_folders=("Trip C",),
+            )
+
+            self.assertEqual(
+                [asset.raw_path for cohort in first for asset in cohort.assets],
+                [asset.raw_path for cohort in second for asset in cohort.assets],
+            )
+            by_folder: dict[str, list[int]] = {}
+            for cohort in first:
+                filename = cohort.assets[0].filename
+                self.assertFalse(filename.startswith("._"))
+                by_folder.setdefault(cohort.scene_id, []).append(
+                    int(filename.removeprefix("DSC").removesuffix(".ARW"))
+                )
+            self.assertEqual(set(by_folder), {"Trip A", "Trip B"})
+            self.assertTrue(
+                all(abs(numbers[0] - numbers[1]) >= 10 for numbers in by_folder.values())
+            )
+
     def test_frozen_cohorts_include_only_vision_candidates_without_reading_xmp(self) -> None:
         with TemporaryDirectory() as tmp_dir:
             root = Path(tmp_dir)

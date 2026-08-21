@@ -8,8 +8,10 @@ from html import escape
 import json
 from pathlib import Path
 import random
+import re
 from typing import Callable
 
+from cull_sh.config import DEFAULT_EXTENSIONS
 from cull_sh.manifests import create_run_dir
 from cull_sh.models import RawAsset
 from cull_sh.vlm_benchmark import _prepare_previews
@@ -64,11 +66,165 @@ def run_culling_blind_test(
         "photo_metadata_reads": False,
         "photo_metadata_writes": False,
     }
+    return _execute_blind_culling(
+        cohorts,
+        prompt,
+        model_specs,
+        run_dir,
+        config,
+        seed=seed,
+        timeout_seconds=timeout_seconds,
+        max_attempts=max_attempts,
+        progress=progress,
+    )
+
+
+def run_sampled_culling_blind_test(
+    photos_root: Path,
+    prompt: str,
+    model_specs: list[VLMModelSpec],
+    runs_root: Path,
+    *,
+    folder_count: int = 6,
+    photos_per_folder: int = 2,
+    min_sequence_gap: int = 10,
+    seed: int = 20260821,
+    excluded_folders: tuple[str, ...] = (),
+    timeout_seconds: float = 600.0,
+    max_attempts: int = 2,
+    cull_sh_commit: str | None = None,
+    resume_run: Path | None = None,
+    progress: ProgressCallback | None = None,
+) -> tuple[Path, Path]:
+    """Run a blind comparison on a stratified random multi-folder sample."""
+    progress = progress or (lambda _message: None)
+    if len(model_specs) != 2:
+        raise ValueError("blind culling requires exactly two models")
+    photos_root = photos_root.expanduser().resolve()
+    cohorts = build_random_folder_cohorts(
+        photos_root,
+        folder_count=folder_count,
+        photos_per_folder=photos_per_folder,
+        min_sequence_gap=min_sequence_gap,
+        seed=seed,
+        excluded_folders=excluded_folders,
+    )
+    run_dir = resume_run or create_run_dir(runs_root)
+    run_dir.mkdir(parents=True, exist_ok=True)
+    config = {
+        "schema_version": 1,
+        "kind": "blind-culling-random-folder-review",
+        "photos_root": str(photos_root),
+        "selection_method": "seeded-folder-stratified-filename-gap",
+        "folder_count": folder_count,
+        "photos_per_folder": photos_per_folder,
+        "min_sequence_gap": min_sequence_gap,
+        "excluded_folders": list(excluded_folders),
+        "prompt": prompt,
+        "batch_size": 1,
+        "seed": seed,
+        "timeout_seconds": timeout_seconds,
+        "max_attempts": max_attempts,
+        "max_output_tokens": 1024,
+        "cull_sh_commit": cull_sh_commit,
+        "models": [asdict(spec) for spec in model_specs],
+        "photo_metadata_reads": False,
+        "photo_metadata_writes": False,
+    }
+    return _execute_blind_culling(
+        cohorts,
+        prompt,
+        model_specs,
+        run_dir,
+        config,
+        seed=seed,
+        timeout_seconds=timeout_seconds,
+        max_attempts=max_attempts,
+        progress=progress,
+    )
+
+
+def build_random_folder_cohorts(
+    photos_root: Path,
+    *,
+    folder_count: int,
+    photos_per_folder: int,
+    min_sequence_gap: int,
+    seed: int,
+    excluded_folders: tuple[str, ...] = (),
+) -> list[VLMCohort]:
+    if folder_count < 1 or photos_per_folder < 1:
+        raise ValueError("folder and photo counts must be at least 1")
+    if min_sequence_gap < 1:
+        raise ValueError("minimum sequence gap must be at least 1")
+    excluded = {name.casefold() for name in excluded_folders}
+    candidates: list[tuple[Path, list[Path]]] = []
+    for folder in sorted(photos_root.iterdir(), key=lambda path: path.name.casefold()):
+        if not folder.is_dir():
+            continue
+        folded_name = folder.name.casefold()
+        if "done" in folded_name or "exported" in folded_name or folded_name in excluded:
+            continue
+        raws = sorted(
+            (
+                path
+                for path in folder.iterdir()
+                if path.is_file()
+                and not path.name.startswith(".")
+                and path.suffix.casefold() in DEFAULT_EXTENSIONS
+            ),
+            key=lambda path: path.name.casefold(),
+        )
+        if len(raws) >= photos_per_folder:
+            candidates.append((folder, raws))
+    if len(candidates) < folder_count:
+        raise ValueError(
+            f"need {folder_count} eligible folders but found {len(candidates)} under {photos_root}"
+        )
+    rng = random.Random(seed)
+    rng.shuffle(candidates)
+    selected_folders = candidates[:folder_count]
+    cohorts: list[VLMCohort] = []
+    for folder_index, (folder, raws) in enumerate(selected_folders, start=1):
+        selected = _sample_with_sequence_gap(
+            raws,
+            count=photos_per_folder,
+            min_sequence_gap=min_sequence_gap,
+            rng=rng,
+        )
+        for photo_index, raw_path in enumerate(selected, start=1):
+            asset = RawAsset(raw_path=raw_path, xmp_path=raw_path.with_suffix(".xmp"))
+            cohorts.append(
+                VLMCohort(
+                    cohort_id=(
+                        f"folder-{folder_index:02d}-{_slug(folder.name)}-"
+                        f"photo-{photo_index:02d}"
+                    ),
+                    scene_id=folder.name,
+                    assets=(asset,),
+                    human_labels=("unreviewed",),
+                )
+            )
+    return cohorts
+
+
+def _execute_blind_culling(
+    cohorts: list[VLMCohort],
+    prompt: str,
+    model_specs: list[VLMModelSpec],
+    run_dir: Path,
+    config: dict[str, object],
+    *,
+    seed: int,
+    timeout_seconds: float,
+    max_attempts: int,
+    progress: ProgressCallback,
+) -> tuple[Path, Path]:
     _write_or_verify_json(run_dir / "blind-culling-config.json", config)
     _write_cohorts(run_dir / "blind-culling-cohorts.json", cohorts)
     photo_count = sum(len(cohort.assets) for cohort in cohorts)
     progress(
-        f"Locked {photo_count} frozen semantic candidate(s) in "
+        f"Locked {photo_count} photo(s) in "
         f"{len(cohorts)} cohort(s); XMP is neither read nor written."
     )
     previews = _prepare_previews(cohorts, run_dir / "previews", progress)
@@ -90,6 +246,36 @@ def run_culling_blind_test(
         seed=seed,
     )
     return page, answer_key
+
+
+def _sample_with_sequence_gap(
+    paths: list[Path],
+    *,
+    count: int,
+    min_sequence_gap: int,
+    rng: random.Random,
+) -> list[Path]:
+    shuffled = list(paths)
+    rng.shuffle(shuffled)
+    selected: list[Path] = []
+    selected_numbers: list[int] = []
+    for path in shuffled:
+        match = re.search(r"(\d+)$", path.stem)
+        sequence_number = int(match.group(1)) if match else None
+        if sequence_number is not None and any(
+            abs(sequence_number - existing) < min_sequence_gap
+            for existing in selected_numbers
+        ):
+            continue
+        selected.append(path)
+        if sequence_number is not None:
+            selected_numbers.append(sequence_number)
+        if len(selected) == count:
+            return selected
+    raise ValueError(
+        f"could not select {count} spaced photos from {paths[0].parent} "
+        f"with minimum sequence gap {min_sequence_gap}"
+    )
 
 
 def build_frozen_semantic_cohorts(
