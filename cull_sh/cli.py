@@ -61,6 +61,7 @@ from cull_sh.rapidraw import render_rapidraw_review
 from cull_sh.rapidraw import stage_rapidraw_develop
 from cull_sh.reporting import RichPipelineReporter
 from cull_sh.scanner import discover_raw_assets
+from cull_sh.xmp import photo_is_picked
 from cull_sh.xmp import sidecar_is_rejected
 from cull_sh.xmp import write_develop_sidecar
 from cull_sh.xmp import write_photo_metadata
@@ -1837,6 +1838,16 @@ def repair_sidecars(
         "--lightroom-edit-scope",
         help="Which repaired sidecars receive Lightroom edits: all or kept.",
     ),
+    preserve_existing_picks: bool = typer.Option(
+        False,
+        "--preserve-existing-picks/--replace-existing-picks",
+        help="Leave photos currently marked as picks completely unchanged.",
+    ),
+    dry_run: bool = typer.Option(
+        True,
+        "--dry-run/--no-dry-run",
+        help="Preview replay counts without writing metadata (the default).",
+    ),
 ) -> None:
     """Rewrite sidecars from an existing manifest without rerunning scoring."""
     try:
@@ -1847,6 +1858,7 @@ def repair_sidecars(
 
     rewritten = 0
     skipped = 0
+    preserved_picks = 0
     for record in records:
         decision = decision_from_manifest_record(record)
         if decision is None:
@@ -1862,16 +1874,24 @@ def repair_sidecars(
             kind=asset_kind,
             paired_raw_path=Path(str(paired_raw_path)) if paired_raw_path else None,
         )
-        write_photo_metadata(
-            asset,
-            decision,
-            apply_lightroom_edit=lightroom_auto_edit,
-            lightroom_edit_scope=lightroom_edit_scope,
-        )
+        if preserve_existing_picks and photo_is_picked(asset):
+            preserved_picks += 1
+            continue
+        if not dry_run:
+            write_photo_metadata(
+                asset,
+                decision,
+                apply_lightroom_edit=lightroom_auto_edit,
+                lightroom_edit_scope=lightroom_edit_scope,
+            )
         rewritten += 1
 
     console.print(f"Run artifacts: {target_run_dir}")
-    console.print(f"Sidecars rewritten: {rewritten}")
+    console.print(f"Mode: {'dry run' if dry_run else 'write'}")
+    console.print(
+        f"Sidecars {'that would be rewritten' if dry_run else 'rewritten'}: {rewritten}"
+    )
+    console.print(f"Existing picks preserved: {preserved_picks}")
     console.print(f"Records skipped: {skipped}")
     console.print(
         "Lightroom auto edit: "
