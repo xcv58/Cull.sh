@@ -17,11 +17,64 @@ from cull_sh.config import BackendConfig
 from cull_sh.config import DEFAULT_PRODUCTION_MODEL
 from cull_sh.models import ColorLabel
 from cull_sh.models import DecisionBucket
+from cull_sh.models import EditReviewPair
+from cull_sh.models import EditReviewVerdict
+from cull_sh.models import EditSuggestion
 from cull_sh.models import PreviewImage
 from cull_sh.models import RawAsset
 
 
 class OllamaBackendTests(unittest.TestCase):
+    def test_review_edits_returns_one_bounded_refinement(self) -> None:
+        backend = OllamaVisionBackend(
+            base_url="http://localhost:11434",
+            model="qwen",
+            timeout_seconds=300.0,
+        )
+        preview = _build_preview("frame.ARW")
+        pair = EditReviewPair(
+            asset=preview.asset,
+            baseline_bytes=b"baseline",
+            edited_bytes=b"edited",
+            suggestion=EditSuggestion(
+                filename="frame.ARW",
+                asset_id=preview.asset.raw_path.as_posix(),
+                exposure=0.2,
+                contrast=10,
+                highlights=-20,
+                shadows=15,
+                vibrance=5,
+            ),
+        )
+        response = MagicMock()
+        response.raise_for_status.return_value = None
+        response.json.return_value = {
+            "message": {
+                "content": (
+                    '{"reviews":[{"id":"image-1","filename":"frame.ARW",'
+                    '"verdict":"refine","exposure":1.4,"contrast":80,'
+                    '"highlights":-70,"shadows":55,"vibrance":45,'
+                    '"has_crop":false,"crop_left":0,"crop_top":0,'
+                    '"crop_right":1,"crop_bottom":1,"crop_angle":0,'
+                    '"summary":"Reduce the remaining darkness."}]}'
+                )
+            }
+        }
+        fake_client = MagicMock()
+        fake_client.__enter__.return_value = fake_client
+        fake_client.post.return_value = response
+
+        with patch("cull_sh.backends.ollama.httpx.Client", return_value=fake_client):
+            reviews = backend.review_edits("natural", [pair])
+
+        self.assertEqual(reviews[0].verdict, EditReviewVerdict.REFINE)
+        self.assertEqual(reviews[0].final_suggestion.exposure, 0.7)
+        self.assertEqual(reviews[0].final_suggestion.contrast, 40)
+        self.assertEqual(reviews[0].final_suggestion.highlights, -50)
+        request_payload = fake_client.post.call_args.kwargs["json"]
+        self.assertEqual(len(request_payload["messages"][1]["images"]), 2)
+        self.assertIn("baseline", request_payload["messages"][1]["content"])
+
     def test_production_backend_defaults_to_qwen_thinking_and_one_attempt(self) -> None:
         backend = build_backend(BackendConfig())
 

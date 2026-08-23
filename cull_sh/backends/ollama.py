@@ -19,6 +19,9 @@ from cull_sh.backends.base import VisionBackendError
 from cull_sh.models import ColorLabel
 from cull_sh.models import DecisionBucket
 from cull_sh.models import DecisionSource
+from cull_sh.models import EditReview
+from cull_sh.models import EditReviewPair
+from cull_sh.models import EditReviewVerdict
 from cull_sh.models import EditSuggestion
 from cull_sh.models import FinalDecision, PreviewImage
 
@@ -108,6 +111,14 @@ class OllamaBatchEditPayload(BaseModel):
 
 class OllamaBatchEditWithCropPayload(BaseModel):
     edits: list[OllamaEditWithCropPayload]
+
+
+class OllamaEditReviewPayload(OllamaEditWithCropPayload):
+    verdict: Literal["accept", "refine", "reject"]
+
+
+class OllamaBatchEditReviewPayload(BaseModel):
+    reviews: list[OllamaEditReviewPayload]
 
 
 class OllamaVisionBackend(VisionBackend):
@@ -403,6 +414,117 @@ class OllamaVisionBackend(VisionBackend):
             ),
         )
 
+    def review_edits(
+        self,
+        prompt: str,
+        pairs: list[EditReviewPair],
+    ) -> list[EditReview]:
+        with httpx.Client(timeout=self.timeout_seconds) as client:
+            parsed_batch = self._review_edit_cohort(client, prompt, pairs)
+
+        returned_by_id = {review.id: review for review in parsed_batch.reviews}
+        reviews: list[EditReview] = []
+        for index, pair in enumerate(pairs, start=1):
+            review_id = _preview_id(index)
+            try:
+                parsed = returned_by_id[review_id]
+            except KeyError as exc:
+                raise VisionBackendError(
+                    f"ollama edit review omitted image id: {review_id}"
+                ) from exc
+
+            verdict = EditReviewVerdict(parsed.verdict)
+            if verdict == EditReviewVerdict.ACCEPT:
+                final_suggestion = pair.suggestion
+            elif verdict == EditReviewVerdict.REJECT:
+                final_suggestion = EditSuggestion(
+                    filename=pair.asset.filename,
+                    asset_id=pair.asset.raw_path.as_posix(),
+                    summary="Reverted to the neutral RapidRAW baseline.",
+                )
+            else:
+                final_suggestion = _bounded_refinement(pair, parsed)
+            reviews.append(
+                EditReview(
+                    filename=pair.asset.filename,
+                    verdict=verdict,
+                    final_suggestion=final_suggestion,
+                    summary=parsed.summary.strip(),
+                )
+            )
+        return reviews
+
+    def _review_edit_cohort(
+        self,
+        client: httpx.Client,
+        prompt: str,
+        pairs: list[EditReviewPair],
+    ) -> OllamaBatchEditReviewPayload:
+        image_specs: list[dict[str, object]] = []
+        encoded_images: list[str] = []
+        for index, pair in enumerate(pairs, start=1):
+            review_id = _preview_id(index)
+            image_specs.append(
+                {
+                    "id": review_id,
+                    "filename": pair.asset.filename,
+                    "image_order": ["baseline", "edited"],
+                    "current_adjustments": _edit_payload(pair.suggestion),
+                }
+            )
+            encoded_images.extend(
+                [
+                    base64.b64encode(pair.baseline_bytes).decode("ascii"),
+                    base64.b64encode(pair.edited_bytes).decode("ascii"),
+                ]
+            )
+
+        request_payload = {
+            "model": self.model,
+            "messages": [
+                {
+                    "role": "system",
+                    "content": (
+                        "You are validating real photo edit renders. Each record has exactly "
+                        "two consecutive images: the neutral RapidRAW baseline followed by the "
+                        "RapidRAW render of the current adjustments. Return only valid JSON matching "
+                        "the schema, with one review per record. Prefer accept over needless tinkering."
+                    ),
+                },
+                {
+                    "role": "user",
+                    "content": (
+                        "Edit pairs:\n"
+                        + json.dumps(image_specs, ensure_ascii=False, indent=2)
+                        + "\n\n"
+                        + f"User instructions: {prompt}\n"
+                        + "Compare each edited render only with its paired baseline. "
+                        + "Use accept when it is a natural improvement without a visible problem. "
+                        + "Use reject when the neutral baseline is better and adjustment is unnecessary. "
+                        + "Use refine only to correct a specific visible issue introduced or left by the edit. "
+                        + "For refine, return final absolute slider and crop values, not deltas. "
+                        + "Keep refinements conservative: exposure within 0.5 stop and each integer slider "
+                        + "within 30 points of the current recipe. Do not invent a stylistic change merely "
+                        + "to make the values different. Fill every field and explain the verdict briefly."
+                    ),
+                    "images": encoded_images,
+                },
+            ],
+            "format": OllamaBatchEditReviewPayload.model_json_schema(),
+            "stream": False,
+            "options": {
+                "temperature": self.temperature,
+                "num_predict": self.max_output_tokens,
+            },
+        }
+        if self.think is not None:
+            request_payload["think"] = self.think
+        return self._chat_structured(
+            client,
+            request_payload,
+            lambda payload: _parse_edit_review_payload(payload, pairs),
+        )
+
     def _chat_structured(
         self,
         client: httpx.Client,
@@ -581,3 +703,84 @@ def _parse_edit_payload(
             )
 
     return parsed
+
+
+def _parse_edit_review_payload(
+    payload: dict[str, object],
+    pairs: list[EditReviewPair],
+) -> OllamaBatchEditReviewPayload:
+    content = _message_content(payload)
+    try:
+        parsed = OllamaBatchEditReviewPayload.model_validate(
+            _load_json_object(content)
+        )
+    except ValidationError as exc:
+        raise VisionBackendError(
+            f"ollama returned invalid structured edit review: {exc}"
+        ) from exc
+
+    if len(parsed.reviews) != len(pairs):
+        raise VisionBackendError(
+            "ollama edit review did not include one result per input pair"
+        )
+    expected_by_id = {
+        _preview_id(index): pair.asset.filename
+        for index, pair in enumerate(pairs, start=1)
+    }
+    returned_ids = [review.id for review in parsed.reviews]
+    if set(returned_ids) != set(expected_by_id):
+        raise VisionBackendError(
+            "ollama edit review did not include the expected image ids"
+        )
+    for review in parsed.reviews:
+        if review.filename != expected_by_id[review.id]:
+            raise VisionBackendError(
+                "ollama edit review did not include the expected filenames"
+            )
+    return parsed
+
+
+def _edit_payload(suggestion: EditSuggestion) -> dict[str, object]:
+    return {
+        "exposure": suggestion.exposure,
+        "contrast": suggestion.contrast,
+        "highlights": suggestion.highlights,
+        "shadows": suggestion.shadows,
+        "vibrance": suggestion.vibrance,
+        "has_crop": suggestion.has_crop,
+        "crop_left": suggestion.crop_left,
+        "crop_top": suggestion.crop_top,
+        "crop_right": suggestion.crop_right,
+        "crop_bottom": suggestion.crop_bottom,
+        "crop_angle": suggestion.crop_angle,
+    }
+
+
+def _bounded_refinement(
+    pair: EditReviewPair,
+    parsed: OllamaEditReviewPayload,
+) -> EditSuggestion:
+    current = pair.suggestion
+
+    def bounded_float(value: float, original: float, delta: float) -> float:
+        return max(original - delta, min(original + delta, value))
+
+    def bounded_int(value: int, original: int, delta: int) -> int:
+        return max(original - delta, min(original + delta, value))
+
+    return EditSuggestion(
+        filename=pair.asset.filename,
+        asset_id=pair.asset.raw_path.as_posix(),
+        exposure=bounded_float(parsed.exposure, current.exposure, 0.5),
+        contrast=bounded_int(parsed.contrast, current.contrast, 30),
+        highlights=bounded_int(parsed.highlights, current.highlights, 30),
+        shadows=bounded_int(parsed.shadows, current.shadows, 30),
+        vibrance=bounded_int(parsed.vibrance, current.vibrance, 30),
+        has_crop=parsed.has_crop,
+        crop_left=parsed.crop_left,
+        crop_top=parsed.crop_top,
+        crop_right=parsed.crop_right,
+        crop_bottom=parsed.crop_bottom,
+        crop_angle=parsed.crop_angle,
+        summary=parsed.summary.strip(),
+    )

@@ -1,0 +1,436 @@
+from __future__ import annotations
+
+from collections.abc import Callable
+from dataclasses import asdict
+from dataclasses import dataclass
+from html import escape
+import json
+from pathlib import Path
+import shutil
+import subprocess
+
+from PIL import Image
+from PIL import ImageStat
+
+from cull_sh.backends.base import VisionBackend
+from cull_sh.manifests import decision_from_manifest_record
+from cull_sh.manifests import load_manifest_records
+from cull_sh.models import AssetKind
+from cull_sh.models import DecisionBucket
+from cull_sh.models import EditReviewPair
+from cull_sh.models import EditSuggestion
+from cull_sh.models import PreviewImage
+from cull_sh.models import RawAsset
+from cull_sh.rapidraw import rapidraw_adjustments_from_suggestion
+from cull_sh.xmp import sidecar_is_picked
+
+
+ProgressCallback = Callable[[str], None]
+CommandRunner = Callable[[list[str]], subprocess.CompletedProcess[str]]
+
+
+@dataclass(frozen=True, slots=True)
+class FeedbackPilotResult:
+    root: Path
+    manifest_path: Path
+    review_page: Path
+    photos: int
+    accepted: int
+    refined: int
+    reverted: int
+
+
+def select_machine_picks(
+    cull_run: Path,
+    human_baseline: Path,
+    source_root: Path,
+) -> list[RawAsset]:
+    """Select manifest picks that were not already human-picked in the backup."""
+    source_root = source_root.expanduser().resolve()
+    human_baseline = human_baseline.expanduser().resolve()
+    selected: list[RawAsset] = []
+    for record in load_manifest_records(cull_run.expanduser().resolve()):
+        decision = decision_from_manifest_record(record)
+        if decision is None or decision.bucket != DecisionBucket.PICK:
+            continue
+        raw_path = Path(str(record["raw_path"])).expanduser().resolve()
+        if raw_path.parent != source_root:
+            continue
+        xmp_path = Path(str(record.get("xmp_path", raw_path.with_suffix(".xmp"))))
+        if sidecar_is_picked(human_baseline / xmp_path.name):
+            continue
+        if not raw_path.is_file():
+            raise FileNotFoundError(f"selected RAW is missing: {raw_path}")
+        selected.append(
+            RawAsset(
+                raw_path=raw_path,
+                xmp_path=xmp_path,
+                kind=AssetKind(str(record.get("asset_kind", AssetKind.RAW.value))),
+            )
+        )
+    return sorted(selected, key=lambda asset: asset.filename)
+
+
+def run_feedback_pilot(
+    assets: list[RawAsset],
+    root: Path,
+    binary: Path,
+    backend: VisionBackend,
+    *,
+    prompt: str,
+    model: str,
+    cull_run: Path,
+    human_baseline: Path,
+    suggestion_batch_size: int = 4,
+    review_batch_size: int = 2,
+    include_crop: bool = True,
+    quality: int = 88,
+    progress: ProgressCallback | None = None,
+    command_runner: CommandRunner | None = None,
+) -> FeedbackPilotResult:
+    """Run a resumable neutral-render, suggest, render, and one-review pilot."""
+    if not assets:
+        raise ValueError("feedback pilot requires at least one selected photo")
+    if suggestion_batch_size < 1 or review_batch_size < 1:
+        raise ValueError("feedback pilot batch sizes must be at least one")
+    if not 1 <= quality <= 100:
+        raise ValueError("feedback pilot quality must be between 1 and 100")
+    binary = binary.expanduser().resolve()
+    if not binary.is_file():
+        raise FileNotFoundError(f"RapidRAW binary is missing: {binary}")
+    root = root.expanduser().resolve()
+    progress = progress or (lambda _message: None)
+    runner = command_runner or _run_command
+
+    input_dir = root / "input"
+    baseline_dir = root / "baseline"
+    first_dir = root / "first-pass"
+    final_dir = root / "final"
+    for directory in (root, input_dir, baseline_dir, first_dir, final_dir):
+        directory.mkdir(parents=True, exist_ok=True)
+    manifest_path = root / "feedback-manifest.json"
+    manifest = _load_or_create_manifest(
+        manifest_path,
+        assets,
+        model=model,
+        prompt=prompt,
+        cull_run=cull_run,
+        human_baseline=human_baseline,
+        include_crop=include_crop,
+    )
+    records = _records(manifest)
+
+    progress(f"Preparing {len(records)} isolated RAW copies and neutral renders.")
+    for index, (asset, record) in enumerate(zip(assets, records), start=1):
+        staged_raw = input_dir / asset.filename
+        if not staged_raw.is_file():
+            shutil.copy2(asset.raw_path, staged_raw)
+        neutral = EditSuggestion(filename=asset.filename, asset_id=str(asset.raw_path))
+        baseline = baseline_dir / f"{asset.raw_path.stem}.jpg"
+        if not baseline.is_file():
+            _write_rrdata(staged_raw, neutral, "Neutral baseline")
+            _render(binary, staged_raw, baseline, quality, runner)
+        record["staged_raw"] = str(staged_raw)
+        record["baseline_render"] = str(baseline)
+        record["baseline_metrics"] = _image_metrics(baseline)
+        _write_json(manifest_path, manifest)
+        progress(f"Baseline {index}/{len(records)}: {asset.filename}")
+
+    pending_initial = [record for record in records if "initial_suggestion" not in record]
+    for cohort_index, cohort in enumerate(
+        _chunked(pending_initial, suggestion_batch_size), start=1
+    ):
+        previews = [
+            PreviewImage(
+                asset=_asset_from_record(record),
+                image_bytes=Path(str(record["baseline_render"])).read_bytes(),
+            )
+            for record in cohort
+        ]
+        progress(
+            f"Qwen initial suggestions cohort {cohort_index}: "
+            + ", ".join(preview.asset.filename for preview in previews)
+        )
+        suggestions = backend.suggest_edits(
+            prompt,
+            previews,
+            include_crop=include_crop,
+        )
+        if len(suggestions) != len(cohort):
+            raise RuntimeError("edit backend returned the wrong suggestion count")
+        for record, suggestion in zip(cohort, suggestions):
+            record["initial_suggestion"] = _suggestion_payload(suggestion)
+        _write_json(manifest_path, manifest)
+
+    progress("Rendering the first-pass Qwen adjustments through RapidRAW.")
+    for index, record in enumerate(records, start=1):
+        staged_raw = Path(str(record["staged_raw"]))
+        suggestion = _suggestion_from_payload(record["initial_suggestion"])
+        first_render = first_dir / f"{staged_raw.stem}.jpg"
+        if not first_render.is_file():
+            _write_rrdata(staged_raw, suggestion, "Qwen first pass")
+            _render(binary, staged_raw, first_render, quality, runner)
+        record["first_render"] = str(first_render)
+        record["first_metrics"] = _image_metrics(first_render)
+        _write_json(manifest_path, manifest)
+        progress(f"First render {index}/{len(records)}: {staged_raw.name}")
+
+    pending_reviews = [record for record in records if "review" not in record]
+    for cohort_index, cohort in enumerate(
+        _chunked(pending_reviews, review_batch_size), start=1
+    ):
+        pairs = [
+            EditReviewPair(
+                asset=_asset_from_record(record),
+                baseline_bytes=Path(str(record["baseline_render"])).read_bytes(),
+                edited_bytes=Path(str(record["first_render"])).read_bytes(),
+                suggestion=_suggestion_from_payload(record["initial_suggestion"]),
+            )
+            for record in cohort
+        ]
+        progress(
+            f"Qwen rendered-edit review cohort {cohort_index}: "
+            + ", ".join(pair.asset.filename for pair in pairs)
+        )
+        reviews = backend.review_edits(prompt, pairs)
+        if len(reviews) != len(cohort):
+            raise RuntimeError("edit backend returned the wrong review count")
+        for record, review in zip(cohort, reviews):
+            record["review"] = {
+                "verdict": review.verdict.value,
+                "summary": review.summary,
+            }
+            record["final_suggestion"] = _suggestion_payload(
+                review.final_suggestion
+            )
+        _write_json(manifest_path, manifest)
+
+    progress("Rendering accepted, reverted, or once-refined final recipes.")
+    for index, record in enumerate(records, start=1):
+        staged_raw = Path(str(record["staged_raw"]))
+        final_render = final_dir / f"{staged_raw.stem}.jpg"
+        initial = _suggestion_from_payload(record["initial_suggestion"])
+        final = _suggestion_from_payload(record["final_suggestion"])
+        _write_rrdata(staged_raw, final, "Qwen validated final")
+        if not final_render.is_file():
+            if _suggestion_payload(initial) == _suggestion_payload(final):
+                shutil.copy2(Path(str(record["first_render"])), final_render)
+            else:
+                _render(binary, staged_raw, final_render, quality, runner)
+        record["final_render"] = str(final_render)
+        record["final_metrics"] = _image_metrics(final_render)
+        _write_json(manifest_path, manifest)
+        progress(f"Final render {index}/{len(records)}: {staged_raw.name}")
+
+    review_page = _write_review_page(root, records)
+    verdicts = [str(record["review"]["verdict"]) for record in records]
+    return FeedbackPilotResult(
+        root=root,
+        manifest_path=manifest_path,
+        review_page=review_page,
+        photos=len(records),
+        accepted=verdicts.count("accept"),
+        refined=verdicts.count("refine"),
+        reverted=verdicts.count("reject"),
+    )
+
+
+def _load_or_create_manifest(
+    path: Path,
+    assets: list[RawAsset],
+    *,
+    model: str,
+    prompt: str,
+    cull_run: Path,
+    human_baseline: Path,
+    include_crop: bool,
+) -> dict[str, object]:
+    filenames = [asset.filename for asset in assets]
+    if path.is_file():
+        payload = json.loads(path.read_text(encoding="utf-8"))
+        existing = [str(record["filename"]) for record in _records(payload)]
+        if existing != filenames:
+            raise ValueError("existing feedback stage has a different selection")
+        return payload
+    payload: dict[str, object] = {
+        "schema_version": 1,
+        "kind": "cull-sh-rendered-edit-feedback-pilot",
+        "model": model,
+        "prompt": prompt,
+        "cull_run": str(cull_run.expanduser().resolve()),
+        "human_baseline": str(human_baseline.expanduser().resolve()),
+        "include_crop": include_crop,
+        "originals_modified": False,
+        "maximum_refinements": 1,
+        "records": [
+            {
+                "id": f"pilot-{index:04d}",
+                "filename": asset.filename,
+                "source": str(asset.raw_path),
+                "xmp_path": str(asset.xmp_path),
+                "asset_kind": asset.kind.value,
+                "selection": "machine-pick-not-in-human-baseline",
+            }
+            for index, asset in enumerate(assets, start=1)
+        ],
+    }
+    _write_json(path, payload)
+    return payload
+
+
+def _records(payload: dict[str, object]) -> list[dict[str, object]]:
+    records = payload.get("records")
+    if not isinstance(records, list) or not all(
+        isinstance(record, dict) for record in records
+    ):
+        raise ValueError("feedback manifest records are invalid")
+    return records  # type: ignore[return-value]
+
+
+def _asset_from_record(record: dict[str, object]) -> RawAsset:
+    source = Path(str(record["source"]))
+    return RawAsset(
+        raw_path=source,
+        xmp_path=Path(str(record["xmp_path"])),
+        kind=AssetKind(str(record.get("asset_kind", AssetKind.RAW.value))),
+    )
+
+
+def _suggestion_payload(suggestion: EditSuggestion) -> dict[str, object]:
+    return asdict(suggestion)
+
+
+def _suggestion_from_payload(payload: object) -> EditSuggestion:
+    if not isinstance(payload, dict):
+        raise ValueError("invalid edit suggestion in feedback manifest")
+    return EditSuggestion(**payload)
+
+
+def _write_rrdata(raw_path: Path, suggestion: EditSuggestion, tag: str) -> None:
+    payload = {
+        "version": 1,
+        "rating": 0,
+        "adjustments": rapidraw_adjustments_from_suggestion(
+            _suggestion_payload(suggestion)
+        ),
+        "tags": ["Cull.sh", tag],
+    }
+    _write_json(raw_path.with_name(raw_path.name + ".rrdata"), payload)
+
+
+def _render(
+    binary: Path,
+    source: Path,
+    output: Path,
+    quality: int,
+    runner: CommandRunner,
+) -> None:
+    command = [
+        str(binary),
+        "export",
+        str(source),
+        "--output",
+        str(output),
+        "--format",
+        "jpeg",
+        "--quality",
+        str(quality),
+    ]
+    result = runner(command)
+    if result.returncode != 0:
+        detail = (result.stderr or result.stdout or "unknown error").strip()
+        raise RuntimeError(f"RapidRAW render failed for {source.name}: {detail}")
+    if not output.is_file():
+        raise RuntimeError(f"RapidRAW reported success but did not create {output}")
+
+
+def _run_command(command: list[str]) -> subprocess.CompletedProcess[str]:
+    return subprocess.run(command, capture_output=True, text=True, check=False)
+
+
+def _image_metrics(path: Path) -> dict[str, float]:
+    with Image.open(path) as image:
+        gray = image.convert("L")
+        histogram = gray.histogram()
+        pixels = max(1, sum(histogram))
+        return {
+            "mean_luma": round(float(ImageStat.Stat(gray).mean[0]), 3),
+            "shadow_clip_fraction": round(sum(histogram[:4]) / pixels, 6),
+            "highlight_clip_fraction": round(sum(histogram[252:]) / pixels, 6),
+        }
+
+
+def _write_review_page(root: Path, records: list[dict[str, object]]) -> Path:
+    cards: list[str] = []
+    for record in records:
+        record_id = str(record["id"])
+        initial = record["initial_suggestion"]
+        final = record["final_suggestion"]
+        review = record["review"]
+        assert isinstance(initial, dict)
+        assert isinstance(final, dict)
+        assert isinstance(review, dict)
+        cards.append(
+            f"<article data-id='{escape(record_id)}'>"
+            f"<h2>{escape(str(record['filename']))}</h2>"
+            "<div class='images'>"
+            + _figure(root, Path(str(record["baseline_render"])), "Baseline")
+            + _figure(root, Path(str(record["first_render"])), "First edit")
+            + _figure(root, Path(str(record["final_render"])), "Validated final")
+            + "</div>"
+            + f"<p><strong>Qwen verdict:</strong> {escape(str(review['verdict']))} — {escape(str(review.get('summary', '')))}</p>"
+            + f"<p class='recipe'>First: {escape(_recipe(initial))}<br>Final: {escape(_recipe(final))}</p>"
+            + "<div class='choices'>Human preference: "
+            + " ".join(
+                f"<label><input type='radio' name='{escape(record_id)}' value='{choice}'> {label}</label>"
+                for choice, label in (
+                    ("baseline", "Baseline"),
+                    ("first", "First edit"),
+                    ("final", "Validated final"),
+                    ("tie", "Tie"),
+                )
+            )
+            + "</div></article>"
+        )
+    ids = json.dumps([str(record["id"]) for record in records])
+    page = root / "review.html"
+    page.write_text(
+        """<!doctype html><html><head><meta charset='utf-8'><meta name='viewport' content='width=device-width,initial-scale=1'>
+<title>Cull.sh rendered edit feedback pilot</title><style>
+:root{color-scheme:dark;font-family:system-ui;background:#101010;color:#eee}body{max-width:1900px;margin:auto;padding:24px}
+.toolbar{position:sticky;top:0;background:#101010ee;padding:12px 0;z-index:2}button{padding:9px 14px}article{border:1px solid #333;border-radius:12px;padding:14px;margin:18px 0;background:#181818}
+.images{display:grid;grid-template-columns:repeat(3,1fr);gap:10px}figure{margin:0}img{width:100%;height:460px;object-fit:contain;background:#080808}figcaption{color:#aaa}.recipe{color:#e9c46a}.choices{display:flex;gap:18px;flex-wrap:wrap}label{padding:8px;border:1px solid #555;border-radius:8px}label:has(input:checked){background:#14532d;border-color:#4ade80}@media(max-width:900px){.images{grid-template-columns:1fr}img{height:auto}}
+</style></head><body><h1>Rendered edit feedback pilot</h1><p>Machine-added picks only. Originals were not modified.</p>
+<div class='toolbar'><button id='download'>Download choices CSV</button> <strong id='count'></strong></div>"""
+        + "".join(cards)
+        + f"""<script>const ids={ids};const key='cull-sh-edit-feedback-'+location.pathname;const saved=JSON.parse(localStorage.getItem(key)||'{{}}');
+function refresh(){{let n=0;ids.forEach(id=>{{const v=saved[id];if(v){{n++;const el=document.querySelector(`input[name="${{id}}"]`+`[value="${{v}}"]`);if(el)el.checked=true;}}}});document.getElementById('count').textContent=n+' / '+ids.length+' reviewed';localStorage.setItem(key,JSON.stringify(saved));}}
+document.querySelectorAll('input[type=radio]').forEach(el=>el.addEventListener('change',()=>{{saved[el.name]=el.value;refresh();}}));
+document.getElementById('download').onclick=()=>{{let csv='id,choice\\n'+ids.map(id=>id+','+(saved[id]||'')).join('\\n');let a=document.createElement('a');a.href=URL.createObjectURL(new Blob([csv],{{type:'text/csv'}}));a.download='edit-feedback-choices.csv';a.click();}};refresh();</script></body></html>""",
+        encoding="utf-8",
+    )
+    return page
+
+
+def _figure(root: Path, path: Path, label: str) -> str:
+    relative = path.relative_to(root).as_posix()
+    return f"<figure><img src='{escape(relative)}'><figcaption>{escape(label)}</figcaption></figure>"
+
+
+def _recipe(payload: dict[str, object]) -> str:
+    fields = ("exposure", "contrast", "highlights", "shadows", "vibrance")
+    text = " · ".join(f"{field} {payload.get(field)}" for field in fields)
+    if payload.get("has_crop"):
+        text += " · crop/level"
+    return text
+
+
+def _chunked(items: list[dict[str, object]], size: int):
+    for start in range(0, len(items), size):
+        yield items[start : start + size]
+
+
+def _write_json(path: Path, payload: dict[str, object]) -> None:
+    temporary = path.with_name(path.name + ".tmp")
+    temporary.write_text(json.dumps(payload, indent=2, sort_keys=True), encoding="utf-8")
+    temporary.replace(path)

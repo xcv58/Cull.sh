@@ -33,6 +33,8 @@ from cull_sh.edit_benchmark import EditModelSpec
 from cull_sh.edit_benchmark import run_edit_benchmark
 from cull_sh.edit_benchmark import stage_lightroom_blind_review
 from cull_sh.edit_benchmark import write_blind_review_page
+from cull_sh.edit_feedback import run_feedback_pilot
+from cull_sh.edit_feedback import select_machine_picks
 from cull_sh.lightroom_ui import build_adaptive_color_stage
 from cull_sh.lightroom_ui import build_jpeg_auto_stage
 from cull_sh.lightroom_ui import write_adaptive_color_handoff
@@ -1668,6 +1670,84 @@ def suggest_edits(
     if read_errors:
         _print_error_table("Suggest Edits Errors", read_errors)
         raise typer.Exit(code=1)
+
+
+@app.command("rapidraw-feedback-pilot")
+def rapidraw_feedback_pilot(
+    path: Path = typer.Option(..., exists=True, file_okay=False, dir_okay=True),
+    cull_run: Path = typer.Option(
+        ...,
+        exists=True,
+        file_okay=False,
+        dir_okay=True,
+        help="Frozen culling run whose machine-only picks define the pilot.",
+    ),
+    human_baseline: Path = typer.Option(
+        ...,
+        exists=True,
+        file_okay=False,
+        dir_okay=True,
+        help="Pre-application XMP backup defining existing human picks.",
+    ),
+    output: Path = typer.Option(
+        ...,
+        file_okay=False,
+        dir_okay=True,
+        help="Isolated resumable RapidRAW feedback stage.",
+    ),
+    prompt: str = typer.Option(DEFAULT_EDIT_PROMPT),
+    model: str = typer.Option(DEFAULT_PRODUCTION_MODEL),
+    backend_url: str = typer.Option("http://localhost:11434"),
+    backend_timeout: float = typer.Option(600.0, min=1.0),
+    backend_max_output_tokens: int = typer.Option(2048, min=1),
+    suggestion_batch_size: int = typer.Option(4, min=1),
+    review_batch_size: int = typer.Option(2, min=1),
+    with_crop: bool = typer.Option(True, "--with-crop/--no-with-crop"),
+    rapidraw_binary: Path = typer.Option(DEFAULT_RAPIDRAW_BINARY),
+) -> None:
+    """Pilot a neutral-render, suggest, render, and one-refinement edit loop."""
+    assets = select_machine_picks(cull_run, human_baseline, path)
+    console.print(f"Machine-only picked pilot photos: {len(assets)}")
+    if not assets:
+        raise typer.BadParameter("the frozen run has no machine-only picks")
+    console.print(", ".join(asset.filename for asset in assets))
+    backend = build_backend(
+        BackendConfig(
+            provider="ollama",
+            model=model,
+            base_url=backend_url,
+            timeout_seconds=backend_timeout,
+            max_attempts=1,
+            think=True,
+            fail_fast=True,
+            max_output_tokens=backend_max_output_tokens,
+        )
+    )
+    try:
+        result = run_feedback_pilot(
+            assets,
+            output,
+            rapidraw_binary,
+            backend,
+            prompt=prompt,
+            model=model,
+            cull_run=cull_run,
+            human_baseline=human_baseline,
+            suggestion_batch_size=suggestion_batch_size,
+            review_batch_size=review_batch_size,
+            include_crop=with_crop,
+            progress=console.print,
+        )
+    except (FileNotFoundError, RuntimeError, ValueError, VisionBackendError) as exc:
+        console.print(f"RapidRAW feedback pilot stopped: {exc}")
+        console.print("The isolated stage is resumable; originals were not modified.")
+        raise typer.Exit(code=1) from exc
+    console.print(
+        f"Pilot complete: photos={result.photos} accept={result.accepted} "
+        f"refine={result.refined} revert={result.reverted}"
+    )
+    console.print(f"Manifest: {result.manifest_path}")
+    console.print(f"Human review: {result.review_page}")
 
 
 @app.command("rapidraw-stage")

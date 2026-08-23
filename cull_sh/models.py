@@ -141,6 +141,28 @@ class EditSuggestion:
         )
 
 
+class EditReviewVerdict(str, Enum):
+    ACCEPT = "accept"
+    REFINE = "refine"
+    REJECT = "reject"
+
+
+@dataclass(slots=True)
+class EditReviewPair:
+    asset: RawAsset
+    baseline_bytes: bytes
+    edited_bytes: bytes
+    suggestion: EditSuggestion
+
+
+@dataclass(slots=True)
+class EditReview:
+    filename: str
+    verdict: EditReviewVerdict
+    final_suggestion: EditSuggestion
+    summary: str = ""
+
+
 @dataclass(slots=True)
 class WorkItem:
     asset: RawAsset
