@@ -37,10 +37,30 @@ class _FakeBackend(VisionBackend):
                 filename=preview.asset.filename,
                 asset_id=str(preview.asset.raw_path),
                 exposure=0.2,
+                brightness=0.1,
                 contrast=5,
                 highlights=-10,
                 shadows=12,
+                whites=6,
+                blacks=-4,
+                temperature=5,
+                tint=-2,
                 vibrance=3,
+                saturation=2,
+                clarity=7,
+                dehaze=3,
+                structure=2,
+                sharpness=5,
+                luma_noise_reduction=10,
+                color_noise_reduction=6,
+                vignette_amount=-4,
+                has_crop=True,
+                crop_left=0.05,
+                crop_top=0.05,
+                crop_right=0.95,
+                crop_bottom=0.95,
+                crop_angle=-1.0,
+                additional_edits=["Consider a subject mask."],
                 summary="Open the darker midtones.",
             )
             for preview in previews
@@ -57,10 +77,30 @@ class _FakeBackend(VisionBackend):
                     filename=pair.asset.filename,
                     asset_id=str(pair.asset.raw_path),
                     exposure=0.1,
+                    brightness=0.05,
                     contrast=3,
                     highlights=-8,
                     shadows=8,
+                    whites=4,
+                    blacks=-3,
+                    temperature=3,
+                    tint=-1,
                     vibrance=2,
+                    saturation=1,
+                    clarity=5,
+                    dehaze=2,
+                    structure=1,
+                    sharpness=4,
+                    luma_noise_reduction=8,
+                    color_noise_reduction=5,
+                    vignette_amount=-3,
+                    has_crop=True,
+                    crop_left=0.05,
+                    crop_top=0.05,
+                    crop_right=0.95,
+                    crop_bottom=0.95,
+                    crop_angle=-0.5,
+                    additional_edits=["Consider a subject mask."],
                     summary="Use a gentler lift.",
                 ),
                 summary="The first pass is slightly too bright.",
@@ -172,8 +212,19 @@ class EditFeedbackPilotTests(unittest.TestCase):
             self.assertTrue((stage / "final/machine.jpg").is_file())
             payload = json.loads(result.manifest_path.read_text(encoding="utf-8"))
             self.assertFalse(payload["originals_modified"])
+            self.assertEqual(payload["schema_version"], 2)
+            self.assertEqual(payload["suggestion_batch_size"], 1)
+            self.assertEqual(payload["review_batch_size"], 1)
             self.assertEqual(payload["maximum_refinements"], 1)
             self.assertEqual(payload["records"][0]["review"]["verdict"], "refine")
+            sidecar = json.loads(
+                (stage / "input/machine.ARW.rrdata").read_text(encoding="utf-8")
+            )
+            self.assertEqual(sidecar["adjustments"]["temperature"], 3)
+            self.assertEqual(sidecar["adjustments"]["clarity"], 5)
+            self.assertEqual(sidecar["adjustments"]["rotation"], -0.5)
+            review_html = result.review_page.read_text(encoding="utf-8")
+            self.assertIn("additional: Consider a subject mask.", review_html)
 
             resumed = run_feedback_pilot(
                 assets,

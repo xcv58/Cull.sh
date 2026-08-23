@@ -76,18 +76,23 @@ or JPEG embedded metadata. Source image bytes are never rewritten for RAWs.
 ### 1. Suggest
 
 `suggest-edits` selects culled, non-rejected RAWs and asks
-`orcarouter/Qwen3.8-27B-Uncensored` for bounded exposure, contrast, highlights,
-shadows, vibrance, and optional crop values. The model is fail-fast with one
-attempt and no fallback by default. Recipes and model/prompt provenance are
-frozen in `edit-suggestions.jsonl`.
+`orcarouter/Qwen3.8-27B-Uncensored` for a bounded RapidRAW recipe. The executable
+surface includes global tone, white-balance/color, presence, detail/noise,
+vignette, crop, and safely cropped rotation controls. The model may also preserve
+unbounded editing ideas as explicit `additional_edits`; these notes are never
+represented as rendered changes. Editing uses one image per request, is
+fail-fast with one attempt and no fallback, and freezes recipe plus
+model/prompt provenance in `edit-suggestions.jsonl`.
 
 ### 2. Stage
 
 `rapidraw-stage` creates a new directory, copies each source RAW, translates the
 recipe into a colocated `.rrdata` sidecar, and writes an immutable
 `rapidraw-manifest.json` plus an approval template. Duplicate basenames are
-disambiguated. Slider bounds, crop geometry, and a minimum retained crop area
-are validated before any copy is rendered.
+disambiguated. Scalar bounds, rotation-with-crop, crop geometry, and a
+minimum retained crop area are validated before any copy is rendered. Spatial
+operations such as masks and healing remain explicit future-work intents until
+a mask-generation stage can supply real geometry or mask pixels.
 
 ### 3. Preview and approve
 

@@ -40,10 +40,23 @@ class OllamaBackendTests(unittest.TestCase):
                 filename="frame.ARW",
                 asset_id=preview.asset.raw_path.as_posix(),
                 exposure=0.2,
+                brightness=0.1,
                 contrast=10,
                 highlights=-20,
                 shadows=15,
+                whites=5,
+                blacks=-4,
+                temperature=3,
+                tint=-2,
                 vibrance=5,
+                saturation=2,
+                clarity=4,
+                dehaze=3,
+                structure=2,
+                sharpness=8,
+                luma_noise_reduction=5,
+                color_noise_reduction=4,
+                vignette_amount=-3,
             ),
         )
         response = MagicMock()
@@ -52,10 +65,14 @@ class OllamaBackendTests(unittest.TestCase):
             "message": {
                 "content": (
                     '{"reviews":[{"id":"image-1","filename":"frame.ARW",'
-                    '"verdict":"refine","exposure":1.4,"contrast":80,'
-                    '"highlights":-70,"shadows":55,"vibrance":45,'
-                    '"has_crop":false,"crop_left":0,"crop_top":0,'
-                    '"crop_right":1,"crop_bottom":1,"crop_angle":0,'
+                    '"verdict":"refine","exposure":1.4,"brightness":1.2,"contrast":80,'
+                    '"highlights":-70,"shadows":55,"whites":60,"blacks":-60,'
+                    '"temperature":50,"tint":-50,"vibrance":45,"saturation":40,'
+                    '"clarity":50,"dehaze":45,"structure":40,"sharpness":60,'
+                    '"luma_noise_reduction":70,"color_noise_reduction":60,'
+                    '"vignette_amount":-50,"additional_edits":["Mask the subject."],'
+                    '"has_crop":true,"crop_left":0.05,"crop_top":0.05,'
+                    '"crop_right":0.95,"crop_bottom":0.95,"crop_angle":8,'
                     '"summary":"Reduce the remaining darkness."}]}'
                 )
             }
@@ -69,11 +86,74 @@ class OllamaBackendTests(unittest.TestCase):
 
         self.assertEqual(reviews[0].verdict, EditReviewVerdict.REFINE)
         self.assertEqual(reviews[0].final_suggestion.exposure, 0.7)
+        self.assertEqual(reviews[0].final_suggestion.brightness, 0.6)
         self.assertEqual(reviews[0].final_suggestion.contrast, 40)
         self.assertEqual(reviews[0].final_suggestion.highlights, -50)
+        self.assertEqual(reviews[0].final_suggestion.whites, 35)
+        self.assertEqual(reviews[0].final_suggestion.temperature, 33)
+        self.assertEqual(reviews[0].final_suggestion.luma_noise_reduction, 35)
+        self.assertEqual(reviews[0].final_suggestion.crop_angle, 5.0)
+        self.assertTrue(reviews[0].final_suggestion.has_crop)
+        self.assertEqual(
+            reviews[0].final_suggestion.additional_edits, ["Mask the subject."]
+        )
         request_payload = fake_client.post.call_args.kwargs["json"]
         self.assertEqual(len(request_payload["messages"][1]["images"]), 2)
         self.assertIn("baseline", request_payload["messages"][1]["content"])
+        self.assertIn(
+            "Judge the rendered result",
+            request_payload["messages"][0]["content"],
+        )
+        self.assertNotIn(
+            "Prefer accept",
+            request_payload["messages"][0]["content"],
+        )
+
+    def test_review_reject_reverts_recipe_but_preserves_additional_intents(self) -> None:
+        backend = OllamaVisionBackend(
+            base_url="http://localhost:11434",
+            model="qwen",
+            timeout_seconds=300.0,
+        )
+        preview = _build_preview("frame.ARW")
+        pair = EditReviewPair(
+            asset=preview.asset,
+            baseline_bytes=b"baseline",
+            edited_bytes=b"edited",
+            suggestion=EditSuggestion(
+                filename="frame.ARW",
+                exposure=0.3,
+                additional_edits=["Generate a subject mask."],
+            ),
+        )
+        response = MagicMock()
+        response.raise_for_status.return_value = None
+        response.json.return_value = {
+            "message": {
+                "content": (
+                    '{"reviews":[{"id":"image-1","filename":"frame.ARW",'
+                    '"verdict":"reject","exposure":0,"contrast":0,'
+                    '"highlights":0,"shadows":0,"vibrance":0,'
+                    '"additional_edits":["Use a tighter subject mask."],'
+                    '"has_crop":false,"crop_left":0,"crop_top":0,'
+                    '"crop_right":1,"crop_bottom":1,"crop_angle":0,'
+                    '"summary":"The baseline is better."}]}'
+                )
+            }
+        }
+        fake_client = MagicMock()
+        fake_client.__enter__.return_value = fake_client
+        fake_client.post.return_value = response
+
+        with patch("cull_sh.backends.ollama.httpx.Client", return_value=fake_client):
+            review = backend.review_edits("natural", [pair])[0]
+
+        self.assertEqual(review.verdict, EditReviewVerdict.REJECT)
+        self.assertTrue(review.final_suggestion.is_noop)
+        self.assertEqual(
+            review.final_suggestion.additional_edits,
+            ["Use a tighter subject mask."],
+        )
 
     def test_production_backend_defaults_to_qwen_thinking_and_one_attempt(self) -> None:
         backend = build_backend(BackendConfig())
@@ -219,6 +299,57 @@ class OllamaBackendTests(unittest.TestCase):
         self.assertEqual(suggestions[0].highlights, -40)
         self.assertTrue(suggestions[1].is_noop)
 
+    def test_suggest_edits_maps_expanded_rapidraw_recipe_and_other_intents(self) -> None:
+        backend = OllamaVisionBackend(
+            base_url="http://localhost:11434",
+            model="qwen",
+            timeout_seconds=300.0,
+        )
+        preview = _build_preview("frame.ARW")
+        response = MagicMock()
+        response.raise_for_status.return_value = None
+        response.json.return_value = {
+            "message": {
+                "content": (
+                    '{"edits":[{"id":"image-1","filename":"frame.ARW",'
+                    '"exposure":0.2,"brightness":0.1,"contrast":8,'
+                    '"highlights":-15,"shadows":12,"whites":6,"blacks":-4,'
+                    '"temperature":5,"tint":-3,"vibrance":7,"saturation":2,'
+                    '"clarity":9,"dehaze":4,"structure":3,"sharpness":11,'
+                    '"luma_noise_reduction":14,"color_noise_reduction":8,'
+                    '"vignette_amount":-5,"additional_edits":'
+                    '["  Add a subtle subject mask.  ",""],'
+                    '"has_crop":true,"crop_left":0.2,"crop_top":0.2,'
+                    '"crop_right":0.8,"crop_bottom":0.8,"crop_angle":-1.2,'
+                    '"summary":"Correct the cool, flat rendering and level the frame."}]}'
+                )
+            }
+        }
+        fake_client = MagicMock()
+        fake_client.__enter__.return_value = fake_client
+        fake_client.post.return_value = response
+
+        with patch("cull_sh.backends.ollama.httpx.Client", return_value=fake_client):
+            suggestion = backend.suggest_edits(
+                "prompt", [preview], include_crop=True
+            )[0]
+
+        self.assertEqual(suggestion.brightness, 0.1)
+        self.assertEqual(suggestion.whites, 6)
+        self.assertEqual(suggestion.blacks, -4)
+        self.assertEqual(suggestion.temperature, 5)
+        self.assertEqual(suggestion.tint, -3)
+        self.assertEqual(suggestion.clarity, 9)
+        self.assertEqual(suggestion.luma_noise_reduction, 14)
+        self.assertEqual(suggestion.color_noise_reduction, 8)
+        self.assertEqual(suggestion.vignette_amount, -5)
+        self.assertTrue(suggestion.has_crop)
+        self.assertEqual(suggestion.crop_angle, -1.2)
+        self.assertEqual(
+            suggestion.additional_edits, ["Add a subtle subject mask."]
+        )
+        self.assertFalse(suggestion.is_noop)
+
     def test_suggest_edits_maps_crop_adjustments_when_requested(self) -> None:
         backend = OllamaVisionBackend(
             base_url="http://localhost:11434",
@@ -257,15 +388,15 @@ class OllamaBackendTests(unittest.TestCase):
         self.assertEqual(suggestions[0].crop_angle, -1.5)
         request_payload = fake_client.post.call_args.kwargs["json"]
         self.assertIn(
-            "actively evaluate composition",
+            "independently evaluate crop and rotation",
             request_payload["messages"][0]["content"],
         )
         self.assertIn(
-            "first-class optional Develop edit",
+            "first-class optional edits",
             request_payload["messages"][0]["content"],
         )
         self.assertIn(
-            "Composition/crop pass",
+            "Composition/crop/rotation pass",
             request_payload["messages"][1]["content"],
         )
         self.assertIn(
@@ -281,6 +412,19 @@ class OllamaBackendTests(unittest.TestCase):
             request_payload["messages"][1]["content"],
         )
         self.assertIn("has_crop", str(request_payload["format"]))
+        self.assertIn("additional_edits", str(request_payload["format"]))
+        self.assertIn(
+            "Do not narrate slider actions",
+            request_payload["messages"][1]["content"],
+        )
+        self.assertIn(
+            "exposure is a linear RAW EV shift",
+            request_payload["messages"][1]["content"],
+        )
+        self.assertNotIn(
+            'or "No global adjustment needed."',
+            request_payload["messages"][1]["content"],
+        )
 
     def test_parse_edit_payload_rejects_wrong_count(self) -> None:
         previews = [_build_preview("a.ARW"), _build_preview("b.ARW")]
@@ -366,7 +510,7 @@ class OllamaBackendTests(unittest.TestCase):
                     '"shadows":5,"vibrance":3,"has_crop":false,'
                     '"crop_left":0.2,"crop_top":0.2,'
                     '"crop_right":0.8,"crop_bottom":0.8,'
-                    '"crop_angle":12,'
+                    '"crop_angle":0,'
                     '"summary":"Slightly dark foreground."}]}'
                 )
             }
@@ -380,6 +524,24 @@ class OllamaBackendTests(unittest.TestCase):
         self.assertEqual(parsed.edits[0].crop_right, 1.0)
         self.assertEqual(parsed.edits[0].crop_bottom, 1.0)
         self.assertEqual(parsed.edits[0].crop_angle, 0.0)
+
+    def test_parse_edit_payload_rejects_rotation_without_crop(self) -> None:
+        preview = _build_preview("frame.ARW")
+        payload = {
+            "message": {
+                "content": (
+                    '{"edits":[{"id":"image-1","filename":"frame.ARW",'
+                    '"exposure":0.1,"contrast":4,"highlights":-10,'
+                    '"shadows":5,"vibrance":3,"has_crop":false,'
+                    '"crop_left":0,"crop_top":0,"crop_right":1,'
+                    '"crop_bottom":1,"crop_angle":2,'
+                    '"summary":"The horizon is tilted."}]}'
+                )
+            }
+        }
+
+        with self.assertRaisesRegex(VisionBackendError, "invalid structured output"):
+            _parse_edit_payload(payload, [preview], include_crop=True)
 
     def test_parse_edit_payload_rejects_invalid_crop_rectangle(self) -> None:
         preview = _build_preview("frame.ARW")

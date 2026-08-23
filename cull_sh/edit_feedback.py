@@ -81,8 +81,8 @@ def run_feedback_pilot(
     model: str,
     cull_run: Path,
     human_baseline: Path,
-    suggestion_batch_size: int = 4,
-    review_batch_size: int = 2,
+    suggestion_batch_size: int = 1,
+    review_batch_size: int = 1,
     include_crop: bool = True,
     quality: int = 88,
     progress: ProgressCallback | None = None,
@@ -117,6 +117,8 @@ def run_feedback_pilot(
         cull_run=cull_run,
         human_baseline=human_baseline,
         include_crop=include_crop,
+        suggestion_batch_size=suggestion_batch_size,
+        review_batch_size=review_batch_size,
     )
     records = _records(manifest)
     _migrate_crop_coordinate_space(root, manifest_path, manifest, records)
@@ -263,6 +265,8 @@ def _load_or_create_manifest(
     cull_run: Path,
     human_baseline: Path,
     include_crop: bool,
+    suggestion_batch_size: int,
+    review_batch_size: int,
 ) -> dict[str, object]:
     filenames = [asset.filename for asset in assets]
     if path.is_file():
@@ -272,13 +276,15 @@ def _load_or_create_manifest(
             raise ValueError("existing feedback stage has a different selection")
         return payload
     payload: dict[str, object] = {
-        "schema_version": 1,
+        "schema_version": 2,
         "kind": "cull-sh-rendered-edit-feedback-pilot",
         "model": model,
         "prompt": prompt,
         "cull_run": str(cull_run.expanduser().resolve()),
         "human_baseline": str(human_baseline.expanduser().resolve()),
         "include_crop": include_crop,
+        "suggestion_batch_size": suggestion_batch_size,
+        "review_batch_size": review_batch_size,
         "originals_modified": False,
         "maximum_refinements": 1,
         "crop_coordinate_space": "rapidraw-pixels-v2",
@@ -535,10 +541,39 @@ def _figure(root: Path, path: Path, label: str) -> str:
 
 
 def _recipe(payload: dict[str, object]) -> str:
-    fields = ("exposure", "contrast", "highlights", "shadows", "vibrance")
-    text = " · ".join(f"{field} {payload.get(field)}" for field in fields)
+    fields = (
+        "exposure",
+        "brightness",
+        "contrast",
+        "highlights",
+        "shadows",
+        "whites",
+        "blacks",
+        "temperature",
+        "tint",
+        "vibrance",
+        "saturation",
+        "clarity",
+        "dehaze",
+        "structure",
+        "sharpness",
+        "luma_noise_reduction",
+        "color_noise_reduction",
+        "vignette_amount",
+    )
+    changed = [
+        f"{field} {payload.get(field)}"
+        for field in fields
+        if payload.get(field, 0) != 0
+    ]
+    text = " · ".join(changed) if changed else "no executable global adjustment"
     if payload.get("has_crop"):
-        text += " · crop/level"
+        text += " · crop"
+    if payload.get("crop_angle", 0) != 0:
+        text += f" · rotation {payload.get('crop_angle')}"
+    additional = payload.get("additional_edits")
+    if isinstance(additional, list) and additional:
+        text += " · additional: " + "; ".join(str(item) for item in additional)
     return text
 
 

@@ -7,6 +7,7 @@ from hashlib import sha256
 from html import escape
 from io import BytesIO
 import json
+import math
 from pathlib import Path
 import plistlib
 import shutil
@@ -75,16 +76,51 @@ def rapidraw_adjustments_from_suggestion(
     image_size: tuple[int, int] | None = None,
 ) -> dict[str, object]:
     exposure = _bounded_float(suggestion, "exposure", -5.0, 5.0)
+    brightness = _bounded_float(suggestion, "brightness", -5.0, 5.0)
     contrast = _bounded_int(suggestion, "contrast", -100, 100)
     highlights = _bounded_int(suggestion, "highlights", -100, 100)
     shadows = _bounded_int(suggestion, "shadows", -100, 100)
+    whites = _bounded_int(suggestion, "whites", -100, 100)
+    blacks = _bounded_int(suggestion, "blacks", -100, 100)
+    temperature = _bounded_int(suggestion, "temperature", -100, 100)
+    tint = _bounded_int(suggestion, "tint", -100, 100)
     vibrance = _bounded_int(suggestion, "vibrance", -100, 100)
+    saturation = _bounded_int(suggestion, "saturation", -100, 100)
+    clarity = _bounded_int(suggestion, "clarity", -100, 100)
+    dehaze = _bounded_int(suggestion, "dehaze", -100, 100)
+    structure = _bounded_int(suggestion, "structure", -100, 100)
+    sharpness = _bounded_int(suggestion, "sharpness", -100, 100)
+    luma_noise_reduction = _bounded_int(
+        suggestion, "luma_noise_reduction", 0, 100
+    )
+    color_noise_reduction = _bounded_int(
+        suggestion, "color_noise_reduction", 0, 100
+    )
+    vignette_amount = _bounded_int(suggestion, "vignette_amount", -100, 100)
+    rotation = _bounded_float(suggestion, "crop_angle", -45.0, 45.0)
+    has_crop = bool(suggestion.get("has_crop", False))
+    if rotation != 0.0 and not has_crop:
+        raise ValueError("rotation requires a crop that removes rotated edges")
     adjustments: dict[str, object] = {
         "exposure": exposure,
+        "brightness": brightness,
         "contrast": contrast,
         "highlights": highlights,
         "shadows": shadows,
+        "whites": whites,
+        "blacks": blacks,
+        "temperature": temperature,
+        "tint": tint,
         "vibrance": vibrance,
+        "saturation": saturation,
+        "clarity": clarity,
+        "dehaze": dehaze,
+        "structure": structure,
+        "sharpness": sharpness,
+        "lumaNoiseReduction": luma_noise_reduction,
+        "colorNoiseReduction": color_noise_reduction,
+        "vignetteAmount": vignette_amount,
+        "rotation": rotation,
         "masks": [],
         "sectionVisibility": {
             "basic": True,
@@ -94,7 +130,7 @@ def rapidraw_adjustments_from_suggestion(
             "effects": True,
         },
     }
-    if bool(suggestion.get("has_crop", False)):
+    if has_crop:
         if image_size is None:
             raise ValueError("crop conversion requires the source image dimensions")
         image_width, image_height = image_size
@@ -104,9 +140,26 @@ def rapidraw_adjustments_from_suggestion(
         top = _bounded_float(suggestion, "crop_top", 0.0, 1.0)
         right = _bounded_float(suggestion, "crop_right", 0.0, 1.0)
         bottom = _bounded_float(suggestion, "crop_bottom", 0.0, 1.0)
-        angle = _bounded_float(suggestion, "crop_angle", -45.0, 45.0)
         if left >= right or top >= bottom:
             raise ValueError("crop coordinates must describe a normalized non-empty rectangle")
+        if (
+            rotation != 0.0
+            and left == 0.0
+            and top == 0.0
+            and right == 1.0
+            and bottom == 1.0
+        ):
+            raise ValueError("rotation requires non-default crop bounds")
+        if rotation != 0.0:
+            safe_left, safe_top, safe_right, safe_bottom = (
+                _rotation_safe_centered_bounds(image_width, image_height, rotation)
+            )
+            left = max(left, safe_left)
+            top = max(top, safe_top)
+            right = min(right, safe_right)
+            bottom = min(bottom, safe_bottom)
+            if left >= right or top >= bottom:
+                raise ValueError("crop and rotation leave no safe image area")
         retained_area = (right - left) * (bottom - top)
         if retained_area < 0.10:
             raise ValueError("crop must retain at least 10% of the source image")
@@ -118,7 +171,6 @@ def rapidraw_adjustments_from_suggestion(
             "width": round((right - left) * image_width, 6),
             "height": round((bottom - top) * image_height, 6),
         }
-        adjustments["rotation"] = angle
     return adjustments
 
 
@@ -198,7 +250,7 @@ def stage_rapidraw_develop(
 
     manifest_path = root / "rapidraw-manifest.json"
     manifest_payload = {
-        "schema_version": 1,
+        "schema_version": 2,
         "kind": "cull-sh-rapidraw-stage",
         "created_at": datetime.now(timezone.utc).isoformat(),
         "source_suggestions": str(suggestions_path),
@@ -469,9 +521,40 @@ def _write_review_page(
         adjustments = record.get("rapidraw_adjustments", {})
         assert isinstance(suggestion, dict)
         assert isinstance(adjustments, dict)
-        recipe = " · ".join(
+        recipe_fields = (
+            "exposure",
+            "brightness",
+            "contrast",
+            "highlights",
+            "shadows",
+            "whites",
+            "blacks",
+            "temperature",
+            "tint",
+            "vibrance",
+            "saturation",
+            "clarity",
+            "dehaze",
+            "structure",
+            "sharpness",
+            "lumaNoiseReduction",
+            "colorNoiseReduction",
+            "vignetteAmount",
+            "rotation",
+        )
+        changed = [
             f"{name} {adjustments.get(name)}"
-            for name in ("exposure", "contrast", "highlights", "shadows", "vibrance")
+            for name in recipe_fields
+            if adjustments.get(name, 0) != 0
+        ]
+        if adjustments.get("crop") is not None:
+            changed.append("crop")
+        recipe = " · ".join(changed) if changed else "No executable adjustment"
+        additional = suggestion.get("additional_edits")
+        additional_text = (
+            "; ".join(str(item) for item in additional)
+            if isinstance(additional, list) and additional
+            else ""
         )
         cards.append(
             f"<article data-id='{escape(record_id)}'>"
@@ -483,7 +566,12 @@ def _write_review_page(
             "</div>"
             f"<p class='recipe'>{escape(recipe)}</p>"
             f"<p>{escape(str(suggestion.get('summary', '')))}</p>"
-            "</article>"
+            + (
+                f"<p><strong>Additional edit intents:</strong> {escape(additional_text)}</p>"
+                if additional_text
+                else ""
+            )
+            + "</article>"
         )
     ids_json = json.dumps([str(record["id"]) for record in records])
     version = escape(str(install.get("version") or "unknown"))
@@ -648,6 +736,27 @@ def _bounded_float(
     if not minimum <= value <= maximum:
         raise ValueError(f"{key} must be between {minimum:g} and {maximum:g}")
     return value
+
+
+def _rotation_safe_centered_bounds(
+    image_width: int, image_height: int, rotation_degrees: float
+) -> tuple[float, float, float, float]:
+    """Return a centered same-aspect crop whose corners contain no rotation fill."""
+    if rotation_degrees == 0.0:
+        return 0.0, 0.0, 1.0, 1.0
+
+    angle = math.radians(rotation_degrees)
+    cosine = abs(math.cos(angle))
+    sine = abs(math.sin(angle))
+    # Scaling the original canvas about its center gives four symmetric crop
+    # corners.  The inverse-rotated corners remain inside the source while both
+    # of these constraints hold.
+    scale = min(
+        image_width / (image_width * cosine + image_height * sine),
+        image_height / (image_width * sine + image_height * cosine),
+    )
+    inset = (1.0 - scale) / 2.0
+    return inset, inset, 1.0 - inset, 1.0 - inset
 
 
 def _bounded_int(

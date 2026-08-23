@@ -54,10 +54,24 @@ class OllamaEditPayload(BaseModel):
     id: str = Field(min_length=1)
     filename: str = Field(min_length=1)
     exposure: float = Field(ge=-5.0, le=5.0)
+    brightness: float = Field(default=0.0, ge=-5.0, le=5.0)
     contrast: int = Field(ge=-100, le=100)
     highlights: int = Field(ge=-100, le=100)
     shadows: int = Field(ge=-100, le=100)
+    whites: int = Field(default=0, ge=-100, le=100)
+    blacks: int = Field(default=0, ge=-100, le=100)
+    temperature: int = Field(default=0, ge=-100, le=100)
+    tint: int = Field(default=0, ge=-100, le=100)
     vibrance: int = Field(ge=-100, le=100)
+    saturation: int = Field(default=0, ge=-100, le=100)
+    clarity: int = Field(default=0, ge=-100, le=100)
+    dehaze: int = Field(default=0, ge=-100, le=100)
+    structure: int = Field(default=0, ge=-100, le=100)
+    sharpness: int = Field(default=0, ge=-100, le=100)
+    luma_noise_reduction: int = Field(default=0, ge=0, le=100)
+    color_noise_reduction: int = Field(default=0, ge=0, le=100)
+    vignette_amount: int = Field(default=0, ge=-100, le=100)
+    additional_edits: list[str] = Field(default_factory=list)
     summary: str = Field(min_length=1)
 
     @field_validator("id", "filename", "summary")
@@ -67,6 +81,11 @@ class OllamaEditPayload(BaseModel):
         if not value:
             raise ValueError("must not be blank")
         return value
+
+    @field_validator("additional_edits")
+    @classmethod
+    def _normalize_additional_edits(cls, values: list[str]) -> list[str]:
+        return [value.strip() for value in values if value.strip()]
 
 
 class OllamaEditWithCropPayload(OllamaEditPayload):
@@ -80,11 +99,12 @@ class OllamaEditWithCropPayload(OllamaEditPayload):
     @model_validator(mode="after")
     def _validate_crop_rectangle(self) -> "OllamaEditWithCropPayload":
         if not self.has_crop:
+            if self.crop_angle != 0.0:
+                raise ValueError("rotation requires a crop that removes rotated edges")
             self.crop_left = 0.0
             self.crop_top = 0.0
             self.crop_right = 1.0
             self.crop_bottom = 1.0
-            self.crop_angle = 0.0
             return self
         if self.crop_left >= self.crop_right:
             raise ValueError("crop_left must be less than crop_right")
@@ -99,8 +119,9 @@ class OllamaEditWithCropPayload(OllamaEditPayload):
             and self.crop_top == 0.0
             and self.crop_right == 1.0
             and self.crop_bottom == 1.0
-            and self.crop_angle == 0.0
         ):
+            if self.crop_angle != 0.0:
+                raise ValueError("rotation requires non-default crop bounds")
             self.has_crop = False
         return self
 
@@ -294,16 +315,30 @@ class OllamaVisionBackend(VisionBackend):
                     filename=preview.asset.filename,
                     asset_id=preview.asset.raw_path.as_posix(),
                     exposure=parsed.exposure,
+                    brightness=parsed.brightness,
                     contrast=parsed.contrast,
                     highlights=parsed.highlights,
                     shadows=parsed.shadows,
+                    whites=parsed.whites,
+                    blacks=parsed.blacks,
+                    temperature=parsed.temperature,
+                    tint=parsed.tint,
                     vibrance=parsed.vibrance,
+                    saturation=parsed.saturation,
+                    clarity=parsed.clarity,
+                    dehaze=parsed.dehaze,
+                    structure=parsed.structure,
+                    sharpness=parsed.sharpness,
+                    luma_noise_reduction=parsed.luma_noise_reduction,
+                    color_noise_reduction=parsed.color_noise_reduction,
+                    vignette_amount=parsed.vignette_amount,
                     has_crop=getattr(parsed, "has_crop", False),
                     crop_left=getattr(parsed, "crop_left", 0.0),
                     crop_top=getattr(parsed, "crop_top", 0.0),
                     crop_right=getattr(parsed, "crop_right", 1.0),
                     crop_bottom=getattr(parsed, "crop_bottom", 1.0),
                     crop_angle=getattr(parsed, "crop_angle", 0.0),
+                    additional_edits=list(parsed.additional_edits),
                     summary=parsed.summary.strip(),
                 )
             )
@@ -329,22 +364,23 @@ class OllamaVisionBackend(VisionBackend):
             encoded_images.append(base64.b64encode(preview.image_bytes).decode("ascii"))
 
         system_crop_instruction = (
-            " When crop fields are present in the schema, actively evaluate "
-            "composition as a first-class optional Develop edit."
+            " When composition fields are present in the schema, independently "
+            "evaluate crop and rotation as first-class optional edits."
             if include_crop
             else ""
         )
         crop_guidance = (
-            "Composition/crop pass:\n"
+            "Composition/crop/rotation pass:\n"
             "- For every image, actively check whether a crop would improve composition before deciding has_crop.\n"
             "- Use has_crop true when cropping or leveling addresses a specific visible issue: empty edge space, a partial distraction, weak subject placement, clutter, imbalance, or a tilted horizon.\n"
-            "- Use crop_angle for clear horizon or architectural leveling, with crop bounds adjusted to cover rotated edges.\n"
+            "- Use crop_angle for clear horizon or architectural leveling only with has_crop true.\n"
+            "- Every nonzero crop_angle must include non-default crop bounds that remove the rotated edges.\n"
             "- Crop as much or as little as the visible issue warrants while preserving important subjects, landmarks, heads, limbs, reflections, and useful context.\n"
             "- Set has_crop false for already well-framed images or when the crop reason is weak.\n"
             "- Do not add a generic inset crop just because crop fields are available; vary bounds only to match the visible issue in that image.\n"
             "- Crop bounds are normalized: crop_left/top/right/bottom are between 0 and 1.\n"
-            "- If no crop is needed, set has_crop false, crop_left 0, crop_top 0, crop_right 1, crop_bottom 1, crop_angle 0.\n"
-            "- If has_crop is true, the summary must mention the specific crop or leveling reason.\n"
+            "- If no crop or rotation is needed, set has_crop false, crop_left 0, crop_top 0, crop_right 1, crop_bottom 1, crop_angle 0.\n"
+            "- If a crop or rotation is used, the summary must mention the specific composition or leveling reason.\n"
         )
         payload_schema = (
             OllamaBatchEditWithCropPayload.model_json_schema()
@@ -358,8 +394,8 @@ class OllamaVisionBackend(VisionBackend):
                 {
                     "role": "system",
                     "content": (
-                        "You are a photo editing assistant for Adobe Lightroom. "
-                        "Suggest natural, image-specific Develop adjustments. "
+                        "You are a photo editing assistant generating reversible RapidRAW recipes. "
+                        "Diagnose each image before suggesting natural, image-specific adjustments. "
                         "Return only one valid JSON object that matches the provided schema. "
                         "Do not use markdown or add commentary. "
                         "Use the provided short ids and filenames exactly and return one result per image. "
@@ -376,17 +412,22 @@ class OllamaVisionBackend(VisionBackend):
                         + "\n\n"
                         + f"User instructions: {prompt}\n"
                         + "Adjustment ranges:\n"
-                        + "- exposure: stops, about -5.0 to 5.0, usually -1.0 to 1.0\n"
-                        + "- contrast, highlights, shadows, vibrance: -100 to 100\n"
+                        + "- exposure and brightness: stops, -5.0 to 5.0, usually -1.0 to 1.0\n"
+                        + "- signed integer controls: -100 to 100\n"
+                        + "- luma_noise_reduction and color_noise_reduction: 0 to 100\n"
                         + "Editing guidance:\n"
                         + "- Fill every required field for every image.\n"
-                        + "- The summary must be one short sentence naming the observed image issue, "
-                        + "or \"No global adjustment needed.\" Never leave it empty.\n"
-                        + "- Inspect exposure, highlight detail, shadow detail, contrast, and color intensity separately.\n"
+                        + "- First diagnose tonal balance, white balance/color cast, presence, detail/noise, and composition independently.\n"
+                        + "- The summary must be one short, image-specific diagnostic sentence about the starting render. Do not narrate slider actions or claim that an adjustment was applied. Never leave it empty.\n"
+                        + "- Inspect exposure, brightness, highlight and shadow detail, whites, blacks, contrast, temperature, tint, vibrance, and saturation separately.\n"
+                        + "- exposure is a linear RAW EV shift; brightness is a filmic perceptual exposure control. Prefer one for the diagnosed need and move both only when their distinct roles are necessary.\n"
                         + "- Recover blown skies with negative highlights; open dark areas with positive shadows.\n"
                         + "- Lift or lower exposure when it improves the overall tonal balance.\n"
+                        + "- Use clarity, dehaze, and structure only for a specific visible presence problem.\n"
+                        + "- Use sharpening or noise reduction only when the available render provides enough evidence; otherwise leave those fields at zero and record a full-resolution inspection in additional_edits.\n"
                         + "- Keep edits realistic unless the user asks for a stronger look.\n"
                         + "- Use 0 only when that slider already looks correct for that specific image.\n"
+                        + "- additional_edits is for useful edits outside the executable fields, including HSL, curves, color grading, masks, healing, lens corrections, or other local work. Use concise, actionable descriptions and never pretend they were applied.\n"
                         + "- Do not copy identical slider values across images unless the summaries explain the same observed issue.\n"
                         + (crop_guidance if include_crop else "")
                         + "Return one set of adjustments per image."
@@ -440,6 +481,11 @@ class OllamaVisionBackend(VisionBackend):
                 final_suggestion = EditSuggestion(
                     filename=pair.asset.filename,
                     asset_id=pair.asset.raw_path.as_posix(),
+                    additional_edits=(
+                        list(parsed.additional_edits)
+                        if parsed.additional_edits
+                        else list(pair.suggestion.additional_edits)
+                    ),
                     summary="Reverted to the neutral RapidRAW baseline.",
                 )
             else:
@@ -485,10 +531,11 @@ class OllamaVisionBackend(VisionBackend):
                 {
                     "role": "system",
                     "content": (
-                        "You are validating real photo edit renders. Each record has exactly "
+                        "You are independently validating real photo edit renders. Each record has exactly "
                         "two consecutive images: the neutral RapidRAW baseline followed by the "
                         "RapidRAW render of the current adjustments. Return only valid JSON matching "
-                        "the schema, with one review per record. Prefer accept over needless tinkering."
+                        "the schema, with one review per record. Judge the rendered result rather than "
+                        "defending the first recipe."
                     ),
                 },
                 {
@@ -498,13 +545,14 @@ class OllamaVisionBackend(VisionBackend):
                         + json.dumps(image_specs, ensure_ascii=False, indent=2)
                         + "\n\n"
                         + f"User instructions: {prompt}\n"
-                        + "Compare each edited render only with its paired baseline. "
-                        + "Use accept when it is a natural improvement without a visible problem. "
-                        + "Use reject when the neutral baseline is better and adjustment is unnecessary. "
+                        + "Compare each edited render only with its paired baseline. Diagnose the most important visible difference before choosing a verdict. "
+                        + "Use accept only when the edit is a meaningful natural improvement without a new visible problem. "
+                        + "Use reject when the neutral baseline is better or the edit has no meaningful benefit. "
                         + "Use refine only to correct a specific visible issue introduced or left by the edit. "
+                        + "additional_edits are unrendered future-work notes: never count them as a visible improvement, but preserve or improve useful notes even when rejecting the executable recipe. "
                         + "For refine, return final absolute slider and crop values, not deltas. "
-                        + "Keep refinements conservative: exposure within 0.5 stop and each integer slider "
-                        + "within 30 points of the current recipe. Do not invent a stylistic change merely "
+                        + "Keep refinements conservative: exposure and brightness within 0.5 stop, rotation within 5 degrees, and each integer slider "
+                        + "within 30 points of the current recipe. Preserve or revise additional_edits based on visible evidence. Do not invent a stylistic change merely "
                         + "to make the values different. Fill every field and explain the verdict briefly."
                     ),
                     "images": encoded_images,
@@ -743,16 +791,30 @@ def _parse_edit_review_payload(
 def _edit_payload(suggestion: EditSuggestion) -> dict[str, object]:
     return {
         "exposure": suggestion.exposure,
+        "brightness": suggestion.brightness,
         "contrast": suggestion.contrast,
         "highlights": suggestion.highlights,
         "shadows": suggestion.shadows,
+        "whites": suggestion.whites,
+        "blacks": suggestion.blacks,
+        "temperature": suggestion.temperature,
+        "tint": suggestion.tint,
         "vibrance": suggestion.vibrance,
+        "saturation": suggestion.saturation,
+        "clarity": suggestion.clarity,
+        "dehaze": suggestion.dehaze,
+        "structure": suggestion.structure,
+        "sharpness": suggestion.sharpness,
+        "luma_noise_reduction": suggestion.luma_noise_reduction,
+        "color_noise_reduction": suggestion.color_noise_reduction,
+        "vignette_amount": suggestion.vignette_amount,
         "has_crop": suggestion.has_crop,
         "crop_left": suggestion.crop_left,
         "crop_top": suggestion.crop_top,
         "crop_right": suggestion.crop_right,
         "crop_bottom": suggestion.crop_bottom,
         "crop_angle": suggestion.crop_angle,
+        "additional_edits": suggestion.additional_edits,
     }
 
 
@@ -772,15 +834,35 @@ def _bounded_refinement(
         filename=pair.asset.filename,
         asset_id=pair.asset.raw_path.as_posix(),
         exposure=bounded_float(parsed.exposure, current.exposure, 0.5),
+        brightness=bounded_float(parsed.brightness, current.brightness, 0.5),
         contrast=bounded_int(parsed.contrast, current.contrast, 30),
         highlights=bounded_int(parsed.highlights, current.highlights, 30),
         shadows=bounded_int(parsed.shadows, current.shadows, 30),
+        whites=bounded_int(parsed.whites, current.whites, 30),
+        blacks=bounded_int(parsed.blacks, current.blacks, 30),
+        temperature=bounded_int(parsed.temperature, current.temperature, 30),
+        tint=bounded_int(parsed.tint, current.tint, 30),
         vibrance=bounded_int(parsed.vibrance, current.vibrance, 30),
+        saturation=bounded_int(parsed.saturation, current.saturation, 30),
+        clarity=bounded_int(parsed.clarity, current.clarity, 30),
+        dehaze=bounded_int(parsed.dehaze, current.dehaze, 30),
+        structure=bounded_int(parsed.structure, current.structure, 30),
+        sharpness=bounded_int(parsed.sharpness, current.sharpness, 30),
+        luma_noise_reduction=bounded_int(
+            parsed.luma_noise_reduction, current.luma_noise_reduction, 30
+        ),
+        color_noise_reduction=bounded_int(
+            parsed.color_noise_reduction, current.color_noise_reduction, 30
+        ),
+        vignette_amount=bounded_int(
+            parsed.vignette_amount, current.vignette_amount, 30
+        ),
         has_crop=parsed.has_crop,
         crop_left=parsed.crop_left,
         crop_top=parsed.crop_top,
         crop_right=parsed.crop_right,
         crop_bottom=parsed.crop_bottom,
-        crop_angle=parsed.crop_angle,
+        crop_angle=bounded_float(parsed.crop_angle, current.crop_angle, 5.0),
+        additional_edits=list(parsed.additional_edits),
         summary=parsed.summary.strip(),
     )

@@ -136,7 +136,7 @@ def write_develop_sidecar(path: Path, suggestion: EditSuggestion) -> None:
 
 
 def apply_develop_settings(description: ET.Element, suggestion: EditSuggestion) -> None:
-    """Set Camera Raw develop attributes for a suggested global edit."""
+    """Set the safely interoperable Camera Raw subset of a RapidRAW recipe."""
     description.set(
         f"{{{CRS_NS}}}Version",
         description.get(f"{{{CRS_NS}}}Version", "18.3"),

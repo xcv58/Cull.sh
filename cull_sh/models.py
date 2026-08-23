@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from dataclasses import field
 from enum import Enum
 from pathlib import Path
 
@@ -112,32 +113,60 @@ class FinalDecision:
 
 @dataclass(slots=True)
 class EditSuggestion:
-    """A set of gentle global Lightroom develop adjustments for one photo."""
+    """A reversible RapidRAW recipe plus any still-unexecutable edit intents."""
 
     filename: str
     asset_id: str = ""
     exposure: float = 0.0  # EV, roughly -5..+5
+    brightness: float = 0.0  # EV, roughly -5..+5
     contrast: int = 0  # -100..100
     highlights: int = 0  # -100..100
     shadows: int = 0  # -100..100
+    whites: int = 0  # -100..100
+    blacks: int = 0  # -100..100
+    temperature: int = 0  # -100..100 relative RapidRAW correction
+    tint: int = 0  # -100..100 relative RapidRAW correction
     vibrance: int = 0  # -100..100
+    saturation: int = 0  # -100..100
+    clarity: int = 0  # -100..100
+    dehaze: int = 0  # -100..100
+    structure: int = 0  # -100..100
+    sharpness: int = 0  # -100..100
+    luma_noise_reduction: int = 0  # 0..100
+    color_noise_reduction: int = 0  # 0..100
+    vignette_amount: int = 0  # -100..100
     has_crop: bool = False
     crop_left: float = 0.0  # normalized 0..1
     crop_top: float = 0.0  # normalized 0..1
     crop_right: float = 1.0  # normalized 0..1
     crop_bottom: float = 1.0  # normalized 0..1
-    crop_angle: float = 0.0  # degrees
+    crop_angle: float = 0.0  # rotation degrees; nonzero requires a safe crop
+    additional_edits: list[str] = field(default_factory=list)
     summary: str = ""
 
     @property
     def is_noop(self) -> bool:
         return (
             self.exposure == 0.0
+            and self.brightness == 0.0
             and self.contrast == 0
             and self.highlights == 0
             and self.shadows == 0
+            and self.whites == 0
+            and self.blacks == 0
+            and self.temperature == 0
+            and self.tint == 0
             and self.vibrance == 0
+            and self.saturation == 0
+            and self.clarity == 0
+            and self.dehaze == 0
+            and self.structure == 0
+            and self.sharpness == 0
+            and self.luma_noise_reduction == 0
+            and self.color_noise_reduction == 0
+            and self.vignette_amount == 0
             and not self.has_crop
+            and self.crop_angle == 0.0
         )
 
 

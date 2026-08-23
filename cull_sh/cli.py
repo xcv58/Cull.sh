@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from concurrent.futures import ThreadPoolExecutor
 from concurrent.futures import as_completed
+from dataclasses import asdict
 import json
 from pathlib import Path
 import shutil
@@ -73,8 +74,11 @@ from cull_sh.vlm_benchmark import run_vlm_benchmark
 
 
 DEFAULT_EDIT_PROMPT = (
-    "Suggest natural, balanced global edits that improve each photo while keeping "
-    "a realistic look."
+    "Treat the neutral RapidRAW render as a starting point. Diagnose each photo, "
+    "then suggest natural, balanced global and composition edits that produce a "
+    "meaningful realistic improvement. Keep a control at zero when changing it "
+    "would not help, and record useful edits outside the executable controls as "
+    "additional edit intents."
 )
 DEFAULT_RAPIDRAW_BINARY = (
     Path.home() / "Applications/RapidRAW.app/Contents/MacOS/RapidRAW"
@@ -1477,9 +1481,9 @@ def suggest_edits(
         help="Hard Ollama generation ceiling for each structured edit response.",
     ),
     batch_size: int = typer.Option(
-        4,
+        1,
         min=1,
-        help="Maximum images per cohort sent to the model in one request.",
+        help="Images per request; one avoids cross-image edit leakage.",
     ),
     limit: int | None = typer.Option(
         None,
@@ -1498,16 +1502,17 @@ def suggest_edits(
         help="Also suggest edits for RAW files with no existing XMP sidecar.",
     ),
     with_crop: bool = typer.Option(
-        False,
+        True,
         "--with-crop/--no-with-crop",
-        help="Allow the model to suggest composition crop and leveling settings.",
+        help="Allow the model to suggest crop and safely cropped rotation/leveling.",
     ),
 ) -> None:
     """Suggest optional develop edits for culled, non-rejected RAW files.
 
     The default dry run produces a frozen JSONL recipe for the RapidRAW workflow.
-    With --no-dry-run, edits are also written as standard, fully reversible Camera
-    Raw settings into XMP. Rejected and unculled RAW files are skipped unless
+    With --no-dry-run, the Lightroom-compatible subset is also written as fully
+    reversible Camera Raw settings into XMP. The complete RapidRAW recipe remains
+    frozen in JSONL. Rejected and unculled RAW files are skipped unless
     --include-unculled is passed.
     """
     edit_prompt = (prompt or DEFAULT_EDIT_PROMPT).strip()
@@ -1586,6 +1591,11 @@ def suggest_edits(
         backend_max_attempts=max_attempts,
     )
     console.print(f"Run artifacts: {run_dir}")
+    if not dry_run:
+        console.print(
+            "XMP interoperability writes only the Lightroom-compatible core; "
+            "the complete expanded recipe is preserved for RapidRAW in JSONL."
+        )
 
     suggestions: list[tuple[RawAsset, EditSuggestion]] = []
     written = 0
@@ -1643,24 +1653,57 @@ def suggest_edits(
         "Crop suggestions",
         str(sum(1 for _, suggestion in suggestions if suggestion.has_crop)),
     )
+    summary.add_row(
+        "Rotation suggestions",
+        str(sum(1 for _, suggestion in suggestions if suggestion.crop_angle != 0.0)),
+    )
+    summary.add_row(
+        "Additional edit intents",
+        str(sum(len(suggestion.additional_edits) for _, suggestion in suggestions)),
+    )
     summary.add_row("Model failure policy", "fail-fast")
-    summary.add_row("Sidecars written", str(written))
+    summary.add_row("XMP sidecars written (compatible subset)", str(written))
     summary.add_row("Dry run", "yes" if dry_run else "no")
     console.print(summary)
 
     if suggestions:
         preview_table = Table(title="Suggested Edits (first 10)")
-        for column in ("Filename", "Exp", "Contr", "High", "Shad", "Vib", "Crop", "Note"):
+        for column in (
+            "Filename",
+            "Tone",
+            "Color",
+            "Presence",
+            "Detail",
+            "Composition",
+            "Other",
+            "Note",
+        ):
             preview_table.add_column(column)
         for _, suggestion in suggestions[:10]:
             preview_table.add_row(
                 suggestion.filename,
-                f"{suggestion.exposure:+.2f}",
-                str(suggestion.contrast),
-                str(suggestion.highlights),
-                str(suggestion.shadows),
-                str(suggestion.vibrance),
-                "yes" if suggestion.has_crop else "no",
+                (
+                    f"exp {suggestion.exposure:+.2f}, bright {suggestion.brightness:+.2f}, "
+                    f"C {suggestion.contrast}, H {suggestion.highlights}, S {suggestion.shadows}, "
+                    f"W {suggestion.whites}, B {suggestion.blacks}"
+                ),
+                (
+                    f"temp {suggestion.temperature}, tint {suggestion.tint}, "
+                    f"vib {suggestion.vibrance}, sat {suggestion.saturation}"
+                ),
+                (
+                    f"clarity {suggestion.clarity}, dehaze {suggestion.dehaze}, "
+                    f"structure {suggestion.structure}"
+                ),
+                (
+                    f"sharp {suggestion.sharpness}, NR "
+                    f"{suggestion.luma_noise_reduction}/{suggestion.color_noise_reduction}"
+                ),
+                (
+                    f"crop {'yes' if suggestion.has_crop else 'no'}, "
+                    f"rotation {suggestion.crop_angle:+.2f}"
+                ),
+                str(len(suggestion.additional_edits)),
                 (suggestion.summary[:40] + "…")
                 if len(suggestion.summary) > 41
                 else suggestion.summary,
@@ -1700,8 +1743,12 @@ def rapidraw_feedback_pilot(
     backend_url: str = typer.Option("http://localhost:11434"),
     backend_timeout: float = typer.Option(600.0, min=1.0),
     backend_max_output_tokens: int = typer.Option(2048, min=1),
-    suggestion_batch_size: int = typer.Option(4, min=1),
-    review_batch_size: int = typer.Option(2, min=1),
+    suggestion_batch_size: int = typer.Option(
+        1, min=1, help="Images per suggestion request; one avoids cross-image leakage."
+    ),
+    review_batch_size: int = typer.Option(
+        1, min=1, help="Rendered pairs per review request; one avoids pair leakage."
+    ),
     with_crop: bool = typer.Option(True, "--with-crop/--no-with-crop"),
     rapidraw_binary: Path = typer.Option(DEFAULT_RAPIDRAW_BINARY),
 ) -> None:
@@ -2051,7 +2098,7 @@ def _write_edit_suggestions_header(
         "with_crop": with_crop,
     }
     if provider is not None:
-        header["schema_version"] = 1
+        header["schema_version"] = 2
         header["kind"] = "cull-sh-edit-suggestions"
         header["provider"] = provider
     if model is not None:
@@ -2076,26 +2123,18 @@ def _append_edit_suggestions(
 ) -> None:
     with path.open("a", encoding="utf-8") as handle:
         for asset, suggestion in suggestions:
+            record = asdict(suggestion)
+            record.update(
+                {
+                    "asset_id": suggestion.asset_id or asset.raw_path.as_posix(),
+                    "filename": suggestion.filename,
+                    "raw_path": str(asset.raw_path),
+                    "xmp_path": str(asset.xmp_path),
+                }
+            )
             handle.write(
                 json.dumps(
-                    {
-                        "asset_id": suggestion.asset_id or asset.raw_path.as_posix(),
-                        "filename": suggestion.filename,
-                        "raw_path": str(asset.raw_path),
-                        "xmp_path": str(asset.xmp_path),
-                        "exposure": suggestion.exposure,
-                        "contrast": suggestion.contrast,
-                        "highlights": suggestion.highlights,
-                        "shadows": suggestion.shadows,
-                        "vibrance": suggestion.vibrance,
-                        "has_crop": suggestion.has_crop,
-                        "crop_left": suggestion.crop_left,
-                        "crop_top": suggestion.crop_top,
-                        "crop_right": suggestion.crop_right,
-                        "crop_bottom": suggestion.crop_bottom,
-                        "crop_angle": suggestion.crop_angle,
-                        "summary": suggestion.summary,
-                    },
+                    record,
                     sort_keys=True,
                 )
                 + "\n"

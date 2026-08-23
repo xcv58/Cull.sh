@@ -6,10 +6,10 @@
 - Foundation draft PR: <https://github.com/xcv58/Cull.sh/pull/2>
 - Follow-up branch: `codex/topiq-qwen-rapidraw`
 - Follow-up base: `feat/ai-develop-edits`
-- Verified follow-up commit: `cceb6c850cf8494a68c101320bada2b62e2cb3ea`
-- Test suite: 102 passed
+- Test suite: 126 passed
 
-The follow-up branch contains three focused commits:
+The follow-up branch contains the original three focused commits plus the
+TOPIQ/Qwen migration, rendered-feedback pilot, and expanded RapidRAW recipe work:
 
 1. `364e3ed` — model benchmarks, shadow evaluation, TOPIQ ranking, and
    AppleDouble scanning exclusion.
@@ -24,10 +24,16 @@ The follow-up branch contains three focused commits:
 - Blend standalone TOPIQ-NR into candidate ranking at 25%; keep the existing
   local percentile at 75%.
 - TOPIQ does not participate in hard rejects.
-- Keep the validated existing/Gemma semantic culling path. The Longwood
-  benchmark measured AUC 0.795 for the frozen pipeline versus 0.500 for Qwen.
-- Use `orcarouter/Qwen3.8-27B-Uncensored` for edit suggestions with one attempt,
-  no fallback, and bounded generation.
+- Use `orcarouter/Qwen3.8-27B-Uncensored` for production semantic culling and
+  edit suggestions with one attempt, no fallback, and bounded generation.
+  Gemma results remain historical benchmark evidence only.
+- Use one image per edit-suggestion request and one rendered pair per feedback
+  request to prevent cross-image association leakage.
+- The executable RapidRAW recipe includes global tone, relative white balance,
+  presence, detail/noise, vignette, crop, and rotation paired with bounds that
+  remove rotated black edges. Preserve
+  unsupported but useful HSL/curve/mask/healing/lens ideas as explicit
+  `additional_edits`; never report them as rendered.
 - Use RapidRAW as the primary automated renderer/exporter. Lightroom-compatible
   XMP remains optional interoperability.
 

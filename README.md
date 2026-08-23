@@ -227,26 +227,36 @@ python main.py lightroom-jpeg-auto --path "/path/to/culled-raws" --lightroom-edi
 ## AI Develop Edits
 
 `suggest-edits` is an explicit opt-in stage. Regular culling does not run local
-AI develop edits. It asks the configured vision model for natural global
-adjustments and freezes the recipes in `edit-suggestions.jsonl`. It is a dry
-run by default; source sidecars are only modified when you pass
-`--no-dry-run`. Rejected RAW files and RAW files without existing sidecars are
-skipped by default, and existing culling state is preserved.
+AI develop edits. It asks the configured vision model for natural global and
+composition adjustments and freezes the complete RapidRAW recipes in
+`edit-suggestions.jsonl`. It is a dry run by default; the Lightroom-compatible
+subset is only written to source XMP sidecars when you pass `--no-dry-run`.
+Rejected RAW files and RAW files without existing sidecars are skipped by
+default, and existing culling state is preserved.
 
 ```bash
 python main.py suggest-edits --path "/path/to/culled-raws"            # dry run: show suggestions only
 python main.py suggest-edits --path "/path/to/culled-raws" --no-dry-run
 python main.py suggest-edits --path "/path/to/culled-raws" --prefer "warm, punchy look"
-python main.py suggest-edits --path "/path/to/culled-raws" --with-crop --batch-size 1
+python main.py suggest-edits --path "/path/to/culled-raws" --batch-size 1
 python main.py suggest-edits --path "/path/to/raws" --include-unculled
 ```
 
-The model suggests exposure, contrast, highlights, shadows, vibrance, and an
-optional crop, all validated before a renderer receives them. Crop suggestions
-are off by default. The selected Qwen model runs with thinking enabled and is
-intentionally fail-fast: Cull.sh does not use a fallback model or retry failed
-photographs individually. Gemma remains supported by historical benchmark commands,
-but is not a production dependency.
+The executable recipe covers exposure/brightness, contrast, highlights,
+shadows, whites, blacks, temperature, tint, vibrance, saturation, clarity,
+dehaze, structure, sharpening, luminance/color noise reduction, vignette,
+crop, and rotation. Crop and rotation evaluation are enabled by default;
+nonzero rotation requires crop bounds that remove RapidRAW's rotated black
+edges. Useful ideas outside that executable surface—such as HSL,
+curves, color grading, masks, healing, or lens work—are retained as explicit
+`additional_edits` instead of being silently dropped or falsely reported as
+applied.
+
+Editing defaults to one image per model request to avoid cross-image leakage.
+The selected Qwen model runs with thinking enabled and is intentionally
+fail-fast: Cull.sh does not use a fallback model or retry failed photographs
+individually. Gemma remains supported by historical benchmark commands, but is
+not a production dependency.
 
 ## RapidRAW Develop Workflow
 
@@ -298,8 +308,11 @@ python main.py rapidraw-feedback-pilot \
 
 For each selected RAW, RapidRAW first creates a neutral baseline render. Qwen
 suggests a structured recipe from that renderer-consistent baseline, RapidRAW
-renders the recipe, and Qwen compares the real before/after pair. The review can
-accept, revert, or make one bounded refinement; it cannot iterate indefinitely.
+renders the recipe, and an independent Qwen pass compares the real before/after
+pair. Suggestions and rendered pairs default to one photo per request. The
+review can accept, revert, or make one bounded refinement; it cannot iterate
+indefinitely. Unrendered `additional_edits` never count as visible improvement
+but remain available for later mask or advanced-edit stages.
 The generated `review.html` shows baseline, first edit, and validated final side
 by side and records a human preference locally.
 
