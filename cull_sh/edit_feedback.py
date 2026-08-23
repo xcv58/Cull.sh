@@ -469,25 +469,43 @@ def _write_review_page(root: Path, records: list[dict[str, object]]) -> Path:
         assert isinstance(initial, dict)
         assert isinstance(final, dict)
         assert isinstance(review, dict)
+        final_matches_first = initial == final
+        figures = (
+            _figure(root, Path(str(record["baseline_render"])), "Baseline")
+            + _figure(
+                root,
+                Path(str(record["first_render"])),
+                "Edited (validated final)" if final_matches_first else "First edit",
+            )
+        )
+        choices = (
+            (("baseline", "Baseline"), ("edited", "Edited"), ("tie", "Tie"))
+            if final_matches_first
+            else (
+                ("baseline", "Baseline"),
+                ("first", "First edit"),
+                ("final", "Validated final"),
+                ("tie", "Tie"),
+            )
+        )
+        if not final_matches_first:
+            figures += _figure(
+                root,
+                Path(str(record["final_render"])),
+                "Validated final",
+            )
         cards.append(
             f"<article data-id='{escape(record_id)}'>"
             f"<h2>{escape(str(record['filename']))}</h2>"
-            "<div class='images'>"
-            + _figure(root, Path(str(record["baseline_render"])), "Baseline")
-            + _figure(root, Path(str(record["first_render"])), "First edit")
-            + _figure(root, Path(str(record["final_render"])), "Validated final")
+            + f"<div class='images {'two' if final_matches_first else 'three'}'>"
+            + figures
             + "</div>"
             + f"<p><strong>Qwen verdict:</strong> {escape(str(review['verdict']))} — {escape(str(review.get('summary', '')))}</p>"
             + f"<p class='recipe'>First: {escape(_recipe(initial))}<br>Final: {escape(_recipe(final))}</p>"
             + "<div class='choices'>Human preference: "
             + " ".join(
                 f"<label><input type='radio' name='{escape(record_id)}' value='{choice}'> {label}</label>"
-                for choice, label in (
-                    ("baseline", "Baseline"),
-                    ("first", "First edit"),
-                    ("final", "Validated final"),
-                    ("tie", "Tie"),
-                )
+                for choice, label in choices
             )
             + "</div></article>"
         )
@@ -498,7 +516,7 @@ def _write_review_page(root: Path, records: list[dict[str, object]]) -> Path:
 <title>Cull.sh rendered edit feedback pilot</title><style>
 :root{color-scheme:dark;font-family:system-ui;background:#101010;color:#eee}body{max-width:1900px;margin:auto;padding:24px}
 .toolbar{position:sticky;top:0;background:#101010ee;padding:12px 0;z-index:2}button{padding:9px 14px}article{border:1px solid #333;border-radius:12px;padding:14px;margin:18px 0;background:#181818}
-.images{display:grid;grid-template-columns:repeat(3,1fr);gap:10px}figure{margin:0}img{width:100%;height:460px;object-fit:contain;background:#080808}figcaption{color:#aaa}.recipe{color:#e9c46a}.choices{display:flex;gap:18px;flex-wrap:wrap}label{padding:8px;border:1px solid #555;border-radius:8px}label:has(input:checked){background:#14532d;border-color:#4ade80}@media(max-width:900px){.images{grid-template-columns:1fr}img{height:auto}}
+.images{display:grid;gap:10px}.images.two{grid-template-columns:repeat(2,1fr)}.images.three{grid-template-columns:repeat(3,1fr)}figure{margin:0}img{width:100%;height:460px;object-fit:contain;background:#080808}figcaption{color:#aaa}.recipe{color:#e9c46a}.choices{display:flex;gap:18px;flex-wrap:wrap}label{padding:8px;border:1px solid #555;border-radius:8px}label:has(input:checked){background:#14532d;border-color:#4ade80}@media(max-width:900px){.images{grid-template-columns:1fr!important}img{height:auto}}
 </style></head><body><h1>Rendered edit feedback pilot</h1><p>Machine-added picks only. Originals were not modified.</p>
 <div class='toolbar'><button id='download'>Download choices CSV</button> <strong id='count'></strong></div>"""
         + "".join(cards)
