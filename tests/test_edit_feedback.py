@@ -11,6 +11,7 @@ from PIL import Image
 from cull_sh.backends.base import VisionBackend
 from cull_sh.edit_feedback import run_feedback_pilot
 from cull_sh.edit_feedback import select_machine_picks
+from cull_sh.edit_feedback import _validate_render_dimensions
 from cull_sh.models import EditReview
 from cull_sh.models import EditReviewPair
 from cull_sh.models import EditReviewVerdict
@@ -84,6 +85,25 @@ class _FailIfCalledBackend(_FakeBackend):
 
 
 class EditFeedbackPilotTests(unittest.TestCase):
+    def test_rejects_implausibly_small_crop_render(self) -> None:
+        with TemporaryDirectory() as tmp_dir:
+            root = Path(tmp_dir)
+            baseline = root / "baseline.jpg"
+            rendered = root / "rendered.jpg"
+            Image.new("RGB", (1000, 500), "gray").save(baseline)
+            Image.new("RGB", (90, 80), "gray").save(rendered)
+            suggestion = EditSuggestion(
+                filename="frame.ARW",
+                has_crop=True,
+                crop_left=0.0,
+                crop_top=0.1,
+                crop_right=0.9,
+                crop_bottom=1.0,
+            )
+
+            with self.assertRaisesRegex(RuntimeError, "unexpectedly small"):
+                _validate_render_dimensions(baseline, rendered, suggestion)
+
     def test_selects_machine_picks_not_present_in_human_baseline(self) -> None:
         with TemporaryDirectory() as tmp_dir:
             root = Path(tmp_dir)

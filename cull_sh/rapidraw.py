@@ -71,6 +71,8 @@ def rapidraw_install_info(binary: Path) -> dict[str, object]:
 
 def rapidraw_adjustments_from_suggestion(
     suggestion: dict[str, object],
+    *,
+    image_size: tuple[int, int] | None = None,
 ) -> dict[str, object]:
     exposure = _bounded_float(suggestion, "exposure", -5.0, 5.0)
     contrast = _bounded_int(suggestion, "contrast", -100, 100)
@@ -93,6 +95,11 @@ def rapidraw_adjustments_from_suggestion(
         },
     }
     if bool(suggestion.get("has_crop", False)):
+        if image_size is None:
+            raise ValueError("crop conversion requires the source image dimensions")
+        image_width, image_height = image_size
+        if image_width < 1 or image_height < 1:
+            raise ValueError("crop conversion requires positive image dimensions")
         left = _bounded_float(suggestion, "crop_left", 0.0, 1.0)
         top = _bounded_float(suggestion, "crop_top", 0.0, 1.0)
         right = _bounded_float(suggestion, "crop_right", 0.0, 1.0)
@@ -104,11 +111,12 @@ def rapidraw_adjustments_from_suggestion(
         if retained_area < 0.10:
             raise ValueError("crop must retain at least 10% of the source image")
         adjustments["crop"] = {
-            "unit": "%",
-            "x": round(left * 100.0, 6),
-            "y": round(top * 100.0, 6),
-            "width": round((right - left) * 100.0, 6),
-            "height": round((bottom - top) * 100.0, 6),
+            # RapidRAW's Rust export path deserializes Crop as pixel coordinates;
+            # its React canvas alone understands the optional percent unit.
+            "x": round(left * image_width, 6),
+            "y": round(top * image_height, 6),
+            "width": round((right - left) * image_width, 6),
+            "height": round((bottom - top) * image_height, 6),
         }
         adjustments["rotation"] = angle
     return adjustments
@@ -162,7 +170,14 @@ def stage_rapidraw_develop(
         sidecar_payload = {
             "version": 1,
             "rating": 0,
-            "adjustments": rapidraw_adjustments_from_suggestion(suggestion),
+            "adjustments": rapidraw_adjustments_from_suggestion(
+                suggestion,
+                image_size=(
+                    _raw_image_dimensions(source)
+                    if bool(suggestion.get("has_crop", False))
+                    else None
+                ),
+            ),
             "tags": ["Cull.sh", "AI edit suggestion", "Approval pending"],
         }
         sidecar.write_text(
@@ -645,6 +660,29 @@ def _bounded_int(
     if not minimum <= value <= maximum:
         raise ValueError(f"{key} must be between {minimum} and {maximum}")
     return value
+
+
+def _raw_image_dimensions(path: Path) -> tuple[int, int]:
+    exiftool = shutil.which("exiftool")
+    if exiftool is None:
+        raise RuntimeError("exiftool is required to map normalized crops to RapidRAW pixels")
+    result = subprocess.run(
+        [exiftool, "-j", "-ImageWidth", "-ImageHeight", str(path)],
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+    if result.returncode != 0:
+        detail = (result.stderr or result.stdout or "unknown error").strip()
+        raise RuntimeError(f"failed to read RAW dimensions for crop: {detail}")
+    payload = json.loads(result.stdout)
+    if not payload:
+        raise RuntimeError(f"failed to read RAW dimensions for crop: {path}")
+    width = int(payload[0].get("ImageWidth", 0))
+    height = int(payload[0].get("ImageHeight", 0))
+    if width < 1 or height < 1:
+        raise RuntimeError(f"invalid RAW dimensions for crop: {path}")
+    return width, height
 
 
 def _duplicate_names(paths: list[Path]) -> set[str]:

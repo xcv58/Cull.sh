@@ -119,6 +119,7 @@ def run_feedback_pilot(
         include_crop=include_crop,
     )
     records = _records(manifest)
+    _migrate_crop_coordinate_space(root, manifest_path, manifest, records)
 
     progress(f"Preparing {len(records)} isolated RAW copies and neutral renders.")
     for index, (asset, record) in enumerate(zip(assets, records), start=1):
@@ -168,8 +169,19 @@ def run_feedback_pilot(
         suggestion = _suggestion_from_payload(record["initial_suggestion"])
         first_render = first_dir / f"{staged_raw.stem}.jpg"
         if not first_render.is_file():
-            _write_rrdata(staged_raw, suggestion, "Qwen first pass")
+            baseline_size = _image_size(Path(str(record["baseline_render"])))
+            _write_rrdata(
+                staged_raw,
+                suggestion,
+                "Qwen first pass",
+                image_size=baseline_size,
+            )
             _render(binary, staged_raw, first_render, quality, runner)
+            _validate_render_dimensions(
+                Path(str(record["baseline_render"])),
+                first_render,
+                suggestion,
+            )
         record["first_render"] = str(first_render)
         record["first_metrics"] = _image_metrics(first_render)
         _write_json(manifest_path, manifest)
@@ -211,12 +223,19 @@ def run_feedback_pilot(
         final_render = final_dir / f"{staged_raw.stem}.jpg"
         initial = _suggestion_from_payload(record["initial_suggestion"])
         final = _suggestion_from_payload(record["final_suggestion"])
-        _write_rrdata(staged_raw, final, "Qwen validated final")
+        baseline_path = Path(str(record["baseline_render"]))
+        _write_rrdata(
+            staged_raw,
+            final,
+            "Qwen validated final",
+            image_size=_image_size(baseline_path),
+        )
         if not final_render.is_file():
             if _suggestion_payload(initial) == _suggestion_payload(final):
                 shutil.copy2(Path(str(record["first_render"])), final_render)
             else:
                 _render(binary, staged_raw, final_render, quality, runner)
+                _validate_render_dimensions(baseline_path, final_render, final)
         record["final_render"] = str(final_render)
         record["final_metrics"] = _image_metrics(final_render)
         _write_json(manifest_path, manifest)
@@ -262,6 +281,7 @@ def _load_or_create_manifest(
         "include_crop": include_crop,
         "originals_modified": False,
         "maximum_refinements": 1,
+        "crop_coordinate_space": "rapidraw-pixels-v2",
         "records": [
             {
                 "id": f"pilot-{index:04d}",
@@ -306,12 +326,19 @@ def _suggestion_from_payload(payload: object) -> EditSuggestion:
     return EditSuggestion(**payload)
 
 
-def _write_rrdata(raw_path: Path, suggestion: EditSuggestion, tag: str) -> None:
+def _write_rrdata(
+    raw_path: Path,
+    suggestion: EditSuggestion,
+    tag: str,
+    *,
+    image_size: tuple[int, int] | None = None,
+) -> None:
     payload = {
         "version": 1,
         "rating": 0,
         "adjustments": rapidraw_adjustments_from_suggestion(
-            _suggestion_payload(suggestion)
+            _suggestion_payload(suggestion),
+            image_size=image_size,
         ),
         "tags": ["Cull.sh", tag],
     }
@@ -348,16 +375,88 @@ def _run_command(command: list[str]) -> subprocess.CompletedProcess[str]:
     return subprocess.run(command, capture_output=True, text=True, check=False)
 
 
-def _image_metrics(path: Path) -> dict[str, float]:
+def _image_metrics(path: Path) -> dict[str, float | int]:
     with Image.open(path) as image:
         gray = image.convert("L")
         histogram = gray.histogram()
         pixels = max(1, sum(histogram))
         return {
+            "width": image.width,
+            "height": image.height,
             "mean_luma": round(float(ImageStat.Stat(gray).mean[0]), 3),
             "shadow_clip_fraction": round(sum(histogram[:4]) / pixels, 6),
             "highlight_clip_fraction": round(sum(histogram[252:]) / pixels, 6),
         }
+
+
+def _image_size(path: Path) -> tuple[int, int]:
+    with Image.open(path) as image:
+        return image.size
+
+
+def _validate_render_dimensions(
+    baseline: Path,
+    rendered: Path,
+    suggestion: EditSuggestion,
+) -> None:
+    base_width, base_height = _image_size(baseline)
+    render_width, render_height = _image_size(rendered)
+    base_area = base_width * base_height
+    rendered_fraction = (render_width * render_height) / max(1, base_area)
+    if suggestion.has_crop:
+        expected_fraction = (
+            (suggestion.crop_right - suggestion.crop_left)
+            * (suggestion.crop_bottom - suggestion.crop_top)
+        )
+        if rendered_fraction < expected_fraction * 0.5:
+            raise RuntimeError(
+                f"RapidRAW crop render is unexpectedly small: {rendered.name} "
+                f"is {render_width}x{render_height}, expected roughly "
+                f"{expected_fraction:.0%} of {base_width}x{base_height}"
+            )
+    elif rendered_fraction < 0.5:
+        raise RuntimeError(
+            f"RapidRAW non-crop render is unexpectedly small: {rendered.name} "
+            f"is {render_width}x{render_height} versus {base_width}x{base_height}"
+        )
+
+
+def _migrate_crop_coordinate_space(
+    root: Path,
+    manifest_path: Path,
+    manifest: dict[str, object],
+    records: list[dict[str, object]],
+) -> None:
+    if manifest.get("crop_coordinate_space") == "rapidraw-pixels-v2":
+        return
+    invalid_dir = root / "invalid-percent-crop-renders"
+    affected = 0
+    for record in records:
+        suggestion = record.get("initial_suggestion")
+        if not isinstance(suggestion, dict) or not suggestion.get("has_crop"):
+            continue
+        affected += 1
+        for key, prefix in (("first_render", "first"), ("final_render", "final")):
+            value = record.get(key)
+            if value:
+                source = Path(str(value))
+                if source.is_file():
+                    invalid_dir.mkdir(exist_ok=True)
+                    target = invalid_dir / f"{prefix}-{source.name}"
+                    if not target.exists():
+                        shutil.move(source, target)
+        for key in (
+            "first_render",
+            "first_metrics",
+            "review",
+            "final_suggestion",
+            "final_render",
+            "final_metrics",
+        ):
+            record.pop(key, None)
+    manifest["crop_coordinate_space"] = "rapidraw-pixels-v2"
+    manifest["invalidated_legacy_crop_records"] = affected
+    _write_json(manifest_path, manifest)
 
 
 def _write_review_page(root: Path, records: list[dict[str, object]]) -> Path:

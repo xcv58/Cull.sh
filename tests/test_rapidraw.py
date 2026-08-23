@@ -31,14 +31,15 @@ class RapidRawWorkflowTests(unittest.TestCase):
                 "crop_right": 0.9,
                 "crop_bottom": 0.8,
                 "crop_angle": 1.5,
-            }
+            },
+            image_size=(1000, 500),
         )
 
         self.assertEqual(adjustments["exposure"], 0.3)
         self.assertEqual(adjustments["highlights"], -20)
         self.assertEqual(
             adjustments["crop"],
-            {"unit": "%", "x": 10.0, "y": 20.0, "width": 80.0, "height": 60.0},
+            {"x": 100.0, "y": 100.0, "width": 800.0, "height": 300.0},
         )
         self.assertEqual(adjustments["rotation"], 1.5)
 
@@ -53,6 +54,19 @@ class RapidRawWorkflowTests(unittest.TestCase):
                     "crop_top": 0.45,
                     "crop_right": 0.55,
                     "crop_bottom": 0.55,
+                },
+                image_size=(1000, 500),
+            )
+
+    def test_crop_mapping_requires_image_dimensions(self) -> None:
+        with self.assertRaisesRegex(ValueError, "source image dimensions"):
+            rapidraw_adjustments_from_suggestion(
+                {
+                    "has_crop": True,
+                    "crop_left": 0.1,
+                    "crop_top": 0.1,
+                    "crop_right": 0.9,
+                    "crop_bottom": 0.9,
                 }
             )
 
