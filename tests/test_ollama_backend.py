@@ -1,15 +1,18 @@
 from __future__ import annotations
 
+from io import BytesIO
 from pathlib import Path
 import unittest
 from unittest.mock import MagicMock
 from unittest.mock import patch
 
 import httpx
+from PIL import Image
 
 from cull_sh.backends import build_backend
 from cull_sh.backends.base import VisionBackendError
 from cull_sh.backends.ollama import OllamaVisionBackend
+from cull_sh.backends.ollama import _image_boundary_facts
 from cull_sh.backends.ollama import _parse_batch_payload
 from cull_sh.backends.ollama import _parse_edit_payload
 from cull_sh.backends.ollama import _normalize_label
@@ -25,6 +28,24 @@ from cull_sh.models import RawAsset
 
 
 class OllamaBackendTests(unittest.TestCase):
+    def test_image_boundary_facts_distinguish_real_pixels_from_display_padding(
+        self,
+    ) -> None:
+        clean = _jpeg_bytes((40, 20), "white")
+        bordered_image = Image.new("RGB", (40, 20), "white")
+        for y in range(20):
+            bordered_image.putpixel((0, y), (0, 0, 0))
+            bordered_image.putpixel((39, y), (0, 0, 0))
+        output = BytesIO()
+        bordered_image.save(output, format="PNG")
+
+        clean_facts = _image_boundary_facts(clean)
+        bordered_facts = _image_boundary_facts(output.getvalue())
+
+        self.assertEqual(clean_facts["width"], 40)
+        self.assertFalse(clean_facts["solid_near_black_edge_detected"])
+        self.assertTrue(bordered_facts["solid_near_black_edge_detected"])
+
     def test_review_edits_returns_one_bounded_refinement(self) -> None:
         backend = OllamaVisionBackend(
             base_url="http://localhost:11434",
@@ -108,6 +129,55 @@ class OllamaBackendTests(unittest.TestCase):
             "Prefer accept",
             request_payload["messages"][0]["content"],
         )
+
+    def test_review_prompt_supplies_actual_pixel_bounds_and_ignores_padding(
+        self,
+    ) -> None:
+        backend = OllamaVisionBackend(
+            base_url="http://localhost:11434",
+            model="qwen",
+            timeout_seconds=300.0,
+        )
+        preview = _build_preview("frame.ARW")
+        pair = EditReviewPair(
+            asset=preview.asset,
+            baseline_bytes=_jpeg_bytes((40, 20), "white"),
+            edited_bytes=_jpeg_bytes((40, 12), "white"),
+            suggestion=EditSuggestion(
+                filename="frame.ARW",
+                has_crop=True,
+                crop_bottom=0.6,
+            ),
+        )
+        response = MagicMock()
+        response.raise_for_status.return_value = None
+        response.json.return_value = {
+            "message": {
+                "content": (
+                    '{"reviews":[{"id":"image-1","filename":"frame.ARW",'
+                    '"verdict":"accept","exposure":0,"contrast":0,'
+                    '"highlights":0,"shadows":0,"vibrance":0,'
+                    '"has_crop":true,"crop_left":0,"crop_top":0,'
+                    '"crop_right":1,"crop_bottom":0.6,"crop_angle":0,'
+                    '"summary":"The crop is clean."}]}'
+                )
+            }
+        }
+        fake_client = MagicMock()
+        fake_client.__enter__.return_value = fake_client
+        fake_client.post.return_value = response
+
+        with patch("cull_sh.backends.ollama.httpx.Client", return_value=fake_client):
+            backend.review_edits("natural", [pair])
+
+        request = fake_client.post.call_args.kwargs["json"]
+        content = request["messages"][1]["content"]
+        self.assertIn('"width": 40', content)
+        self.assertIn('"height": 12', content)
+        self.assertIn('"solid_near_black_edge_detected": false', content)
+        self.assertIn("display padding is not part of the photo", content)
+        self.assertIn("when one small bounded tone", content)
+        self.assertIn("whether it stops slightly early", content)
 
     def test_review_reject_reverts_recipe_but_preserves_additional_intents(self) -> None:
         backend = OllamaVisionBackend(
@@ -413,8 +483,24 @@ class OllamaBackendTests(unittest.TestCase):
         )
         self.assertIn("has_crop", str(request_payload["format"]))
         self.assertIn("additional_edits", str(request_payload["format"]))
+        required_fields = {
+            field
+            for definition in request_payload["format"]["$defs"].values()
+            for field in definition.get("required", [])
+        }
+        self.assertIn("temperature", required_fields)
+        self.assertIn("clarity", required_fields)
+        self.assertIn("additional_edits", required_fields)
         self.assertIn(
             "Do not narrate slider actions",
+            request_payload["messages"][1]["content"],
+        )
+        self.assertIn(
+            "Do not fall back to only exposure",
+            request_payload["messages"][1]["content"],
+        )
+        self.assertIn(
+            "Never place global exposure",
             request_payload["messages"][1]["content"],
         )
         self.assertIn(
@@ -650,6 +736,12 @@ def _build_preview_from_path(raw_path: str) -> PreviewImage:
         ),
         image_bytes=b"jpeg-bytes",
     )
+
+
+def _jpeg_bytes(size: tuple[int, int], color: str) -> bytes:
+    output = BytesIO()
+    Image.new("RGB", size, color).save(output, format="JPEG", quality=95)
+    return output.getvalue()
 
 
 if __name__ == "__main__":

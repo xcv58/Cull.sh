@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import base64
+from io import BytesIO
 import json
 import time
 from typing import Callable
@@ -8,6 +9,8 @@ from typing import Literal
 from typing import TypeVar
 
 import httpx
+from PIL import Image
+from PIL import UnidentifiedImageError
 from pydantic import BaseModel
 from pydantic import Field
 from pydantic import ValidationError
@@ -27,6 +30,30 @@ from cull_sh.models import FinalDecision, PreviewImage
 
 
 T = TypeVar("T")
+EDIT_SCHEMA_FIELDS = (
+    "id",
+    "filename",
+    "exposure",
+    "brightness",
+    "contrast",
+    "highlights",
+    "shadows",
+    "whites",
+    "blacks",
+    "temperature",
+    "tint",
+    "vibrance",
+    "saturation",
+    "clarity",
+    "dehaze",
+    "structure",
+    "sharpness",
+    "luma_noise_reduction",
+    "color_noise_reduction",
+    "vignette_amount",
+    "additional_edits",
+    "summary",
+)
 
 
 class OllamaDecisionPayload(BaseModel):
@@ -53,15 +80,30 @@ class OllamaBatchDecisionPayload(BaseModel):
 class OllamaEditPayload(BaseModel):
     id: str = Field(min_length=1)
     filename: str = Field(min_length=1)
-    exposure: float = Field(ge=-5.0, le=5.0)
-    brightness: float = Field(default=0.0, ge=-5.0, le=5.0)
+    exposure: float = Field(ge=-5.0, le=5.0, description="Linear RAW EV shift.")
+    brightness: float = Field(
+        default=0.0,
+        ge=-5.0,
+        le=5.0,
+        description="Filmic perceptual brightness shift.",
+    )
     contrast: int = Field(ge=-100, le=100)
     highlights: int = Field(ge=-100, le=100)
     shadows: int = Field(ge=-100, le=100)
     whites: int = Field(default=0, ge=-100, le=100)
     blacks: int = Field(default=0, ge=-100, le=100)
-    temperature: int = Field(default=0, ge=-100, le=100)
-    tint: int = Field(default=0, ge=-100, le=100)
+    temperature: int = Field(
+        default=0,
+        ge=-100,
+        le=100,
+        description="Relative global warm or cool correction.",
+    )
+    tint: int = Field(
+        default=0,
+        ge=-100,
+        le=100,
+        description="Relative global green or magenta correction.",
+    )
     vibrance: int = Field(ge=-100, le=100)
     saturation: int = Field(default=0, ge=-100, le=100)
     clarity: int = Field(default=0, ge=-100, le=100)
@@ -71,8 +113,14 @@ class OllamaEditPayload(BaseModel):
     luma_noise_reduction: int = Field(default=0, ge=0, le=100)
     color_noise_reduction: int = Field(default=0, ge=0, le=100)
     vignette_amount: int = Field(default=0, ge=-100, le=100)
-    additional_edits: list[str] = Field(default_factory=list)
-    summary: str = Field(min_length=1)
+    additional_edits: list[str] = Field(
+        default_factory=list,
+        description="Useful edits that cannot be represented by another recipe field."
+    )
+    summary: str = Field(
+        min_length=1,
+        description="One diagnostic sentence about the unedited starting render only.",
+    )
 
     @field_validator("id", "filename", "summary")
     @classmethod
@@ -382,10 +430,10 @@ class OllamaVisionBackend(VisionBackend):
             "- If no crop or rotation is needed, set has_crop false, crop_left 0, crop_top 0, crop_right 1, crop_bottom 1, crop_angle 0.\n"
             "- If a crop or rotation is used, the summary must mention the specific composition or leveling reason.\n"
         )
-        payload_schema = (
-            OllamaBatchEditWithCropPayload.model_json_schema()
+        payload_schema = _strict_edit_schema(
+            OllamaBatchEditWithCropPayload
             if include_crop
-            else OllamaBatchEditPayload.model_json_schema()
+            else OllamaBatchEditPayload
         )
 
         request_payload = {
@@ -419,6 +467,9 @@ class OllamaVisionBackend(VisionBackend):
                         + "- Fill every required field for every image.\n"
                         + "- First diagnose tonal balance, white balance/color cast, presence, detail/noise, and composition independently.\n"
                         + "- The summary must be one short, image-specific diagnostic sentence about the starting render. Do not narrate slider actions or claim that an adjustment was applied. Never leave it empty.\n"
+                        + "- Every executable field is required. Make an explicit independent decision for every field; use 0 only after deciding that control would not improve this image.\n"
+                        + "- The numeric fields are the actual recipe. Any executable change described anywhere in the response must have a matching nonzero field, and every nonzero field must address the visible diagnosis.\n"
+                        + "- Do not fall back to only exposure, contrast, highlights, shadows, and vibrance. Use the broader executable controls when the diagnosis calls for them, without forcing unnecessary changes.\n"
                         + "- Inspect exposure, brightness, highlight and shadow detail, whites, blacks, contrast, temperature, tint, vibrance, and saturation separately.\n"
                         + "- exposure is a linear RAW EV shift; brightness is a filmic perceptual exposure control. Prefer one for the diagnosed need and move both only when their distinct roles are necessary.\n"
                         + "- Recover blown skies with negative highlights; open dark areas with positive shadows.\n"
@@ -427,7 +478,7 @@ class OllamaVisionBackend(VisionBackend):
                         + "- Use sharpening or noise reduction only when the available render provides enough evidence; otherwise leave those fields at zero and record a full-resolution inspection in additional_edits.\n"
                         + "- Keep edits realistic unless the user asks for a stronger look.\n"
                         + "- Use 0 only when that slider already looks correct for that specific image.\n"
-                        + "- additional_edits is for useful edits outside the executable fields, including HSL, curves, color grading, masks, healing, lens corrections, or other local work. Use concise, actionable descriptions and never pretend they were applied.\n"
+                        + "- additional_edits is only for useful edits outside the executable fields, including HSL, curves, color grading, masks, healing, lens corrections, or other local work. Never place global exposure, brightness, contrast, highlights, shadows, whites, blacks, temperature, tint, vibrance, saturation, clarity, dehaze, structure, sharpening, noise reduction, vignette, crop, or rotation work there. Use concise, actionable descriptions and never pretend they were applied.\n"
                         + "- Do not copy identical slider values across images unless the summaries explain the same observed issue.\n"
                         + (crop_guidance if include_crop else "")
                         + "Return one set of adjustments per image."
@@ -515,6 +566,10 @@ class OllamaVisionBackend(VisionBackend):
                     "id": review_id,
                     "filename": pair.asset.filename,
                     "image_order": ["baseline", "edited"],
+                    "baseline_actual_pixels": _image_boundary_facts(
+                        pair.baseline_bytes
+                    ),
+                    "edited_actual_pixels": _image_boundary_facts(pair.edited_bytes),
                     "current_adjustments": _edit_payload(pair.suggestion),
                 }
             )
@@ -548,17 +603,17 @@ class OllamaVisionBackend(VisionBackend):
                         + "Compare each edited render only with its paired baseline. Diagnose the most important visible difference before choosing a verdict. "
                         + "Use accept only when the edit is a meaningful natural improvement without a new visible problem. "
                         + "Use reject when the neutral baseline is better or the edit has no meaningful benefit. "
-                        + "Use refine only to correct a specific visible issue introduced or left by the edit. "
+                        + "Use refine to correct a specific visible issue introduced or left by the edit, or when one small bounded tone, color, detail, crop, or rotation change would clearly make an already-improved render better. For a crop, check whether it stops slightly early or cuts too far relative to the stated composition goal. Do not refine merely to make values different. "
+                        + "The actual-pixel metadata gives the decoded image dimensions and measured outer-edge pixels. Vision preprocessing may add black or neutral padding outside images with different aspect ratios; that display padding is not part of the photo. Never report letterboxing or black bars from external presentation padding. Only report a black-border defect when a band is visibly inside the actual image and the measured edge facts corroborate it. A smaller edited height or width is expected after a crop. "
                         + "additional_edits are unrendered future-work notes: never count them as a visible improvement, but preserve or improve useful notes even when rejecting the executable recipe. "
                         + "For refine, return final absolute slider and crop values, not deltas. "
                         + "Keep refinements conservative: exposure and brightness within 0.5 stop, rotation within 5 degrees, and each integer slider "
-                        + "within 30 points of the current recipe. Preserve or revise additional_edits based on visible evidence. Do not invent a stylistic change merely "
-                        + "to make the values different. Fill every field and explain the verdict briefly."
+                        + "within 30 points of the current recipe. Preserve or revise additional_edits based on visible evidence. Do not invent a stylistic change. Fill every field and explain the verdict briefly."
                     ),
                     "images": encoded_images,
                 },
             ],
-            "format": OllamaBatchEditReviewPayload.model_json_schema(),
+            "format": _strict_edit_schema(OllamaBatchEditReviewPayload),
             "stream": False,
             "options": {
                 "temperature": self.temperature,
@@ -816,6 +871,72 @@ def _edit_payload(suggestion: EditSuggestion) -> dict[str, object]:
         "crop_angle": suggestion.crop_angle,
         "additional_edits": suggestion.additional_edits,
     }
+
+
+def _image_boundary_facts(image_bytes: bytes) -> dict[str, object]:
+    """Measure decoded image bounds so a VLM can distinguish pixels from padding."""
+    try:
+        with Image.open(BytesIO(image_bytes)) as source:
+            width, height = source.size
+            sampled = source.convert("RGB")
+            sampled.thumbnail((256, 256))
+    except (OSError, UnidentifiedImageError):
+        return {"analysis_available": False}
+
+    sample_width, sample_height = sampled.size
+    edges = {
+        "top": [sampled.getpixel((x, 0)) for x in range(sample_width)],
+        "bottom": [
+            sampled.getpixel((x, sample_height - 1)) for x in range(sample_width)
+        ],
+        "left": [sampled.getpixel((0, y)) for y in range(sample_height)],
+        "right": [
+            sampled.getpixel((sample_width - 1, y)) for y in range(sample_height)
+        ],
+    }
+    near_black_fractions = {
+        edge: round(
+            sum(max(pixel) <= 3 for pixel in pixels) / max(len(pixels), 1), 4
+        )
+        for edge, pixels in edges.items()
+    }
+    return {
+        "analysis_available": True,
+        "width": width,
+        "height": height,
+        "near_black_outer_edge_fraction": near_black_fractions,
+        "solid_near_black_edge_detected": any(
+            fraction >= 0.98 for fraction in near_black_fractions.values()
+        ),
+    }
+
+
+def _strict_edit_schema(model: type[BaseModel]) -> dict[str, object]:
+    """Require explicit model output while retaining legacy parser defaults."""
+    schema = model.model_json_schema()
+    definitions = schema.get("$defs")
+    if not isinstance(definitions, dict):
+        return schema
+    for definition in definitions.values():
+        if not isinstance(definition, dict):
+            continue
+        properties = definition.get("properties")
+        if not isinstance(properties, dict) or "exposure" not in properties:
+            continue
+        required = list(EDIT_SCHEMA_FIELDS)
+        for crop_field in (
+            "has_crop",
+            "crop_left",
+            "crop_top",
+            "crop_right",
+            "crop_bottom",
+            "crop_angle",
+            "verdict",
+        ):
+            if crop_field in properties:
+                required.append(crop_field)
+        definition["required"] = required
+    return schema
 
 
 def _bounded_refinement(

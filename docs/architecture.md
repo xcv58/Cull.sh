@@ -83,6 +83,8 @@ unbounded editing ideas as explicit `additional_edits`; these notes are never
 represented as rendered changes. Editing uses one image per request, is
 fail-fast with one attempt and no fallback, and freezes recipe plus
 model/prompt provenance in `edit-suggestions.jsonl`.
+The transport schema requires an explicit value for every executable control,
+while persisted recipes retain backward-compatible neutral defaults.
 
 ### 2. Stage
 
@@ -95,6 +97,12 @@ operations such as masks and healing remain explicit future-work intents until
 a mask-generation stage can supply real geometry or mask pixels.
 
 ### 3. Preview and approve
+
+The bounded validation stage receives the neutral and rendered pair plus actual
+decoded dimensions and measured outer-edge facts. This prevents aspect-ratio
+padding introduced by vision preprocessing from being reported as image
+letterboxing. The validator may accept, reject, or make one bounded refinement;
+the human preference recorded by the review page remains authoritative.
 
 `rapidraw-preview` invokes RapidRAW's headless CLI on the staged copies and
 builds a private `review.html` with actual before/after renders. Choices are

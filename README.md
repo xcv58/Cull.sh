@@ -253,6 +253,9 @@ curves, color grading, masks, healing, or lens work—are retained as explicit
 applied.
 
 Editing defaults to one image per model request to avoid cross-image leakage.
+Every executable field is marked required in the structured model schema, so
+Qwen must explicitly decide each expanded control instead of silently omitting
+newer fields. Stored legacy recipes remain readable with neutral defaults.
 The selected Qwen model runs with thinking enabled and is intentionally
 fail-fast: Cull.sh does not use a fallback model or retry failed photographs
 individually. Gemma remains supported by historical benchmark commands, but is
@@ -313,6 +316,10 @@ pair. Suggestions and rendered pairs default to one photo per request. The
 review can accept, revert, or make one bounded refinement; it cannot iterate
 indefinitely. Unrendered `additional_edits` never count as visible improvement
 but remain available for later mask or advanced-edit stages.
+The reviewer receives decoded image dimensions and measured outer-edge facts so
+vision-model letterboxing outside a cropped image is not mistaken for black
+pixels in the photograph. Validation remains advisory: human preferences from
+the review page are the final quality signal.
 The generated `review.html` shows baseline, first edit, and validated final side
 by side and records a human preference locally.
 

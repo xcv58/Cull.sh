@@ -6,7 +6,7 @@
 - Foundation draft PR: <https://github.com/xcv58/Cull.sh/pull/2>
 - Follow-up branch: `codex/topiq-qwen-rapidraw`
 - Follow-up base: `feat/ai-develop-edits`
-- Test suite: 126 passed
+- Test suite: 128 passed
 
 The follow-up branch contains the original three focused commits plus the
 TOPIQ/Qwen migration, rendered-feedback pilot, and expanded RapidRAW recipe work:
@@ -29,6 +29,9 @@ TOPIQ/Qwen migration, rendered-feedback pilot, and expanded RapidRAW recipe work
   Gemma results remain historical benchmark evidence only.
 - Use one image per edit-suggestion request and one rendered pair per feedback
   request to prevent cross-image association leakage.
+- Require every executable edit field in Qwen's transport schema, and give the
+  validator actual decoded dimensions plus measured outer-edge facts so display
+  padding is not confused with pixels. Keep human review authoritative.
 - The executable RapidRAW recipe includes global tone, relative white balance,
   presence, detail/noise, vignette, crop, and rotation paired with bounds that
   remove rotated black edges. Preserve
