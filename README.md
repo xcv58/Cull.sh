@@ -281,6 +281,32 @@ controlled pilot. Final export otherwise fails without a matching approval
 file. Generated review and output files live inside the stage, never beside the
 original photographs.
 
+### Rendered edit feedback pilot
+
+`rapidraw-feedback-pilot` tests a bounded render-and-review loop on picks that
+were added by a frozen machine cull but were not picks in the pre-application
+human XMP backup:
+
+```bash
+python main.py rapidraw-feedback-pilot \
+  --path "/path/to/photos" \
+  --cull-run runs/<frozen-cull-run> \
+  --human-baseline "/path/to/pre-application-xmp-backup" \
+  --output "/path/to/new-or-resumable-feedback-stage" \
+  --with-crop
+```
+
+For each selected RAW, RapidRAW first creates a neutral baseline render. Qwen
+suggests a structured recipe from that renderer-consistent baseline, RapidRAW
+renders the recipe, and Qwen compares the real before/after pair. The review can
+accept, revert, or make one bounded refinement; it cannot iterate indefinitely.
+The generated `review.html` shows baseline, first edit, and validated final side
+by side and records a human preference locally.
+
+The stage is resumable and never writes the source RAW/XMP files. Normalized
+crop suggestions are converted to the full-resolution pixel coordinates used by
+RapidRAW's headless export path, and implausibly small crop renders fail fast.
+
 `--limit` now applies after whole-folder scene grouping, so `--limit 24` means
 "process the first 24 scenes" rather than "stop after 24 files".
 
