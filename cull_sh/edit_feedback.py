@@ -3,6 +3,8 @@ from __future__ import annotations
 from collections.abc import Callable
 from dataclasses import asdict
 from dataclasses import dataclass
+from datetime import datetime, timezone
+from hashlib import sha256
 from html import escape
 import json
 from pathlib import Path
@@ -21,6 +23,7 @@ from cull_sh.models import EditReviewPair
 from cull_sh.models import EditSuggestion
 from cull_sh.models import PreviewImage
 from cull_sh.models import RawAsset
+from cull_sh.rapidraw import rapidraw_install_info
 from cull_sh.rapidraw import rapidraw_adjustments_from_suggestion
 from cull_sh.xmp import sidecar_is_picked
 
@@ -40,24 +43,79 @@ class FeedbackPilotResult:
     reverted: int
 
 
+@dataclass(frozen=True, slots=True)
+class FeedbackExportResult:
+    manifest_path: Path
+    output_dir: Path
+    photos: int
+    exported: int
+    resumed: int
+
+
 def select_machine_picks(
     cull_run: Path,
     human_baseline: Path,
     source_root: Path,
 ) -> list[RawAsset]:
     """Select manifest picks that were not already human-picked in the backup."""
+    return select_feedback_picks(
+        cull_run,
+        human_baseline,
+        source_root,
+        include_existing_picks=False,
+    )
+
+
+def select_feedback_picks(
+    cull_run: Path,
+    human_baseline: Path,
+    source_root: Path,
+    *,
+    include_existing_picks: bool,
+    ignore_baseline_picks: bool = False,
+) -> list[RawAsset]:
+    """Select machine picks, optionally unioned with protected baseline picks."""
+    if include_existing_picks and ignore_baseline_picks:
+        raise ValueError(
+            "include_existing_picks and ignore_baseline_picks are mutually exclusive"
+        )
     source_root = source_root.expanduser().resolve()
     human_baseline = human_baseline.expanduser().resolve()
     selected: list[RawAsset] = []
+    matched_baseline_sidecars: set[str] = set()
+    protected_sidecars = (
+        set()
+        if ignore_baseline_picks
+        else {
+            path.name.casefold()
+            for path in human_baseline.glob("*.xmp")
+            if not path.name.startswith("._") and sidecar_is_picked(path)
+        }
+    )
     for record in load_manifest_records(cull_run.expanduser().resolve()):
         decision = decision_from_manifest_record(record)
-        if decision is None or decision.bucket != DecisionBucket.PICK:
-            continue
         raw_path = Path(str(record["raw_path"])).expanduser().resolve()
         if raw_path.parent != source_root:
             continue
         xmp_path = Path(str(record.get("xmp_path", raw_path.with_suffix(".xmp"))))
-        if sidecar_is_picked(human_baseline / xmp_path.name):
+        baseline_sidecar = human_baseline / xmp_path.name
+        baseline_picked = (
+            False if ignore_baseline_picks else sidecar_is_picked(baseline_sidecar)
+        )
+        if baseline_picked:
+            matched_baseline_sidecars.add(xmp_path.name.casefold())
+        machine_picked = (
+            decision is not None and decision.bucket == DecisionBucket.PICK
+        )
+        if ignore_baseline_picks:
+            selected_by_scope = machine_picked
+        else:
+            selected_by_scope = machine_picked or (
+                include_existing_picks and baseline_picked
+            )
+        if not selected_by_scope:
+            continue
+        if baseline_picked and not include_existing_picks and not ignore_baseline_picks:
             continue
         if not raw_path.is_file():
             raise FileNotFoundError(f"selected RAW is missing: {raw_path}")
@@ -68,6 +126,13 @@ def select_machine_picks(
                 kind=AssetKind(str(record.get("asset_kind", AssetKind.RAW.value))),
             )
         )
+    if include_existing_picks:
+        missing = sorted(protected_sidecars - matched_baseline_sidecars)
+        if missing:
+            raise ValueError(
+                "protected baseline pick is missing from the frozen cull manifest: "
+                f"{missing[0]}"
+            )
     return sorted(selected, key=lambda asset: asset.filename)
 
 
@@ -84,6 +149,7 @@ def run_feedback_pilot(
     suggestion_batch_size: int = 1,
     review_batch_size: int = 1,
     include_crop: bool = True,
+    selection_scope: str = "machine-picks-only",
     quality: int = 88,
     progress: ProgressCallback | None = None,
     command_runner: CommandRunner | None = None,
@@ -117,6 +183,7 @@ def run_feedback_pilot(
         cull_run=cull_run,
         human_baseline=human_baseline,
         include_crop=include_crop,
+        selection_scope=selection_scope,
         suggestion_batch_size=suggestion_batch_size,
         review_batch_size=review_batch_size,
     )
@@ -256,6 +323,273 @@ def run_feedback_pilot(
     )
 
 
+def export_feedback_stage(
+    root: Path,
+    binary: Path,
+    output_dir: Path,
+    *,
+    quality: int = 95,
+    keep_metadata: bool = True,
+    command_runner: CommandRunner | None = None,
+) -> FeedbackExportResult:
+    """Export every completed Qwen-validated recipe as a delivery JPEG."""
+    if not 1 <= quality <= 100:
+        raise ValueError("feedback export quality must be between 1 and 100")
+    root = root.expanduser().resolve()
+    binary = binary.expanduser().resolve()
+    output_dir = output_dir.expanduser().resolve()
+    manifest_path = root / "feedback-manifest.json"
+    if not manifest_path.is_file():
+        raise FileNotFoundError(f"feedback manifest is missing: {manifest_path}")
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    if manifest.get("kind") != "cull-sh-rendered-edit-feedback-pilot":
+        raise ValueError("not a Cull.sh rendered feedback stage")
+    records = _records(manifest)
+    if not records:
+        raise ValueError("feedback manifest contains no records")
+
+    required = {
+        "id",
+        "filename",
+        "source",
+        "staged_raw",
+        "baseline_render",
+        "final_render",
+        "final_suggestion",
+        "review",
+    }
+    for record in records:
+        missing = sorted(required - record.keys())
+        if missing:
+            raise ValueError(
+                f"feedback record {record.get('filename', record.get('id'))} is incomplete: "
+                f"missing {missing[0]}"
+            )
+        if not isinstance(record["review"], dict):
+            raise ValueError(
+                f"feedback record {record['filename']} has an invalid review"
+            )
+        if not isinstance(record["final_suggestion"], dict):
+            raise ValueError(
+                f"feedback record {record['filename']} has an invalid final suggestion"
+            )
+        if not Path(str(record["final_render"])).is_file():
+            raise FileNotFoundError(
+                f"validated final render is missing: {record['final_render']}"
+            )
+
+    record_ids = [str(record["id"]) for record in records]
+    if len(record_ids) != len(set(record_ids)):
+        raise ValueError("feedback manifest contains duplicate record ids")
+    source_roots = {Path(str(record["source"])).resolve().parent for record in records}
+    if any(
+        output_dir == source_root or source_root in output_dir.parents
+        for source_root in source_roots
+    ):
+        raise ValueError("feedback delivery output must be outside the source photo folder")
+    if output_dir == root or root in output_dir.parents:
+        raise ValueError("feedback delivery output must be outside the feedback stage")
+
+    install = rapidraw_install_info(binary)
+    if not install["exists"] or not install["executable"]:
+        raise FileNotFoundError(f"RapidRAW binary is not executable: {binary}")
+    runner = command_runner or _run_command
+    feedback_digest = _file_sha256(manifest_path)
+    export_manifest_path = root / "feedback-export.json"
+    previous = (
+        json.loads(export_manifest_path.read_text(encoding="utf-8"))
+        if export_manifest_path.is_file()
+        else {}
+    )
+    if previous:
+        expected = {
+            "feedback_manifest_sha256": feedback_digest,
+            "output_dir": str(output_dir),
+            "quality": quality,
+            "keep_metadata": keep_metadata,
+        }
+        for key, value in expected.items():
+            if previous.get(key) != value:
+                raise ValueError(
+                    f"existing feedback export uses a different {key.replace('_', ' ')}"
+                )
+    elif output_dir.exists() and any(output_dir.iterdir()):
+        raise FileExistsError(
+            f"refusing to use non-empty untracked delivery folder: {output_dir}"
+        )
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    completed = {
+        str(record["id"]): record
+        for record in previous.get("records", [])
+        if isinstance(record, dict) and record.get("status") == "exported"
+    }
+    export_records: list[dict[str, object]] = list(completed.values())
+    output_names = _feedback_output_names(records)
+    exported = 0
+    resumed = 0
+    for record, output_name in zip(records, output_names):
+        record_id = str(record["id"])
+        staged_raw = Path(str(record["staged_raw"]))
+        if not staged_raw.is_file():
+            raise FileNotFoundError(f"staged RAW is missing: {staged_raw}")
+        target = output_dir / output_name
+        prior = completed.get(record_id)
+        if prior is not None and target.is_file():
+            expected_sha = prior.get("sha256")
+            if expected_sha and _file_sha256(target) != expected_sha:
+                raise ValueError(f"completed delivery JPEG changed after export: {target}")
+            resumed += 1
+            continue
+        if target.exists():
+            raise FileExistsError(
+                f"refusing to overwrite output not recorded as complete: {target}"
+            )
+
+        baseline = Path(str(record["baseline_render"]))
+        final = _suggestion_from_payload(record["final_suggestion"])
+        _write_rrdata(
+            staged_raw,
+            final,
+            "Qwen validated unattended final",
+            image_size=_image_size(baseline),
+        )
+        command = [
+            str(binary),
+            "export",
+            str(staged_raw),
+            "--output",
+            str(target),
+            "--format",
+            "jpeg",
+            "--quality",
+            str(quality),
+        ]
+        if keep_metadata:
+            command.append("--keep-metadata")
+        try:
+            result = runner(command)
+            if result.returncode != 0:
+                detail = (result.stderr or result.stdout or "unknown error").strip()
+                raise RuntimeError(
+                    f"RapidRAW delivery export failed for {staged_raw.name}: {detail}"
+                )
+            if not target.is_file():
+                raise RuntimeError(
+                    f"RapidRAW reported success but did not create {target}"
+                )
+            _validate_render_dimensions(baseline, target, final)
+        except Exception as exc:
+            export_records.append(
+                {
+                    "id": record_id,
+                    "filename": record["filename"],
+                    "source": record["source"],
+                    "output": str(target),
+                    "status": "failed",
+                    "error": str(exc),
+                }
+            )
+            _write_feedback_export_manifest(
+                export_manifest_path,
+                feedback_digest,
+                output_dir,
+                install,
+                quality,
+                keep_metadata,
+                len(records),
+                export_records,
+            )
+            raise
+        width, height = _image_size(target)
+        review = record["review"]
+        assert isinstance(review, dict)
+        export_records.append(
+            {
+                "id": record_id,
+                "filename": record["filename"],
+                "source": record["source"],
+                "selection": record.get("selection"),
+                "qwen_verdict": review.get("verdict"),
+                "output": str(target),
+                "status": "exported",
+                "bytes": target.stat().st_size,
+                "width": width,
+                "height": height,
+                "sha256": _file_sha256(target),
+            }
+        )
+        exported += 1
+        _write_feedback_export_manifest(
+            export_manifest_path,
+            feedback_digest,
+            output_dir,
+            install,
+            quality,
+            keep_metadata,
+            len(records),
+            export_records,
+        )
+    return FeedbackExportResult(
+        manifest_path=export_manifest_path,
+        output_dir=output_dir,
+        photos=len(records),
+        exported=exported,
+        resumed=resumed,
+    )
+
+
+def _feedback_output_names(records: list[dict[str, object]]) -> list[str]:
+    stems = [Path(str(record["filename"])).stem for record in records]
+    duplicate_stems = {
+        stem.casefold() for stem in stems if sum(s.casefold() == stem.casefold() for s in stems) > 1
+    }
+    return [
+        f"{record['id']}-{stem}.jpg" if stem.casefold() in duplicate_stems else f"{stem}.jpg"
+        for record, stem in zip(records, stems)
+    ]
+
+
+def _write_feedback_export_manifest(
+    path: Path,
+    feedback_digest: str,
+    output_dir: Path,
+    install: dict[str, object],
+    quality: int,
+    keep_metadata: bool,
+    total_photos: int,
+    records: list[dict[str, object]],
+) -> None:
+    _write_json(
+        path,
+        {
+            "schema_version": 1,
+            "kind": "cull-sh-rapidraw-feedback-export",
+            "created_at": datetime.now(timezone.utc).isoformat(),
+            "mode": "unattended",
+            "feedback_manifest_sha256": feedback_digest,
+            "output_dir": str(output_dir),
+            "rapidraw": install,
+            "format": "jpeg",
+            "quality": quality,
+            "keep_metadata": keep_metadata,
+            "photos": total_photos,
+            "completed_photos": sum(
+                1 for record in records if record.get("status") == "exported"
+            ),
+            "records": records,
+        },
+    )
+
+
+def _file_sha256(path: Path) -> str:
+    digest = sha256()
+    with path.open("rb") as handle:
+        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
 def _load_or_create_manifest(
     path: Path,
     assets: list[RawAsset],
@@ -265,6 +599,7 @@ def _load_or_create_manifest(
     cull_run: Path,
     human_baseline: Path,
     include_crop: bool,
+    selection_scope: str,
     suggestion_batch_size: int,
     review_batch_size: int,
 ) -> dict[str, object]:
@@ -276,13 +611,14 @@ def _load_or_create_manifest(
             raise ValueError("existing feedback stage has a different selection")
         return payload
     payload: dict[str, object] = {
-        "schema_version": 2,
+        "schema_version": 3,
         "kind": "cull-sh-rendered-edit-feedback-pilot",
         "model": model,
         "prompt": prompt,
         "cull_run": str(cull_run.expanduser().resolve()),
         "human_baseline": str(human_baseline.expanduser().resolve()),
         "include_crop": include_crop,
+        "selection_scope": selection_scope,
         "suggestion_batch_size": suggestion_batch_size,
         "review_batch_size": review_batch_size,
         "originals_modified": False,
@@ -295,7 +631,15 @@ def _load_or_create_manifest(
                 "source": str(asset.raw_path),
                 "xmp_path": str(asset.xmp_path),
                 "asset_kind": asset.kind.value,
-                "selection": "machine-pick-not-in-human-baseline",
+                "selection": (
+                    "frozen-machine-pick"
+                    if selection_scope == "frozen-machine-picks"
+                    else "protected-existing-pick"
+                    if sidecar_is_picked(
+                        human_baseline.expanduser().resolve() / asset.xmp_path.name
+                    )
+                    else "machine-pick-not-in-human-baseline"
+                ),
             }
             for index, asset in enumerate(assets, start=1)
         ],
@@ -516,6 +860,20 @@ def _write_review_page(root: Path, records: list[dict[str, object]]) -> Path:
             + "</div></article>"
         )
     ids = json.dumps([str(record["id"]) for record in records])
+    protected = sum(
+        1 for record in records if record.get("selection") == "protected-existing-pick"
+    )
+    frozen = sum(
+        1 for record in records if record.get("selection") == "frozen-machine-pick"
+    )
+    machine_added = len(records) - protected
+    selection_note = (
+        f"{frozen} frozen machine pick(s); pre-existing flags were ignored."
+        if frozen
+        else f"{protected} protected existing pick(s) and {machine_added} machine-added pick(s)."
+        if protected
+        else "Machine-added picks only."
+    )
     page = root / "review.html"
     page.write_text(
         """<!doctype html><html><head><meta charset='utf-8'><meta name='viewport' content='width=device-width,initial-scale=1'>
@@ -523,7 +881,9 @@ def _write_review_page(root: Path, records: list[dict[str, object]]) -> Path:
 :root{color-scheme:dark;font-family:system-ui;background:#101010;color:#eee}body{max-width:1900px;margin:auto;padding:24px}
 .toolbar{position:sticky;top:0;background:#101010ee;padding:12px 0;z-index:2}button{padding:9px 14px}article{border:1px solid #333;border-radius:12px;padding:14px;margin:18px 0;background:#181818}
 .images{display:grid;gap:10px}.images.two{grid-template-columns:repeat(2,1fr)}.images.three{grid-template-columns:repeat(3,1fr)}figure{margin:0}img{width:100%;height:460px;object-fit:contain;background:#080808}figcaption{color:#aaa}.recipe{color:#e9c46a}.choices{display:flex;gap:18px;flex-wrap:wrap}label{padding:8px;border:1px solid #555;border-radius:8px}label:has(input:checked){background:#14532d;border-color:#4ade80}@media(max-width:900px){.images{grid-template-columns:1fr!important}img{height:auto}}
-</style></head><body><h1>Rendered edit feedback pilot</h1><p>Machine-added picks only. Originals were not modified.</p>
+</style></head><body><h1>Rendered edit feedback pilot</h1><p>"""
+        + escape(selection_note)
+        + """ Originals were not modified.</p>
 <div class='toolbar'><button id='download'>Download choices CSV</button> <strong id='count'></strong></div>"""
         + "".join(cards)
         + f"""<script>const ids={ids};const key='cull-sh-edit-feedback-'+location.pathname;const saved=JSON.parse(localStorage.getItem(key)||'{{}}');

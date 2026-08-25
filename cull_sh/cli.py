@@ -34,8 +34,9 @@ from cull_sh.edit_benchmark import EditModelSpec
 from cull_sh.edit_benchmark import run_edit_benchmark
 from cull_sh.edit_benchmark import stage_lightroom_blind_review
 from cull_sh.edit_benchmark import write_blind_review_page
+from cull_sh.edit_feedback import export_feedback_stage
 from cull_sh.edit_feedback import run_feedback_pilot
-from cull_sh.edit_feedback import select_machine_picks
+from cull_sh.edit_feedback import select_feedback_picks
 from cull_sh.lightroom_ui import build_adaptive_color_stage
 from cull_sh.lightroom_ui import build_jpeg_auto_stage
 from cull_sh.lightroom_ui import write_adaptive_color_handoff
@@ -1723,7 +1724,7 @@ def rapidraw_feedback_pilot(
         exists=True,
         file_okay=False,
         dir_okay=True,
-        help="Frozen culling run whose machine-only picks define the pilot.",
+        help="Frozen culling run whose final picks define the pilot.",
     ),
     human_baseline: Path = typer.Option(
         ...,
@@ -1749,14 +1750,44 @@ def rapidraw_feedback_pilot(
     review_batch_size: int = typer.Option(
         1, min=1, help="Rendered pairs per review request; one avoids pair leakage."
     ),
+    include_existing_picks: bool = typer.Option(
+        False,
+        "--include-existing-picks/--machine-picks-only",
+        help="Edit the union of protected baseline picks and frozen machine picks.",
+    ),
+    frozen_machine_picks: bool = typer.Option(
+        False,
+        "--frozen-machine-picks",
+        help=(
+            "Use every pick from the frozen manifest while ignoring pre-existing "
+            "flags; intended for an uncontaminated automated test arm."
+        ),
+    ),
     with_crop: bool = typer.Option(True, "--with-crop/--no-with-crop"),
     rapidraw_binary: Path = typer.Option(DEFAULT_RAPIDRAW_BINARY),
 ) -> None:
-    """Pilot a neutral-render, suggest, render, and one-refinement edit loop."""
-    assets = select_machine_picks(cull_run, human_baseline, path)
-    console.print(f"Machine-only picked pilot photos: {len(assets)}")
+    """Run a neutral-render, suggest, render, and one-refinement edit loop."""
+    if include_existing_picks and frozen_machine_picks:
+        raise typer.BadParameter(
+            "use either --include-existing-picks or --frozen-machine-picks, not both"
+        )
+    assets = select_feedback_picks(
+        cull_run,
+        human_baseline,
+        path,
+        include_existing_picks=include_existing_picks,
+        ignore_baseline_picks=frozen_machine_picks,
+    )
+    scope = (
+        "frozen machine"
+        if frozen_machine_picks
+        else "all final"
+        if include_existing_picks
+        else "machine-added"
+    )
+    console.print(f"{scope.capitalize()} picked pilot photos: {len(assets)}")
     if not assets:
-        raise typer.BadParameter("the frozen run has no machine-only picks")
+        raise typer.BadParameter(f"the frozen run has no {scope} picks")
     console.print(", ".join(asset.filename for asset in assets))
     backend = build_backend(
         BackendConfig(
@@ -1783,6 +1814,13 @@ def rapidraw_feedback_pilot(
             suggestion_batch_size=suggestion_batch_size,
             review_batch_size=review_batch_size,
             include_crop=with_crop,
+            selection_scope=(
+                "frozen-machine-picks"
+                if frozen_machine_picks
+                else "protected-and-machine-picks"
+                if include_existing_picks
+                else "machine-added-picks"
+            ),
             progress=console.print,
         )
     except (FileNotFoundError, RuntimeError, ValueError, VisionBackendError) as exc:
@@ -1795,6 +1833,59 @@ def rapidraw_feedback_pilot(
     )
     console.print(f"Manifest: {result.manifest_path}")
     console.print(f"Human review: {result.review_page}")
+
+
+@app.command("rapidraw-feedback-export")
+def rapidraw_feedback_export(
+    stage: Path = typer.Option(
+        ...,
+        exists=True,
+        file_okay=False,
+        dir_okay=True,
+        help="Completed stage created by rapidraw-feedback-pilot.",
+    ),
+    output: Path = typer.Option(
+        ...,
+        file_okay=False,
+        dir_okay=True,
+        help="Delivery folder containing JPEG files only; supports safe resume.",
+    ),
+    unattended: bool = typer.Option(
+        False,
+        "--unattended",
+        help="Explicitly accept Qwen validation without human approval.",
+    ),
+    rapidraw_binary: Path = typer.Option(DEFAULT_RAPIDRAW_BINARY),
+    quality: int = typer.Option(95, min=1, max=100),
+    keep_metadata: bool = typer.Option(
+        True,
+        "--keep-metadata/--strip-metadata",
+        help="Retain capture metadata in delivery JPEGs.",
+    ),
+) -> None:
+    """Export all completed Qwen-validated finals as delivery JPEGs."""
+    if not unattended:
+        raise typer.BadParameter(
+            "pass --unattended to acknowledge export without human approval"
+        )
+    try:
+        result = export_feedback_stage(
+            stage,
+            rapidraw_binary,
+            output,
+            quality=quality,
+            keep_metadata=keep_metadata,
+        )
+    except (FileExistsError, FileNotFoundError, RuntimeError, ValueError) as exc:
+        console.print(f"RapidRAW unattended feedback export stopped: {exc}")
+        console.print("The isolated stage and completed delivery JPEGs are resumable.")
+        raise typer.Exit(code=1) from exc
+    console.print(
+        f"Unattended delivery complete: photos={result.photos} "
+        f"newly_exported={result.exported} resumed={result.resumed}"
+    )
+    console.print(f"Delivery JPEGs: {result.output_dir}")
+    console.print(f"Export manifest: {result.manifest_path}")
 
 
 @app.command("rapidraw-stage")

@@ -9,7 +9,9 @@ import unittest
 from PIL import Image
 
 from cull_sh.backends.base import VisionBackend
+from cull_sh.edit_feedback import export_feedback_stage
 from cull_sh.edit_feedback import run_feedback_pilot
+from cull_sh.edit_feedback import select_feedback_picks
 from cull_sh.edit_feedback import select_machine_picks
 from cull_sh.edit_feedback import _validate_render_dimensions
 from cull_sh.models import EditReview
@@ -168,6 +170,94 @@ class EditFeedbackPilotTests(unittest.TestCase):
 
             self.assertEqual([asset.filename for asset in selected], ["machine.ARW"])
 
+    def test_selects_union_of_protected_and_machine_picks(self) -> None:
+        with TemporaryDirectory() as tmp_dir:
+            root = Path(tmp_dir)
+            source = root / "source"
+            backup = root / "backup"
+            run = root / "run"
+            source.mkdir()
+            backup.mkdir()
+            run.mkdir()
+            for stem in ("protected", "machine", "review"):
+                (source / f"{stem}.ARW").write_bytes(stem.encode())
+            _write_xmp(backup / "protected.xmp", good="True")
+            _write_xmp(backup / "machine.xmp")
+            _write_xmp(backup / "review.xmp")
+            _write_manifest(
+                run,
+                source,
+                [
+                    ("protected", "reject"),
+                    ("machine", "pick"),
+                    ("review", "review"),
+                ],
+            )
+
+            selected = select_feedback_picks(
+                run,
+                backup,
+                source,
+                include_existing_picks=True,
+            )
+
+            self.assertEqual(
+                [asset.filename for asset in selected],
+                ["machine.ARW", "protected.ARW"],
+            )
+
+    def test_fails_when_protected_pick_is_missing_from_frozen_manifest(self) -> None:
+        with TemporaryDirectory() as tmp_dir:
+            root = Path(tmp_dir)
+            source = root / "source"
+            backup = root / "backup"
+            run = root / "run"
+            source.mkdir()
+            backup.mkdir()
+            run.mkdir()
+            (source / "protected.ARW").write_bytes(b"raw")
+            _write_xmp(backup / "protected.xmp", good="True")
+            (run / "manifest.jsonl").write_text("", encoding="utf-8")
+
+            with self.assertRaisesRegex(ValueError, "missing from the frozen"):
+                select_feedback_picks(
+                    run,
+                    backup,
+                    source,
+                    include_existing_picks=True,
+                )
+
+    def test_frozen_machine_scope_ignores_preexisting_flags(self) -> None:
+        with TemporaryDirectory() as tmp_dir:
+            root = Path(tmp_dir)
+            source = root / "source"
+            backup = root / "backup"
+            run = root / "run"
+            source.mkdir()
+            backup.mkdir()
+            run.mkdir()
+            for stem in ("picked-again", "protected-only"):
+                (source / f"{stem}.ARW").write_bytes(stem.encode())
+                _write_xmp(backup / f"{stem}.xmp", good="True")
+            _write_manifest(
+                run,
+                source,
+                [("picked-again", "pick"), ("protected-only", "reject")],
+            )
+
+            selected = select_feedback_picks(
+                run,
+                backup,
+                source,
+                include_existing_picks=False,
+                ignore_baseline_picks=True,
+            )
+
+            self.assertEqual(
+                [asset.filename for asset in selected],
+                ["picked-again.ARW"],
+            )
+
     def test_runs_resumable_render_feedback_loop_without_touching_original(self) -> None:
         with TemporaryDirectory() as tmp_dir:
             root = Path(tmp_dir)
@@ -212,7 +302,7 @@ class EditFeedbackPilotTests(unittest.TestCase):
             self.assertTrue((stage / "final/machine.jpg").is_file())
             payload = json.loads(result.manifest_path.read_text(encoding="utf-8"))
             self.assertFalse(payload["originals_modified"])
-            self.assertEqual(payload["schema_version"], 2)
+            self.assertEqual(payload["schema_version"], 3)
             self.assertEqual(payload["suggestion_batch_size"], 1)
             self.assertEqual(payload["review_batch_size"], 1)
             self.assertEqual(payload["maximum_refinements"], 1)
@@ -238,6 +328,120 @@ class EditFeedbackPilotTests(unittest.TestCase):
                 command_runner=runner,
             )
             self.assertEqual(resumed.refined, 1)
+
+    def test_exports_validated_feedback_as_resumable_delivery_jpeg(self) -> None:
+        with TemporaryDirectory() as tmp_dir:
+            root = Path(tmp_dir)
+            source = root / "source"
+            backup = root / "backup"
+            run = root / "run"
+            stage = root / "stage"
+            delivery = root / "delivery"
+            source.mkdir()
+            backup.mkdir()
+            run.mkdir()
+            raw = source / "protected.ARW"
+            raw.write_bytes(b"original-raw")
+            _write_xmp(backup / "protected.xmp", good="True")
+            _write_manifest(run, source, [("protected", "reject")])
+            binary = root / "RapidRAW"
+            binary.write_bytes(b"#!/bin/sh\n")
+            binary.chmod(0o755)
+            assets = select_feedback_picks(
+                run,
+                backup,
+                source,
+                include_existing_picks=True,
+            )
+
+            def pilot_runner(command: list[str]) -> subprocess.CompletedProcess[str]:
+                output = Path(command[command.index("--output") + 1])
+                Image.new("RGB", (32, 24), "gray").save(output)
+                return subprocess.CompletedProcess(command, 0, "ok", "")
+
+            pilot = run_feedback_pilot(
+                assets,
+                stage,
+                binary,
+                _FakeBackend(),
+                prompt="Natural edits",
+                model="qwen",
+                cull_run=run,
+                human_baseline=backup,
+                selection_scope="protected-and-machine-picks",
+                command_runner=pilot_runner,
+            )
+            commands: list[list[str]] = []
+
+            def export_runner(command: list[str]) -> subprocess.CompletedProcess[str]:
+                commands.append(command)
+                output = Path(command[command.index("--output") + 1])
+                Image.new("RGB", (32, 24), "green").save(output)
+                return subprocess.CompletedProcess(command, 0, "ok", "")
+
+            result = export_feedback_stage(
+                pilot.root,
+                binary,
+                delivery,
+                quality=95,
+                keep_metadata=True,
+                command_runner=export_runner,
+            )
+
+            self.assertEqual(result.photos, 1)
+            self.assertEqual(result.exported, 1)
+            self.assertEqual(result.resumed, 0)
+            self.assertEqual([path.name for path in delivery.iterdir()], ["protected.jpg"])
+            self.assertIn("--keep-metadata", commands[0])
+            self.assertEqual(commands[0][commands[0].index("--quality") + 1], "95")
+            manifest = json.loads(result.manifest_path.read_text(encoding="utf-8"))
+            self.assertEqual(manifest["mode"], "unattended")
+            self.assertEqual(manifest["records"][0]["selection"], "protected-existing-pick")
+            self.assertEqual(manifest["records"][0]["status"], "exported")
+            self.assertTrue(manifest["records"][0]["sha256"])
+            self.assertEqual(manifest["photos"], 1)
+            self.assertEqual(manifest["completed_photos"], 1)
+
+            resumed = export_feedback_stage(
+                pilot.root,
+                binary,
+                delivery,
+                quality=95,
+                keep_metadata=True,
+                command_runner=export_runner,
+            )
+            self.assertEqual(resumed.exported, 0)
+            self.assertEqual(resumed.resumed, 1)
+            self.assertEqual(len(commands), 1)
+
+            with self.assertRaisesRegex(ValueError, "outside the source"):
+                export_feedback_stage(
+                    pilot.root,
+                    binary,
+                    source / "OUTPUT",
+                    command_runner=export_runner,
+                )
+
+    def test_feedback_export_rejects_incomplete_validation(self) -> None:
+        with TemporaryDirectory() as tmp_dir:
+            root = Path(tmp_dir)
+            stage = root / "stage"
+            stage.mkdir()
+            (stage / "feedback-manifest.json").write_text(
+                json.dumps(
+                    {
+                        "kind": "cull-sh-rendered-edit-feedback-pilot",
+                        "records": [{"id": "pilot-0001", "filename": "frame.ARW"}],
+                    }
+                ),
+                encoding="utf-8",
+            )
+            binary = root / "RapidRAW"
+            binary.write_bytes(b"#!/bin/sh\n")
+            binary.chmod(0o755)
+
+            with self.assertRaisesRegex(ValueError, "is incomplete"):
+                export_feedback_stage(stage, binary, root / "delivery")
 
 
 def _write_manifest(

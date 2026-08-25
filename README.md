@@ -306,8 +306,18 @@ python main.py rapidraw-feedback-pilot \
   --cull-run runs/<frozen-cull-run> \
   --human-baseline "/path/to/pre-application-xmp-backup" \
   --output "/path/to/new-or-resumable-feedback-stage" \
+  --include-existing-picks \
   --with-crop
 ```
+
+By default the pilot retains its historical machine-added-picks-only scope.
+`--include-existing-picks` selects the union of protected picks in the baseline
+and new picks in the frozen cull manifest. It fails rather than silently omit a
+protected pick that is absent from the manifest. For a clean automated-versus-
+human experiment, use `--frozen-machine-picks` instead: every frozen manifest
+pick is included and all pre-existing flags are ignored, preventing prior human
+judgment from leaking into the automated arm. The two flags are mutually
+exclusive.
 
 For each selected RAW, RapidRAW first creates a neutral baseline render. Qwen
 suggests a structured recipe from that renderer-consistent baseline, RapidRAW
@@ -326,6 +336,27 @@ by side and records a human preference locally.
 The stage is resumable and never writes the source RAW/XMP files. Normalized
 crop suggestions are converted to the full-resolution pixel coordinates used by
 RapidRAW's headless export path, and implausibly small crop renders fail fast.
+
+For an explicitly unattended experiment, export every completed Qwen-validated
+recipe into a separate delivery folder:
+
+```bash
+python main.py rapidraw-feedback-export \
+  --stage "/path/to/completed-feedback-stage" \
+  --output "/path/to/delivery-jpegs" \
+  --quality 95 \
+  --keep-metadata \
+  --unattended
+```
+
+The delivery folder contains JPEGs only. Export provenance and resumable state
+remain in `feedback-export.json` inside the isolated stage. The exporter refuses
+incomplete validation records, a source-photo folder as its destination, changed
+completed JPEGs, or a non-empty output folder that it does not own. The explicit
+`--unattended` acknowledgement is required because Qwen's rendered-edit verdict
+replaces human approval in this mode. RapidRAW 1.6.1 retains supported EXIF such
+as camera and capture time, but its current `--keep-metadata` path does not retain
+GPS coordinates.
 
 `--limit` now applies after whole-folder scene grouping, so `--limit 24` means
 "process the first 24 scenes" rather than "stop after 24 files".
