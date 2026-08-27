@@ -813,9 +813,11 @@ def _parse_edit_review_payload(
     pairs: list[EditReviewPair],
 ) -> OllamaBatchEditReviewPayload:
     content = _message_content(payload)
+    parsed_object = _load_json_object(content)
+    _fill_unchanged_edit_review_fields(parsed_object, pairs)
     try:
         parsed = OllamaBatchEditReviewPayload.model_validate(
-            _load_json_object(content)
+            parsed_object
         )
     except ValidationError as exc:
         raise VisionBackendError(
@@ -841,6 +843,48 @@ def _parse_edit_review_payload(
                 "ollama edit review did not include the expected filenames"
             )
     return parsed
+
+
+def _fill_unchanged_edit_review_fields(
+    payload: dict[str, object],
+    pairs: list[EditReviewPair],
+) -> None:
+    """Fill deterministic fields omitted by abbreviated accept/reject reviews.
+
+    The final recipe for ``accept`` and ``reject`` is selected locally from the
+    known current edit or neutral baseline. A ``refine`` response still has to
+    provide every absolute recipe field so the bounded-refinement guard can
+    validate the model's requested changes.
+    """
+    reviews = payload.get("reviews")
+    if not isinstance(reviews, list):
+        return
+    pairs_by_id = {
+        _preview_id(index): pair for index, pair in enumerate(pairs, start=1)
+    }
+    for review in reviews:
+        if not isinstance(review, dict):
+            continue
+        verdict = review.get("verdict")
+        if verdict not in {"accept", "reject"}:
+            continue
+        pair = pairs_by_id.get(str(review.get("id", "")))
+        if pair is None:
+            continue
+        fallback = (
+            pair.suggestion
+            if verdict == "accept"
+            else EditSuggestion(
+                filename=pair.asset.filename,
+                asset_id=pair.asset.raw_path.as_posix(),
+            )
+        )
+        review.setdefault("filename", pair.asset.filename)
+        comment = review.get("comment")
+        if "summary" not in review and isinstance(comment, str):
+            review["summary"] = comment
+        for key, value in _edit_payload(fallback).items():
+            review.setdefault(key, value)
 
 
 def _edit_payload(suggestion: EditSuggestion) -> dict[str, object]:

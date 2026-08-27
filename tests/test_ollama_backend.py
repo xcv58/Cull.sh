@@ -225,6 +225,88 @@ class OllamaBackendTests(unittest.TestCase):
             ["Use a tighter subject mask."],
         )
 
+    def test_review_accept_fills_abbreviated_unchanged_recipe(self) -> None:
+        backend = OllamaVisionBackend(
+            base_url="http://localhost:11434",
+            model="qwen",
+            timeout_seconds=300.0,
+            max_attempts=1,
+        )
+        preview = _build_preview("frame.ARW")
+        suggestion = EditSuggestion(
+            filename="frame.ARW",
+            asset_id=preview.asset.raw_path.as_posix(),
+            exposure=0.3,
+            contrast=12,
+            vibrance=8,
+            has_crop=True,
+            crop_right=0.9,
+        )
+        pair = EditReviewPair(
+            asset=preview.asset,
+            baseline_bytes=b"baseline",
+            edited_bytes=b"edited",
+            suggestion=suggestion,
+        )
+        response = MagicMock()
+        response.raise_for_status.return_value = None
+        response.json.return_value = {
+            "message": {
+                "content": (
+                    '{"reviews":[{"id":"image-1","verdict":"accept",'
+                    '"comment":"The rendered edit is a natural improvement.",'
+                    '"additional_edits":["Inspect sharpening at full resolution."]}]}'
+                )
+            }
+        }
+        fake_client = MagicMock()
+        fake_client.__enter__.return_value = fake_client
+        fake_client.post.return_value = response
+
+        with patch("cull_sh.backends.ollama.httpx.Client", return_value=fake_client):
+            review = backend.review_edits("natural", [pair])[0]
+
+        self.assertEqual(review.verdict, EditReviewVerdict.ACCEPT)
+        self.assertEqual(review.final_suggestion, suggestion)
+        self.assertEqual(
+            review.summary,
+            "The rendered edit is a natural improvement.",
+        )
+
+    def test_review_refine_does_not_fill_abbreviated_recipe(self) -> None:
+        backend = OllamaVisionBackend(
+            base_url="http://localhost:11434",
+            model="qwen",
+            timeout_seconds=300.0,
+            max_attempts=1,
+        )
+        preview = _build_preview("frame.ARW")
+        pair = EditReviewPair(
+            asset=preview.asset,
+            baseline_bytes=b"baseline",
+            edited_bytes=b"edited",
+            suggestion=EditSuggestion(filename="frame.ARW", exposure=0.3),
+        )
+        response = MagicMock()
+        response.raise_for_status.return_value = None
+        response.json.return_value = {
+            "message": {
+                "content": (
+                    '{"reviews":[{"id":"image-1","verdict":"refine",'
+                    '"comment":"Reduce the contrast slightly."}]}'
+                )
+            }
+        }
+        fake_client = MagicMock()
+        fake_client.__enter__.return_value = fake_client
+        fake_client.post.return_value = response
+
+        with patch("cull_sh.backends.ollama.httpx.Client", return_value=fake_client):
+            with self.assertRaisesRegex(
+                VisionBackendError, "invalid structured edit review"
+            ):
+                backend.review_edits("natural", [pair])
+
     def test_production_backend_defaults_to_qwen_thinking_and_one_attempt(self) -> None:
         backend = build_backend(BackendConfig())
 
