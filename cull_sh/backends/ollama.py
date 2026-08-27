@@ -814,6 +814,7 @@ def _parse_edit_review_payload(
 ) -> OllamaBatchEditReviewPayload:
     content = _message_content(payload)
     parsed_object = _load_json_object(content)
+    _flatten_nested_edit_review_fields(parsed_object, pairs)
     _fill_unchanged_edit_review_fields(parsed_object, pairs)
     try:
         parsed = OllamaBatchEditReviewPayload.model_validate(
@@ -843,6 +844,46 @@ def _parse_edit_review_payload(
                 "ollama edit review did not include the expected filenames"
             )
     return parsed
+
+
+def _flatten_nested_edit_review_fields(
+    payload: dict[str, object],
+    pairs: list[EditReviewPair],
+) -> None:
+    """Accept a complete nested absolute recipe without inventing refinements."""
+    reviews = payload.get("reviews")
+    if not isinstance(reviews, list):
+        return
+    pairs_by_id = {
+        _preview_id(index): pair for index, pair in enumerate(pairs, start=1)
+    }
+    for review in reviews:
+        if not isinstance(review, dict) or "final_adjustments" not in review:
+            continue
+        adjustments = review["final_adjustments"]
+        if not isinstance(adjustments, dict):
+            raise VisionBackendError("nested final_adjustments must be an object")
+        pair = pairs_by_id.get(str(review.get("id", "")))
+        if pair is None:
+            continue
+        recipe_fields = set(_edit_payload(pair.suggestion))
+        required = recipe_fields - {"additional_edits"}
+        missing = required - adjustments.keys()
+        if missing:
+            raise VisionBackendError(
+                "nested final_adjustments is missing absolute recipe fields: "
+                + ", ".join(sorted(missing))
+            )
+        for key in recipe_fields & adjustments.keys():
+            if key in review and review[key] != adjustments[key]:
+                raise VisionBackendError(
+                    f"conflicting nested edit review field: {key}"
+                )
+            review[key] = adjustments[key]
+        review.setdefault("filename", pair.asset.filename)
+        rationale = review.get("rationale")
+        if "summary" not in review and isinstance(rationale, str):
+            review["summary"] = rationale
 
 
 def _fill_unchanged_edit_review_fields(

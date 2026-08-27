@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from io import BytesIO
+import json
 from pathlib import Path
 import unittest
 from unittest.mock import MagicMock
@@ -15,6 +16,8 @@ from cull_sh.backends.ollama import OllamaVisionBackend
 from cull_sh.backends.ollama import _image_boundary_facts
 from cull_sh.backends.ollama import _parse_batch_payload
 from cull_sh.backends.ollama import _parse_edit_payload
+from cull_sh.backends.ollama import _parse_edit_review_payload
+from cull_sh.backends.ollama import _edit_payload
 from cull_sh.backends.ollama import _normalize_label
 from cull_sh.config import BackendConfig
 from cull_sh.config import DEFAULT_PRODUCTION_MODEL
@@ -306,6 +309,47 @@ class OllamaBackendTests(unittest.TestCase):
                 VisionBackendError, "invalid structured edit review"
             ):
                 backend.review_edits("natural", [pair])
+
+    def test_review_flattens_complete_nested_absolute_refinement(self) -> None:
+        preview = _build_preview("frame.ARW")
+        pair = EditReviewPair(
+            asset=preview.asset,
+            baseline_bytes=b"baseline",
+            edited_bytes=b"edited",
+            suggestion=EditSuggestion(filename="frame.ARW", exposure=0.3),
+        )
+        adjustments = _edit_payload(
+            EditSuggestion(filename="frame.ARW", exposure=0.2, contrast=10)
+        )
+        adjustments.pop("additional_edits")
+        review = {
+            "id": "image-1",
+            "verdict": "refine",
+            "rationale": "Reduce the clipped lighting slightly.",
+            "final_adjustments": adjustments,
+            "additional_edits": ["Inspect the dark sky at full resolution."],
+        }
+        parsed = _parse_edit_review_payload(
+            {"message": {"content": json.dumps({"reviews": [review]})}}, [pair]
+        ).reviews[0]
+        self.assertEqual(parsed.filename, "frame.ARW")
+        self.assertEqual(parsed.exposure, 0.2)
+        self.assertEqual(parsed.contrast, 10)
+        self.assertEqual(parsed.summary, "Reduce the clipped lighting slightly.")
+        self.assertEqual(
+            parsed.additional_edits, ["Inspect the dark sky at full resolution."]
+        )
+
+        for invalid, expected_error in (
+            ({**review, "final_adjustments": {"exposure": 0.2}}, "missing absolute"),
+            ({**review, "exposure": 0.8}, "conflicting nested"),
+        ):
+            with self.subTest(expected_error=expected_error):
+                with self.assertRaisesRegex(VisionBackendError, expected_error):
+                    _parse_edit_review_payload(
+                        {"message": {"content": json.dumps({"reviews": [invalid]})}},
+                        [pair],
+                    )
 
     def test_production_backend_defaults_to_qwen_thinking_and_one_attempt(self) -> None:
         backend = build_backend(BackendConfig())
