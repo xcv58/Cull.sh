@@ -3,14 +3,20 @@
 ## Current development iteration — August 28
 
 - Branch: `codex/sentosa-unattended-quality`, based on `codex/topiq-qwen-rapidraw`.
-- Regression suite: 167 passed, including four subtests; installed-app control
-  tests also passed. The photographic quality evaluation is still running.
+- Regression suite: 171 passed plus four subtests; installed-app control
+  tests also passed. The twelve-photo pilot finished: ten passed and two failed
+  final quality checks for darkening (DSC03797 and DSC03806). No delivery export
+  was authorized by that original pilot.
 - Renderer semantics, final-pixel validation, experimental calibrated baselines,
   straightening evidence, cautious local rejects, and post-selection duplicate
   handling are implemented. See [quality validation](docs/unattended-quality-validation.md).
 - Frozen Sentosa source/human/first-machine artifacts remain untouched.
-- Live progress is in `runs/sentosa-quality-v2/pilot-v2/status.json`; the full
-  389-photo selection stage is `runs/sentosa-quality-v2/album`.
+- The parent `runs/sentosa-quality-v2/pilot-v2` is preserved. User-authorized
+  two-photo correction progress is in `pilot-v2-correction-1/status.json`, using
+  the explicit `cull_sh.feedback_correction` workflow. Ten passed records are
+  copied unchanged; only two failed photos get a correction and new final check.
+  The full 389-photo selection stage remains prepared with zero decisions in
+  `runs/sentosa-quality-v2/album`; no automatic album continuation is enabled.
 - Runtime recovery preserves six completed reviews after a worker reset and a
   reproduced oversized-request error. Resume this job with `--context-tokens
   65536`; bounded overviews leave full-resolution renders and native detail

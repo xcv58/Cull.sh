@@ -122,6 +122,39 @@ is not established by the available macOS diagnostics. See the ignored run-local
 
 ## Sentosa development run, August 28
 
+### Explicit correction after a failed final quality check
+
+The completed `pilot-v2` has twelve final renders/checks: ten passed, while
+DSC03797 and DSC03806 failed for excessive daylight darkening. Calibrated
+brightness was reduced from 0.5 to 0.3 and from 1.0 to 0.5 respectively. In the
+latter case, the first recipe reset brightness to zero, and the ordinary
+half-stop refinement limit could not restore 1.0 in one step. This is development
+evidence of imperfect recipe reasoning and bounded repair, not a renderer crash.
+
+`cull_sh.feedback_correction` supports a separately authorized development
+experiment. It checks parent/source hashes and renderer provenance, copies the
+stage into a separate tree, and preserves all passed recipes, pixels and final
+checks. Only failed records get a new ordinary correction request. The old
+failed record and parent manifest hash remain in the new manifest. Final checks
+use the original prompt, without the correction guidance or prior diagnosis.
+There is no automatic recursive correction; a failed new check remains failed
+on resume, and blocks the entire pilot export as before.
+
+```bash
+.venv/bin/python -m cull_sh.feedback_correction \
+  --parent-stage runs/sentosa-quality-v2/pilot-v2/stage \
+  --output runs/sentosa-quality-v2/pilot-v2-correction-1 \
+  --binary /Users/yihong/Applications/RapidRAW.app/Contents/MacOS/RapidRAW \
+  --context-tokens 65536 --reason 'Explicitly authorized diagnosis and correction'
+```
+
+The reason is part of the resume identity; use the exact original command when
+resuming an interrupted correction. Do not launch this example over an existing
+experiment with a different reason. This command never starts album selection.
+It does not change the default production prompt or remove refinement limits.
+Improvement on these selected failures cannot be reported as an unbiased
+benchmark or as a fully unattended success.
+
 - Work branch: `codex/sentosa-unattended-quality`.
 - Inputs: 389 hash-verified isolated RAWs from the original blind experiment.
 - Full selection prepared as 90 chronological cohorts in
