@@ -1,5 +1,4 @@
-from cull_sh.backends.base import VisionBackend
-from cull_sh.backends.base import VisionBackendError
+from cull_sh.backends.base import VisionBackend, VisionBackendError
 from cull_sh.backends.ollama import OllamaVisionBackend
 from cull_sh.config import BackendConfig
 
@@ -14,6 +13,7 @@ def build_backend(config: BackendConfig) -> VisionBackend:
             max_attempts=config.max_attempts,
             think=config.think,
             max_output_tokens=config.max_output_tokens,
+            context_tokens=config.context_tokens,
         )
     raise ValueError(f"unsupported backend provider: {config.provider}")
 

@@ -7,6 +7,43 @@ from pathlib import Path
 import numpy as np
 from PIL import Image, ImageCms, ImageDraw
 
+IMAGE_TRANSPORT_POLICY = "overview-4mp-native-detail-v1"
+
+
+def model_image_bytes(data: bytes) -> bytes:
+    """Bound request size; never replace the full-resolution render on disk.
+
+    Small images (including native-pixel detail sheets) pass through unchanged.
+    Large overviews are bounded to 4 MP, 2560 pixels per edge, and 4 MiB JPEG.
+    """
+    max_pixels, max_edge, max_bytes = 4_000_000, 2560, 4 * 1024 * 1024
+    with Image.open(BytesIO(data)) as image:
+        width, height = image.size
+        if (
+            width * height <= max_pixels
+            and max(width, height) <= max_edge
+            and len(data) <= max_bytes
+        ):
+            return data
+        scale = min(
+            1.0, max_edge / max(width, height), math.sqrt(max_pixels / (width * height))
+        )
+        target = (max(1, int(width * scale)), max(1, int(height * scale)))
+        image = image.convert("RGB").resize(target, Image.Resampling.LANCZOS)
+        for quality in (90, 85, 80):
+            output = BytesIO()
+            image.save(
+                output,
+                format="JPEG",
+                quality=quality,
+                icc_profile=image.info.get("icc_profile"),
+            )
+            encoded = output.getvalue()
+            if len(encoded) <= max_bytes:
+                return encoded
+    raise ValueError("image exceeds the bounded vision transport size")
+
+
 CONTROL_GUIDANCE = (
     "RapidRAW control semantics (not Lightroom slider values):\n"
     "- exposure: linear RAW EV; brightness: perceptual/filmic exposure.\n"

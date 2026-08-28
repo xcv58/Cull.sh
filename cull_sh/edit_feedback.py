@@ -159,6 +159,7 @@ def run_feedback_pilot(
     selection_scope: str = "machine-picks-only",
     quality: int = 88,
     baseline_mode: str = "neutral",
+    context_change_reason: str | None = None,
     progress: ProgressCallback | None = None,
     command_runner: CommandRunner | None = None,
 ) -> FeedbackPilotResult:
@@ -206,6 +207,36 @@ def run_feedback_pilot(
             raise ValueError(f"feedback stage has different {key}; use a new stage")
         manifest[key] = value
     records = _records(manifest)
+    context_tokens = getattr(backend, "context_tokens", None)
+    old_context = manifest.get("runtime_context_tokens")
+    if old_context != context_tokens:
+        completed = sum("initial_suggestion" in r for r in records)
+        if completed and not context_change_reason:
+            raise ValueError("context allocation changed; an explicit recovery reason is required")
+        manifest.setdefault("runtime_recoveries", []).append({
+            "at": datetime.now(timezone.utc).isoformat(),
+            "previous_context_tokens": old_context,
+            "context_tokens": context_tokens,
+            "reason": context_change_reason or "initial explicit context allocation",
+            "retained_suggestions": completed,
+            "retained_reviews": sum("review" in r for r in records),
+        })
+    manifest["runtime_context_tokens"] = context_tokens
+    transport = getattr(backend, 'image_transport_policy', None)
+    old_transport = manifest.get('runtime_image_transport_policy')
+    if old_transport != transport:
+        completed = sum('initial_suggestion' in r for r in records)
+        if completed and not context_change_reason:
+            raise ValueError('image transport changed; an explicit recovery reason is required')
+        manifest.setdefault('runtime_recoveries', []).append({
+            'at': datetime.now(timezone.utc).isoformat(),
+            'previous_image_transport_policy': old_transport,
+            'image_transport_policy': transport,
+            'reason': context_change_reason or 'initial bounded image transport',
+            'retained_suggestions': completed,
+            'retained_reviews': sum('review' in r for r in records),
+        })
+    manifest['runtime_image_transport_policy'] = transport
     _migrate_crop_coordinate_space(root, manifest_path, manifest, records)
 
     progress(f"Preparing {len(records)} isolated RAW copies and neutral renders.")
@@ -264,6 +295,8 @@ def run_feedback_pilot(
             if suggestion.filename != record["filename"]:
                 raise ValueError("edit backend returned mismatched filename")
             record["initial_suggestion"] = _suggestion_payload(suggestion)
+            record["initial_context_tokens"] = context_tokens
+            record["initial_image_transport_policy"] = transport
         _write_json(manifest_path, manifest)
 
     progress("Rendering the first-pass Qwen adjustments through RapidRAW.")
@@ -320,6 +353,8 @@ def run_feedback_pilot(
             record["review"] = {
                 "verdict": review.verdict.value,
                 "summary": review.summary,
+                "context_tokens": context_tokens,
+                "image_transport_policy": transport,
             }
             record["final_suggestion"] = _suggestion_payload(
                 review.final_suggestion
@@ -374,6 +409,8 @@ def run_feedback_pilot(
             raise ValueError("delivery validator returned mismatched result")
         review = reviews[0]
         record["delivery_validation"] = {
+            "context_tokens": context_tokens,
+            "image_transport_policy": transport,
             "policy": VALIDATION_POLICY,
             "status": "passed" if review.verdict.value == "accept" else "failed",
             "verdict": review.verdict.value, "summary": review.summary,

@@ -94,6 +94,32 @@ automatically edit/export the newly selected full album. Qwen keeps thinking
 enabled, one attempt, 4096 output tokens and a 600-second per-request timeout;
 there is no model fallback. A failure stops the job and leaves resumable records.
 
+### Explicit runtime recovery
+
+`--context-tokens 65536` caps Ollama's allocation for this job only, without
+changing its global settings, model or output budget. The general backend default
+remains unspecified. Overviews sent to the model are bounded to 4 megapixels,
+2560 pixels per edge and 4 MiB encoded JPEG; small images and native-pixel detail
+sheets pass through unchanged. Full-resolution stage and delivery files are not
+resized. The model is told that overview dimensions differ from source dimensions.
+
+When resuming saved model work with a changed context or transport policy, supply
+`--runtime-change-reason 'specific diagnosed reason'` (the older alias
+`--context-change-reason` is also accepted). The manifest records the transition
+and retained work counts; new review/check records identify the runtime settings.
+This is an explicit operational recovery, not an automatic retry or model fallback.
+Model, prompt, thinking, renderer and recipe changes remain separately guarded.
+Album context/transport settings may change after preparation only while it has
+no model decisions; once decisions exist they are fixed for that album stage.
+
+The August 28 recovery reproduced HTTP 413 on DSC03966: two 60 MP renders totaled
+approximately 120 MiB before base64. Bounded overviews plus the native patches
+reduced the image payload from about 160 MiB to 3.64 MiB. A fresh worker at 65536
+context also reduced the logged context allocation from 16533 to 4245 MiB.
+The original worker's connection reset is confirmed, but its precise exit cause
+is not established by the available macOS diagnostics. See the ignored run-local
+`pilot-v2/recovery-20260828` directory for preserved failure records and evidence.
+
 ## Sentosa development run, August 28
 
 - Work branch: `codex/sentosa-unattended-quality`.

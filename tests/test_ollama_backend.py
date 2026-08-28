@@ -33,6 +33,33 @@ from cull_sh.models import (
 
 
 class OllamaBackendTests(unittest.TestCase):
+    def test_scoped_context_limit_is_forwarded_without_changing_default(self):
+        backend = build_backend(BackendConfig(context_tokens=65536, max_output_tokens=4096))
+        client = MagicMock()
+        client.post.return_value.json.return_value = {'prompt_eval_count': 13000}
+        payload = {'options': {'num_predict': 4096}}
+        backend._chat_structured(client, payload, lambda result: result)
+        self.assertEqual(client.post.call_args.kwargs['json']['options'], {'num_predict': 4096, 'num_ctx': 65536})
+        self.assertIsNone(build_backend(BackendConfig()).context_tokens)
+        self.assertTrue(backend.think)
+        self.assertEqual(backend.max_attempts, 1)
+
+    def test_context_headroom_and_server_error_are_fail_fast(self):
+        backend = build_backend(BackendConfig(context_tokens=65536, max_output_tokens=4096))
+        client = MagicMock()
+        client.post.return_value.json.return_value = {'prompt_eval_count': 64000}
+        with self.assertRaisesRegex(VisionBackendError, 'insufficient headroom'):
+            backend._chat_structured(client, {}, lambda result: result)
+        self.assertEqual(client.post.call_count, 1)
+        response = httpx.Response(500, json={'error': 'runner connection reset'}, request=httpx.Request('POST', 'http://localhost/api/chat'))
+        client = MagicMock()
+        client.post.return_value = response
+        with self.assertRaisesRegex(VisionBackendError, 'runner connection reset.*1 attempt'):
+            backend._chat_structured(client, {}, lambda result: result)
+        self.assertEqual(client.post.call_count, 1)
+        with self.assertRaises(ValueError):
+            build_backend(BackendConfig(context_tokens=4096, max_output_tokens=4096))
+
     def test_edit_prompt_preserves_starting_recipe_without_zero_noop_conflict(self):
         backend = OllamaVisionBackend(base_url='http://localhost:11434', model='qwen')
         preview = _build_preview('frame.ARW')

@@ -159,6 +159,7 @@ def write_run_config(run_dir: Path, config: PipelineConfig) -> Path:
         "backend_think": config.backend.think,
         "backend_fail_fast": config.backend.fail_fast,
         "backend_max_output_tokens": config.backend.max_output_tokens,
+        "backend_context_tokens": config.backend.context_tokens,
         "batch_size": config.batch_size,
         "extract_workers": config.extract_workers,
         "score_workers": config.score_workers,

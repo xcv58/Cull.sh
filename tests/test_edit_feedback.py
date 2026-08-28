@@ -209,6 +209,38 @@ class EditFeedbackPilotTests(unittest.TestCase):
             with self.assertRaisesRegex(ValueError,'different prompt'):
                 run_feedback_pilot(*args,**{**kwargs,'prompt':'new style'})
 
+    def test_context_recovery_is_explicit_and_preserves_completed_work(self):
+        with TemporaryDirectory() as tmp:
+            args,kwargs=self._new_stage(Path(tmp))
+            result=run_feedback_pilot(*args,**kwargs)
+            before=json.loads(result.manifest_path.read_text())
+            resumed_backend=_FailIfCalledBackend()
+            resumed_backend.context_tokens=65536
+            resumed=(*args[:3],resumed_backend)
+            with self.assertRaisesRegex(ValueError,'explicit recovery reason'):
+                run_feedback_pilot(*resumed,**kwargs)
+            run_feedback_pilot(*resumed,**kwargs,context_change_reason='Bound oversized server default after worker loss.')
+            after=json.loads(result.manifest_path.read_text())
+            self.assertEqual(before['records'],after['records'])
+            self.assertEqual(after['runtime_context_tokens'],65536)
+            self.assertEqual(after['runtime_recoveries'][-1]['retained_reviews'],1)
+
+    def test_image_transport_recovery_requires_reason_and_preserves_results(self):
+        with TemporaryDirectory() as tmp:
+            args,kwargs=self._new_stage(Path(tmp))
+            result=run_feedback_pilot(*args,**kwargs)
+            before=json.loads(result.manifest_path.read_text())
+            backend=_FailIfCalledBackend()
+            backend.image_transport_policy='bounded-overviews-test'
+            resumed=(*args[:3],backend)
+            with self.assertRaisesRegex(ValueError,'image transport changed'):
+                run_feedback_pilot(*resumed,**kwargs)
+            run_feedback_pilot(*resumed,**kwargs,context_change_reason='Recover from request size rejection.')
+            after=json.loads(result.manifest_path.read_text())
+            self.assertEqual(before['records'],after['records'])
+            self.assertEqual(after['runtime_image_transport_policy'],'bounded-overviews-test')
+
+
     def test_changed_renderer_preferences_block_export(self):
         with TemporaryDirectory() as tmp:
             root=Path(tmp)

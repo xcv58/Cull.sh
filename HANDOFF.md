@@ -3,7 +3,7 @@
 ## Current development iteration — August 28
 
 - Branch: `codex/sentosa-unattended-quality`, based on `codex/topiq-qwen-rapidraw`.
-- Regression suite: 160 passed, including four subtests; installed-app control
+- Regression suite: 167 passed, including four subtests; installed-app control
   tests also passed. The photographic quality evaluation is still running.
 - Renderer semantics, final-pixel validation, experimental calibrated baselines,
   straightening evidence, cautious local rejects, and post-selection duplicate
@@ -11,6 +11,10 @@
 - Frozen Sentosa source/human/first-machine artifacts remain untouched.
 - Live progress is in `runs/sentosa-quality-v2/pilot-v2/status.json`; the full
   389-photo selection stage is `runs/sentosa-quality-v2/album`.
+- Runtime recovery preserves six completed reviews after a worker reset and a
+  reproduced oversized-request error. Resume this job with `--context-tokens
+  65536`; bounded overviews leave full-resolution renders and native detail
+  patches intact. Prior failures and runtime transitions are recorded in the run.
 - Keep Qwen thinking/one-attempt/no-fallback and existing TOPIQ ranking unchanged.
 - Do not call Sentosa tuning an independent benchmark or claim Lightroom parity.
 

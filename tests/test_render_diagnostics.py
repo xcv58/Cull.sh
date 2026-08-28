@@ -12,6 +12,7 @@ from cull_sh.render_diagnostics import (
     detail_sheet,
     image_diagnostics,
     leveling_evidence,
+    model_image_bytes,
     tag_srgb_jpeg,
 )
 
@@ -23,6 +24,25 @@ def jpeg(image):
 
 
 class RenderDiagnosticsTests(unittest.TestCase):
+    def test_transport_bounds_overview_size_and_leaves_input_unchanged(self):
+        source = Image.fromarray(
+            np.random.default_rng(7).integers(0, 256, (2100, 3100, 3), dtype=np.uint8)
+        )
+        original = jpeg(source)
+        encoded = model_image_bytes(original)
+        with Image.open(BytesIO(encoded)) as image:
+            self.assertLessEqual(image.width * image.height, 4_000_000)
+            self.assertLessEqual(max(image.size), 2560)
+            self.assertAlmostEqual(image.width / image.height, 3100 / 2100, places=2)
+        self.assertLessEqual(len(encoded), 4 * 1024 * 1024)
+        with Image.open(BytesIO(original)) as image:
+            self.assertEqual(image.size, (3100, 2100))
+
+    def test_native_detail_sheet_passes_transport_without_recompression(self):
+        original = jpeg(Image.new("RGB", (1600, 1200), "gray"))
+        sheet = detail_sheet(original)
+        self.assertEqual(model_image_bytes(sheet), sheet)
+
     def test_vignette_sign_not_inverted_by_adapter(self):
         for value in [-10, 0, 10]:
             self.assertEqual(

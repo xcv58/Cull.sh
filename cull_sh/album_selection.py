@@ -165,6 +165,8 @@ def run_album_selection(
         "model": getattr(backend, "model", "test"),
         "think": getattr(backend, "think", True),
         "max_output_tokens": getattr(backend, "max_output_tokens", 4096),
+        "context_tokens": getattr(backend, "context_tokens", None),
+        "image_transport_policy": getattr(backend, "image_transport_policy", None),
     }
     checkpoint = output / "album-state.json"
     if output.exists() and any(output.iterdir()) and not checkpoint.is_file():
@@ -175,6 +177,12 @@ def run_album_selection(
         if checkpoint.is_file()
         else {"config": expected, "decisions": {}, "status": "running"}
     )
+    state["config"].setdefault("context_tokens", None)
+    state["config"].setdefault("image_transport_policy", None)
+    # Preparation made no model decisions, so its runtime allocation can change.
+    if not state["decisions"]:
+        state["config"]["context_tokens"] = expected["context_tokens"]
+        state["config"]["image_transport_policy"] = expected["image_transport_policy"]
     if state["config"] != expected:
         raise ValueError("album resume configuration changed; use a new stage")
     state["status"] = "running"
@@ -329,13 +337,20 @@ def main():
     for arg in ["frozen-run", "source", "output", "raw-checksums"]:
         parser.add_argument("--" + arg, type=Path, required=True)
     parser.add_argument("--batch-size", type=int, default=6)
+    parser.add_argument("--context-tokens", type=int, default=None)
     parser.add_argument(
         "--prepare-only",
         action="store_true",
         help="Verify RAW hashes and cache previews without calling the model.",
     )
     args = parser.parse_args()
-    backend = build_backend(BackendConfig(max_output_tokens=4096, timeout_seconds=600))
+    backend = build_backend(
+        BackendConfig(
+            max_output_tokens=4096,
+            timeout_seconds=600,
+            context_tokens=args.context_tokens,
+        )
+    )
     result = run_album_selection(
         args.frozen_run,
         args.source,

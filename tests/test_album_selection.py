@@ -43,6 +43,21 @@ class Extractor:
 
 
 class AlbumSelectionTests(unittest.TestCase):
+    def test_context_can_change_after_preparation_but_not_after_decisions(self):
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            source, frozen, _, hashes = self.fixtures(root)
+            backend = Backend()
+            run_album_selection(frozen, source, root / 'album', hashes, backend,
+                                extractor=Extractor(), progress=lambda _: None, prepare_only=True)
+            backend.context_tokens = 65536
+            run_album_selection(frozen, source, root / 'album', hashes, backend,
+                                extractor=Extractor(), progress=lambda _: None)
+            backend.context_tokens = 32768
+            with self.assertRaisesRegex(ValueError, 'configuration changed'):
+                run_album_selection(frozen, source, root / 'album', hashes, backend,
+                                    extractor=Extractor(), progress=lambda _: None)
+
     def test_preparation_does_not_call_model_and_can_resume(self):
         with TemporaryDirectory() as tmp:
             root = Path(tmp)

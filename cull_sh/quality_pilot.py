@@ -26,6 +26,13 @@ def main():
         help="After the pilot passes, run full unattended reselection here.",
     )
     parser.add_argument("--raw-checksums", type=Path)
+    parser.add_argument("--context-tokens", type=int, default=None)
+    parser.add_argument(
+        "--runtime-change-reason",
+        "--context-change-reason",
+        dest="context_change_reason",
+        help="Explicitly record a context/image-transport recovery while retaining completed work.",
+    )
     args = parser.parse_args()
     if args.album_output and not args.raw_checksums:
         parser.error("--album-output requires --raw-checksums")
@@ -47,14 +54,22 @@ def main():
     if args.raw_checksums:
         expected = load_raw_hashes(args.raw_checksums)
         for asset in assets:
-            with asset.raw_path.open('rb') as raw:
-                if file_digest(raw, 'sha256').hexdigest() != expected.get(asset.filename):
-                    raise ValueError(f'RAW differs from frozen checksum ledger: {asset.filename}')
+            with asset.raw_path.open("rb") as raw:
+                if file_digest(raw, "sha256").hexdigest() != expected.get(
+                    asset.filename
+                ):
+                    raise ValueError(
+                        f"RAW differs from frozen checksum ledger: {asset.filename}"
+                    )
     if root.exists() and any(root.iterdir()) and not (root / "status.json").is_file():
         raise ValueError("refusing nonempty untracked pilot output")
     root.mkdir(parents=True, exist_ok=True)
     backend_config = BackendConfig(
-        max_output_tokens=4096, timeout_seconds=600, think=True, max_attempts=1
+        max_output_tokens=4096,
+        timeout_seconds=600,
+        think=True,
+        max_attempts=1,
+        context_tokens=args.context_tokens,
     )
     backend = build_backend(backend_config)
     prompt = (
@@ -70,10 +85,21 @@ def main():
         "stems": sorted(args.stems),
         "source": str(source),
         "album_output": str(args.album_output.resolve()) if args.album_output else None,
+        "context_tokens": args.context_tokens,
         "status": "running",
         "started_at": datetime.now(timezone.utc).isoformat(),
     }
     status_path = root / "status.json"
+    if status_path.is_file():
+        previous = json.loads(status_path.read_text())
+        state["started_at"] = previous.get("started_at", state["started_at"])
+        state["attempt_history"] = previous.get("attempt_history", []) + [
+            {
+                key: previous.get(key)
+                for key in ("status", "error", "updated_at", "context_tokens")
+            }
+        ]
+        state["resumed_at"] = datetime.now(timezone.utc).isoformat()
     status_path.write_text(json.dumps(state, indent=2) + "\n")
     try:
         run_feedback_pilot(
@@ -87,6 +113,7 @@ def main():
             human_baseline=root / "unused-human-baseline",
             selection_scope="development-pilot",
             baseline_mode="camera-midtones-v1",
+            context_change_reason=args.context_change_reason,
             quality=95,
             progress=lambda msg: print(msg, flush=True),
         )

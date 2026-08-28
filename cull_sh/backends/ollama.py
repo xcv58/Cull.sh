@@ -27,9 +27,11 @@ from cull_sh.models import (
 from cull_sh.render_diagnostics import (
     CONTROL_GUIDANCE,
     DELIVERY_GUIDANCE,
+    IMAGE_TRANSPORT_POLICY,
     detail_sheet,
     image_diagnostics,
     leveling_evidence,
+    model_image_bytes,
 )
 
 T = TypeVar("T")
@@ -195,6 +197,7 @@ class OllamaBatchEditReviewPayload(BaseModel):
 
 class OllamaVisionBackend(VisionBackend):
     prompt_policy = "rapidraw-absolute-controls-v2"
+    image_transport_policy = IMAGE_TRANSPORT_POLICY
 
     """
     Local vision backend through Ollama.
@@ -213,6 +216,7 @@ class OllamaVisionBackend(VisionBackend):
         temperature: float = 0.0,
         think: bool | str | None = None,
         max_output_tokens: int = 1024,
+        context_tokens: int | None = None,
     ) -> None:
         self.base_url = base_url.rstrip("/")
         self.model = model
@@ -224,6 +228,9 @@ class OllamaVisionBackend(VisionBackend):
         if max_output_tokens < 1:
             raise ValueError("max_output_tokens must be at least 1")
         self.max_output_tokens = max_output_tokens
+        if context_tokens is not None and context_tokens <= max_output_tokens:
+            raise ValueError("context_tokens must leave room beyond the output token budget")
+        self.context_tokens = context_tokens
 
     def score_batch(
         self,
@@ -289,7 +296,7 @@ class OllamaVisionBackend(VisionBackend):
                     "filename": preview.asset.filename,
                 }
             )
-            encoded_images.append(base64.b64encode(preview.image_bytes).decode("ascii"))
+            encoded_images.append(base64.b64encode(model_image_bytes(preview.image_bytes)).decode("ascii"))
 
         request_payload = {
             "model": self.model,
@@ -450,7 +457,7 @@ class OllamaVisionBackend(VisionBackend):
                     "leveling_evidence": leveling_evidence(preview.image_bytes) if include_crop else None,
                 }
             )
-            encoded_images.append(base64.b64encode(preview.image_bytes).decode("ascii"))
+            encoded_images.append(base64.b64encode(model_image_bytes(preview.image_bytes)).decode("ascii"))
 
         system_crop_instruction = (
             " When composition fields are present in the schema, independently "
@@ -622,8 +629,8 @@ class OllamaVisionBackend(VisionBackend):
             )
             encoded_images.extend(
                 [
-                    base64.b64encode(pair.baseline_bytes).decode("ascii"),
-                    base64.b64encode(pair.edited_bytes).decode("ascii"),
+                    base64.b64encode(model_image_bytes(pair.baseline_bytes)).decode("ascii"),
+                    base64.b64encode(model_image_bytes(pair.edited_bytes)).decode("ascii"),
                     base64.b64encode(detail_sheet(pair.baseline_bytes)).decode("ascii"),
                     base64.b64encode(detail_sheet(pair.edited_bytes)).decode("ascii"),
                 ]
@@ -638,6 +645,9 @@ class OllamaVisionBackend(VisionBackend):
                         "You are independently validating real photo edit renders. Each record has exactly "
                         "four consecutive images: baseline, edited render, baseline native-pixel patch sheet, "
                         "then edited native-pixel patch sheet. Patch locations may differ after a crop; "
+                        "The first two images are bounded-resolution overviews for transport. "
+                        "Reported actual-pixel dimensions refer to the full-resolution source renders, "
+                        "not overview size. The patches retain native source-pixel scale. "
                         "compare equivalent content only. Return only valid JSON matching "
                         "the schema, with one review per record. Judge the rendered result rather than "
                         "defending the first recipe."
@@ -688,6 +698,8 @@ class OllamaVisionBackend(VisionBackend):
         request_payload: dict[str, object],
         parse_fn: Callable[[dict[str, object]], T],
     ) -> T:
+        if self.context_tokens is not None:
+            request_payload.setdefault("options", {})["num_ctx"] = self.context_tokens
         last_error: str | None = None
         for attempt in range(1, self.max_attempts + 1):
             try:
@@ -704,6 +716,12 @@ class OllamaVisionBackend(VisionBackend):
                 status_code = exc.response.status_code
                 if 500 <= status_code < 600:
                     last_error = f"ollama request failed with {status_code}"
+                    try:
+                        detail = exc.response.json().get("error")
+                    except (ValueError, AttributeError):
+                        detail = None
+                    if isinstance(detail, str) and detail.strip():
+                        last_error += ": " + " ".join(detail.split())[:500]
                 else:
                     raise VisionBackendError(f"ollama request failed: {exc}") from exc
             except httpx.HTTPError as exc:  # pragma: no cover - network/service dependent
@@ -711,6 +729,10 @@ class OllamaVisionBackend(VisionBackend):
             else:
                 try:
                     payload = response.json()
+                    prompt_tokens = payload.get("prompt_eval_count")
+                    if (self.context_tokens is not None and isinstance(prompt_tokens, int)
+                        and prompt_tokens + self.max_output_tokens >= self.context_tokens):
+                        raise VisionBackendError("context budget has insufficient headroom; refusing possibly truncated input")
                     return parse_fn(payload)
                 except VisionBackendError as exc:
                     last_error = str(exc)
