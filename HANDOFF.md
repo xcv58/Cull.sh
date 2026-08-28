@@ -1,5 +1,21 @@
 # Cull.sh Handoff
 
+## Current development iteration — August 28
+
+- Branch: `codex/sentosa-unattended-quality`, based on `codex/topiq-qwen-rapidraw`.
+- Regression suite: 160 passed, including four subtests; installed-app control
+  tests also passed. The photographic quality evaluation is still running.
+- Renderer semantics, final-pixel validation, experimental calibrated baselines,
+  straightening evidence, cautious local rejects, and post-selection duplicate
+  handling are implemented. See [quality validation](docs/unattended-quality-validation.md).
+- Frozen Sentosa source/human/first-machine artifacts remain untouched.
+- Live progress is in `runs/sentosa-quality-v2/pilot-v2/status.json`; the full
+  389-photo selection stage is `runs/sentosa-quality-v2/album`.
+- Keep Qwen thinking/one-attempt/no-fallback and existing TOPIQ ranking unchanged.
+- Do not call Sentosa tuning an independent benchmark or claim Lightroom parity.
+
+The foundation notes below describe the prior branch and historical results.
+
 ## Repository state
 
 - Foundation branch: `feat/ai-develop-edits`

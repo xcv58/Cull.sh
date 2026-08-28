@@ -1,31 +1,38 @@
 from __future__ import annotations
 
+import json
+import shutil
+import subprocess
 from collections.abc import Callable
-from dataclasses import asdict
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass
 from datetime import datetime, timezone
 from hashlib import sha256
 from html import escape
-import json
 from pathlib import Path
-import shutil
-import subprocess
+from tempfile import mkdtemp
 
-from PIL import Image
-from PIL import ImageStat
+from PIL import Image, ImageStat
 
 from cull_sh.backends.base import VisionBackend
-from cull_sh.manifests import decision_from_manifest_record
-from cull_sh.manifests import load_manifest_records
-from cull_sh.models import AssetKind
-from cull_sh.models import DecisionBucket
-from cull_sh.models import EditReviewPair
-from cull_sh.models import EditSuggestion
-from cull_sh.models import PreviewImage
-from cull_sh.models import RawAsset
-from cull_sh.rapidraw import rapidraw_install_info
-from cull_sh.rapidraw import rapidraw_adjustments_from_suggestion
+from cull_sh.extractors import ExifToolPreviewExtractor
+from cull_sh.manifests import decision_from_manifest_record, load_manifest_records
+from cull_sh.models import (
+    AssetKind,
+    DecisionBucket,
+    EditReviewPair,
+    EditSuggestion,
+    PreviewImage,
+    RawAsset,
+)
+from cull_sh.rapidraw import (
+    rapidraw_adjustments_from_suggestion,
+    rapidraw_install_info,
+    rapidraw_render_environment,
+)
+from cull_sh.render_diagnostics import image_diagnostics, tag_srgb_jpeg
 from cull_sh.xmp import sidecar_is_picked
+
+VALIDATION_POLICY = "delivery-pixels-v2"
 
 
 ProgressCallback = Callable[[str], None]
@@ -151,12 +158,15 @@ def run_feedback_pilot(
     include_crop: bool = True,
     selection_scope: str = "machine-picks-only",
     quality: int = 88,
+    baseline_mode: str = "neutral",
     progress: ProgressCallback | None = None,
     command_runner: CommandRunner | None = None,
 ) -> FeedbackPilotResult:
-    """Run a resumable neutral-render, suggest, render, and one-review pilot."""
+    """Render a baseline, suggest, review/refine once, then check final pixels."""
     if not assets:
         raise ValueError("feedback pilot requires at least one selected photo")
+    if baseline_mode not in {"neutral", "camera-midtones-v1"}:
+        raise ValueError("unknown baseline mode")
     if suggestion_batch_size < 1 or review_batch_size < 1:
         raise ValueError("feedback pilot batch sizes must be at least one")
     if not 1 <= quality <= 100:
@@ -187,19 +197,40 @@ def run_feedback_pilot(
         suggestion_batch_size=suggestion_batch_size,
         review_batch_size=review_batch_size,
     )
+    provenance = {"quality": quality, "renderer_sha256": _file_sha256(binary), "baseline_mode": baseline_mode,
+                  "renderer_environment": rapidraw_render_environment(binary),
+                  "backend_inference": {key: getattr(backend, key, None) for key in
+                                        ("prompt_policy", "model", "think", "temperature", "max_output_tokens")}}
+    for key, value in provenance.items():
+        if key in manifest and manifest[key] != value:
+            raise ValueError(f"feedback stage has different {key}; use a new stage")
+        manifest[key] = value
     records = _records(manifest)
     _migrate_crop_coordinate_space(root, manifest_path, manifest, records)
 
     progress(f"Preparing {len(records)} isolated RAW copies and neutral renders.")
     for index, (asset, record) in enumerate(zip(assets, records), start=1):
         staged_raw = input_dir / asset.filename
+        source_digest = _file_sha256(asset.raw_path)
+        if record.get("source_sha256", source_digest) != source_digest:
+            raise ValueError(f"source changed since staging: {asset.filename}")
         if not staged_raw.is_file():
             shutil.copy2(asset.raw_path, staged_raw)
+        if _file_sha256(staged_raw) != source_digest:
+            raise ValueError(f"isolated RAW differs from source: {asset.filename}")
+        record["source_sha256"] = source_digest
         neutral = EditSuggestion(filename=asset.filename, asset_id=str(asset.raw_path))
         baseline = baseline_dir / f"{asset.raw_path.stem}.jpg"
-        if not baseline.is_file():
+        if not baseline.is_file() or "baseline_suggestion" not in record:
             _write_rrdata(staged_raw, neutral, "Neutral baseline")
             _render(binary, staged_raw, baseline, quality, runner)
+            if baseline_mode == "camera-midtones-v1":
+                neutral, calibration = _calibrate_baseline(staged_raw, baseline, root, binary, quality, runner, neutral)
+                record["baseline_calibration"] = calibration
+            record["baseline_suggestion"] = _suggestion_payload(neutral)
+        if record.get("baseline_sha256", _file_sha256(baseline)) != _file_sha256(baseline):
+            raise ValueError(f"baseline pixels changed: {asset.filename}")
+        record["baseline_sha256"] = _file_sha256(baseline)
         record["staged_raw"] = str(staged_raw)
         record["baseline_render"] = str(baseline)
         record["baseline_metrics"] = _image_metrics(baseline)
@@ -214,6 +245,7 @@ def run_feedback_pilot(
             PreviewImage(
                 asset=_asset_from_record(record),
                 image_bytes=Path(str(record["baseline_render"])).read_bytes(),
+                starting_suggestion=_suggestion_from_payload(record["baseline_suggestion"]),
             )
             for record in cohort
         ]
@@ -229,6 +261,8 @@ def run_feedback_pilot(
         if len(suggestions) != len(cohort):
             raise RuntimeError("edit backend returned the wrong suggestion count")
         for record, suggestion in zip(cohort, suggestions):
+            if suggestion.filename != record["filename"]:
+                raise ValueError("edit backend returned mismatched filename")
             record["initial_suggestion"] = _suggestion_payload(suggestion)
         _write_json(manifest_path, manifest)
 
@@ -252,6 +286,9 @@ def run_feedback_pilot(
                 suggestion,
             )
         record["first_render"] = str(first_render)
+        if record.get("first_sha256", _file_sha256(first_render)) != _file_sha256(first_render):
+            raise ValueError(f"first-pass pixels changed: {record['filename']}")
+        record["first_sha256"] = _file_sha256(first_render)
         record["first_metrics"] = _image_metrics(first_render)
         _write_json(manifest_path, manifest)
         progress(f"First render {index}/{len(records)}: {staged_raw.name}")
@@ -266,6 +303,7 @@ def run_feedback_pilot(
                 baseline_bytes=Path(str(record["baseline_render"])).read_bytes(),
                 edited_bytes=Path(str(record["first_render"])).read_bytes(),
                 suggestion=_suggestion_from_payload(record["initial_suggestion"]),
+                baseline_suggestion=_suggestion_from_payload(record["baseline_suggestion"]),
             )
             for record in cohort
         ]
@@ -277,6 +315,8 @@ def run_feedback_pilot(
         if len(reviews) != len(cohort):
             raise RuntimeError("edit backend returned the wrong review count")
         for record, review in zip(cohort, reviews):
+            if review.filename != record["filename"] or review.final_suggestion.filename != record["filename"]:
+                raise ValueError("review backend returned mismatched filename")
             record["review"] = {
                 "verdict": review.verdict.value,
                 "summary": review.summary,
@@ -296,7 +336,7 @@ def run_feedback_pilot(
         _write_rrdata(
             staged_raw,
             final,
-            "Qwen validated final",
+            "Qwen final candidate pending delivery check",
             image_size=_image_size(baseline_path),
         )
         if not final_render.is_file():
@@ -310,7 +350,43 @@ def run_feedback_pilot(
         _write_json(manifest_path, manifest)
         progress(f"Final render {index}/{len(records)}: {staged_raw.name}")
 
+    progress("Checking the exact final pixels for delivery (no further refinement).")
+    for record in records:
+        final_path = Path(str(record["final_render"]))
+        digest = _file_sha256(final_path)
+        recipe_digest = _recipe_sha256(record["final_suggestion"])
+        check = record.get("delivery_validation")
+        if check:
+            if check.get("render_sha256") != digest or check.get("recipe_sha256") != recipe_digest:
+                raise ValueError(f"validated final pixels or recipe changed: {record['filename']}")
+            # A failed check stays failed on resume; reruns must be explicit new experiments.
+            continue
+        pair = EditReviewPair(
+            asset=_asset_from_record(record),
+            baseline_bytes=Path(str(record["baseline_render"])).read_bytes(),
+            edited_bytes=final_path.read_bytes(),
+            suggestion=_suggestion_from_payload(record["final_suggestion"]),
+            delivery_check=True,
+            baseline_suggestion=_suggestion_from_payload(record["baseline_suggestion"]),
+        )
+        reviews = backend.review_edits(prompt, [pair])
+        if len(reviews) != 1 or reviews[0].filename != record["filename"]:
+            raise ValueError("delivery validator returned mismatched result")
+        review = reviews[0]
+        record["delivery_validation"] = {
+            "policy": VALIDATION_POLICY,
+            "status": "passed" if review.verdict.value == "accept" else "failed",
+            "verdict": review.verdict.value, "summary": review.summary,
+            "render_sha256": digest, "recipe_sha256": recipe_digest,
+            "diagnostics": image_diagnostics(pair.edited_bytes),
+        }
+        _write_json(manifest_path, manifest)
+        progress(f"Delivery check {record['filename']}: {record['delivery_validation']['status']}")
+
     review_page = _write_review_page(root, records)
+    failures = [r["filename"] for r in records if r["delivery_validation"]["status"] != "passed"]
+    if failures:
+        raise RuntimeError("delivery quality check failed (no JPEG delivery authorized): " + ", ".join(failures))
     verdicts = [str(record["review"]["verdict"]) for record in records]
     return FeedbackPilotResult(
         root=root,
@@ -344,6 +420,12 @@ def export_feedback_stage(
     manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
     if manifest.get("kind") != "cull-sh-rendered-edit-feedback-pilot":
         raise ValueError("not a Cull.sh rendered feedback stage")
+    if manifest.get("validation_policy") != VALIDATION_POLICY:
+        raise ValueError("legacy feedback stage lacks final-pixel delivery validation; use a new stage")
+    if manifest.get("renderer_sha256") != _file_sha256(binary):
+        raise ValueError("RapidRAW binary changed since final validation")
+    if manifest.get("renderer_environment") != rapidraw_render_environment(binary):
+        raise ValueError("RapidRAW rendering preferences changed since final validation")
     records = _records(manifest)
     if not records:
         raise ValueError("feedback manifest contains no records")
@@ -377,6 +459,13 @@ def export_feedback_stage(
             raise FileNotFoundError(
                 f"validated final render is missing: {record['final_render']}"
             )
+        check = record.get("delivery_validation", {})
+        if check.get("status") != "passed" or check.get("policy") != VALIDATION_POLICY:
+            raise ValueError(f"final delivery validation is missing or failed: {record['filename']}")
+        if check.get("render_sha256") != _file_sha256(Path(str(record["final_render"]))):
+            raise ValueError(f"validated final pixels changed: {record['filename']}")
+        if check.get("recipe_sha256") != _recipe_sha256(record["final_suggestion"]):
+            raise ValueError(f"validated final recipe changed: {record['filename']}")
 
     record_ids = [str(record["id"]) for record in records]
     if len(record_ids) != len(set(record_ids)):
@@ -433,6 +522,8 @@ def export_feedback_stage(
         staged_raw = Path(str(record["staged_raw"]))
         if not staged_raw.is_file():
             raise FileNotFoundError(f"staged RAW is missing: {staged_raw}")
+        if _file_sha256(staged_raw) != record.get("source_sha256"):
+            raise ValueError(f"staged RAW changed after validation: {staged_raw}")
         target = output_dir / output_name
         prior = completed.get(record_id)
         if prior is not None and target.is_file():
@@ -454,12 +545,15 @@ def export_feedback_stage(
             "Qwen validated unattended final",
             image_size=_image_size(baseline),
         )
+        # Failed renders/checks must not leave unvalidated delivery JPEGs.
+        candidate_dir = Path(mkdtemp(prefix="delivery-candidate-", dir=root))
+        candidate = candidate_dir / output_name
         command = [
             str(binary),
             "export",
             str(staged_raw),
             "--output",
-            str(target),
+            str(candidate),
             "--format",
             "jpeg",
             "--quality",
@@ -474,11 +568,16 @@ def export_feedback_stage(
                 raise RuntimeError(
                     f"RapidRAW delivery export failed for {staged_raw.name}: {detail}"
                 )
-            if not target.is_file():
+            if not candidate.is_file():
                 raise RuntimeError(
-                    f"RapidRAW reported success but did not create {target}"
+                    f"RapidRAW reported success but did not create {candidate}"
                 )
-            _validate_render_dimensions(baseline, target, final)
+            _validate_render_dimensions(baseline, candidate, final)
+            _validate_delivery_pixels(Path(str(record["final_render"])), candidate)
+            tag_srgb_jpeg(candidate)
+            temporary = output_dir / (output_name + ".tmp")
+            shutil.copy2(candidate, temporary)
+            temporary.replace(target)
         except Exception as exc:
             export_records.append(
                 {
@@ -487,6 +586,7 @@ def export_feedback_stage(
                     "source": record["source"],
                     "output": str(target),
                     "status": "failed",
+                    "candidate": str(candidate),
                     "error": str(exc),
                 }
             )
@@ -590,6 +690,67 @@ def _file_sha256(path: Path) -> str:
     return digest.hexdigest()
 
 
+def _recipe_sha256(payload: object) -> str:
+    return sha256(json.dumps(payload, sort_keys=True, allow_nan=False).encode()).hexdigest()
+
+
+def _calibrate_baseline(raw, baseline, root, binary, quality, runner, neutral):
+    """Bounded brightness-only search toward camera midtones, not human edits."""
+    from dataclasses import replace
+
+    import numpy as np
+    camera = ExifToolPreviewExtractor().extract_preview_bytes(raw)
+    reference = image_diagnostics(camera)
+    original = image_diagnostics(baseline.read_bytes())
+    directory = root / "calibration" / raw.stem
+    directory.mkdir(parents=True, exist_ok=True)
+    (directory / "camera-reference.jpg").write_bytes(camera)
+    shutil.copy2(baseline, directory / "neutral.jpg")
+    target = np.array(reference["luma_percentiles_10_50_90"], dtype=float)
+    def cost(facts):
+        levels = np.array(facts["luma_percentiles_10_50_90"], dtype=float)
+        tonal = float(np.average(np.abs(np.log((levels+8)/(target+8))), weights=[1,3,1]))
+        # Penalize newly near-white pixels; natural existing bright sky is not a failure.
+        extra = max(0, float(facts["near_white_fraction"])-max(float(reference["near_white_fraction"]), float(original["near_white_fraction"])))
+        return tonal + 4*extra
+    candidates = [(cost(original), neutral, directory/"neutral.jpg", original)]
+    difference = target[1] - float(original["luma_percentiles_10_50_90"][1])
+    if abs(difference) >= 8:
+        direction = 1 if difference > 0 else -1
+        for magnitude in [0.5, 1.0, 1.5]:
+            suggestion = replace(neutral, brightness=direction*magnitude)
+            path = directory / f"brightness-{direction*magnitude}.jpg"
+            _write_rrdata(raw, suggestion, "Camera-referenced baseline calibration")
+            _render(binary, raw, path, quality, runner)
+            facts = image_diagnostics(path.read_bytes())
+            candidates.append((cost(facts), suggestion, path, facts))
+    selected = min(candidates, key=lambda candidate: candidate[0])
+    # Do not change the baseline for an insignificant numerical improvement.
+    if candidates[0][0] - selected[0] < 0.03:
+        selected = candidates[0]
+    shutil.copy2(selected[2], baseline)
+    return selected[1], {
+        "policy": "camera-midtones-v1", "reference": reference,
+        "selected_brightness": selected[1].brightness,
+        "candidates": [{"brightness": s.brightness, "cost": round(c,5), "metrics": f}
+                       for c,s,_,f in candidates],
+        "note": "Camera JPEG midtones guide a bounded tonal starting point; not a quality verdict or human ground truth.",
+    }
+
+
+def _validate_delivery_pixels(validated: Path, delivered: Path) -> None:
+    """Allow JPEG compression drift, not different rendering or geometry."""
+    import numpy as np
+    with Image.open(validated) as a, Image.open(delivered) as b:
+        if a.size != b.size:
+            raise ValueError("delivery dimensions differ from inspected final")
+        aa = np.asarray(a.convert("RGB").resize((128, 128)), dtype=float)
+        bb = np.asarray(b.convert("RGB").resize((128, 128)), dtype=float)
+    difference = np.abs(aa-bb)
+    if float(difference.mean()) > 3 or float(np.percentile(difference, 95)) > 8:
+        raise ValueError("delivery pixels differ materially from inspected final")
+
+
 def _load_or_create_manifest(
     path: Path,
     assets: list[RawAsset],
@@ -606,12 +767,21 @@ def _load_or_create_manifest(
     filenames = [asset.filename for asset in assets]
     if path.is_file():
         payload = json.loads(path.read_text(encoding="utf-8"))
+        if payload.get("validation_policy") != VALIDATION_POLICY:
+            raise ValueError("legacy feedback stage is frozen; create a new delivery-validated stage")
+        expected = {"model": model, "prompt": prompt, "include_crop": include_crop,
+                    "selection_scope": selection_scope, "suggestion_batch_size": suggestion_batch_size,
+                    "review_batch_size": review_batch_size}
+        for key, value in expected.items():
+            if payload.get(key) != value:
+                raise ValueError(f"existing feedback stage uses different {key}; create a new stage")
         existing = [str(record["filename"]) for record in _records(payload)]
         if existing != filenames:
             raise ValueError("existing feedback stage has a different selection")
         return payload
     payload: dict[str, object] = {
-        "schema_version": 3,
+        "schema_version": 4,
+        "validation_policy": VALIDATION_POLICY,
         "kind": "cull-sh-rendered-edit-feedback-pilot",
         "model": model,
         "prompt": prompt,
@@ -632,7 +802,9 @@ def _load_or_create_manifest(
                 "xmp_path": str(asset.xmp_path),
                 "asset_kind": asset.kind.value,
                 "selection": (
-                    "frozen-machine-pick"
+                    "development-pilot"
+                    if selection_scope == "development-pilot"
+                    else "frozen-machine-pick"
                     if selection_scope == "frozen-machine-picks"
                     else "protected-existing-pick"
                     if sidecar_is_picked(
@@ -719,6 +891,7 @@ def _render(
         raise RuntimeError(f"RapidRAW render failed for {source.name}: {detail}")
     if not output.is_file():
         raise RuntimeError(f"RapidRAW reported success but did not create {output}")
+    tag_srgb_jpeg(output)
 
 
 def _run_command(command: list[str]) -> subprocess.CompletedProcess[str]:
@@ -825,7 +998,7 @@ def _write_review_page(root: Path, records: list[dict[str, object]]) -> Path:
             + _figure(
                 root,
                 Path(str(record["first_render"])),
-                "Edited (validated final)" if final_matches_first else "First edit",
+                "Final candidate" if final_matches_first else "First edit",
             )
         )
         choices = (
@@ -834,7 +1007,7 @@ def _write_review_page(root: Path, records: list[dict[str, object]]) -> Path:
             else (
                 ("baseline", "Baseline"),
                 ("first", "First edit"),
-                ("final", "Validated final"),
+                ("final", "Final candidate"),
                 ("tie", "Tie"),
             )
         )
@@ -842,7 +1015,7 @@ def _write_review_page(root: Path, records: list[dict[str, object]]) -> Path:
             figures += _figure(
                 root,
                 Path(str(record["final_render"])),
-                "Validated final",
+                "Final candidate",
             )
         cards.append(
             f"<article data-id='{escape(record_id)}'>"
@@ -851,6 +1024,7 @@ def _write_review_page(root: Path, records: list[dict[str, object]]) -> Path:
             + figures
             + "</div>"
             + f"<p><strong>Qwen verdict:</strong> {escape(str(review['verdict']))} — {escape(str(review.get('summary', '')))}</p>"
+            + f"<p><strong>Delivery check:</strong> {escape(str(record.get('delivery_validation', {}).get('status', 'not checked')))} — {escape(str(record.get('delivery_validation', {}).get('summary', '')))}</p>"
             + f"<p class='recipe'>First: {escape(_recipe(initial))}<br>Final: {escape(_recipe(final))}</p>"
             + "<div class='choices'>Human preference: "
             + " ".join(
@@ -868,7 +1042,9 @@ def _write_review_page(root: Path, records: list[dict[str, object]]) -> Path:
     )
     machine_added = len(records) - protected
     selection_note = (
-        f"{frozen} frozen machine pick(s); pre-existing flags were ignored."
+        "Explicitly selected development pilot; not an independent benchmark."
+        if all(r.get("selection") == "development-pilot" for r in records)
+        else f"{frozen} frozen machine pick(s); pre-existing flags were ignored."
         if frozen
         else f"{protected} protected existing pick(s) and {machine_added} machine-added pick(s)."
         if protected

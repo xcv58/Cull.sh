@@ -302,16 +302,12 @@ def build_local_decision_trace(
     available_support_votes = {
         name: value for name, value in active_support_votes.items() if value is not None
     }
-    required_support_votes = (
-        min(local_reject_required_support_votes, len(available_support_votes))
-        if available_support_votes
-        else 0
-    )
+    # Missing corroboration must never lower the bar for destructive triage.
+    required_support_votes = max(1, local_reject_required_support_votes)
     weak_support_count = sum(1 for value in available_support_votes.values() if value)
-    primary_weak = bool(votes["laplacian_weak"] and votes["tenengrad_weak"])
-    quality_reject = primary_weak and (
-        weak_support_count >= required_support_votes if available_support_votes else True
-    )
+    primary_weak = bool(metrics.blur_score is not None and metrics.tenengrad_score is not None
+                        and votes["laplacian_weak"] and votes["tenengrad_weak"])
+    quality_reject = primary_weak and weak_support_count >= required_support_votes
 
     if quality_reject:
         explanation = (
@@ -319,8 +315,10 @@ def build_local_decision_trace(
         )
     elif primary_weak:
         explanation = (
-            "Kept for review/model: primary sharpness weak but support signals were mixed or stronger."
+            "Kept for review/model: primary sharpness weak but corroborating support is insufficient, missing, or mixed."
         )
+    elif metrics.blur_score is None or metrics.tenengrad_score is None:
+        explanation = "Kept for review/model: primary sharpness evidence is incomplete."
     else:
         explanation = "Passed local quality gate: primary sharpness signals were acceptable."
 

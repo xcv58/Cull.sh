@@ -1,7 +1,6 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
-from dataclasses import field
+from dataclasses import dataclass, field
 from enum import Enum
 from pathlib import Path
 
@@ -69,6 +68,7 @@ class PreviewImage:
     image_bytes: bytes
     mime_type: str = "image/jpeg"
     cache_path: Path | None = None
+    starting_suggestion: EditSuggestion | None = None
 
 
 @dataclass(slots=True)
@@ -182,6 +182,8 @@ class EditReviewPair:
     baseline_bytes: bytes
     edited_bytes: bytes
     suggestion: EditSuggestion
+    delivery_check: bool = False
+    baseline_suggestion: EditSuggestion | None = None
 
 
 @dataclass(slots=True)

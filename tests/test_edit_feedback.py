@@ -1,25 +1,32 @@
 from __future__ import annotations
 
 import json
-from pathlib import Path
 import subprocess
-from tempfile import TemporaryDirectory
 import unittest
+from io import BytesIO
+from pathlib import Path
+from tempfile import TemporaryDirectory
+from unittest.mock import patch
 
 from PIL import Image
 
 from cull_sh.backends.base import VisionBackend
-from cull_sh.edit_feedback import export_feedback_stage
-from cull_sh.edit_feedback import run_feedback_pilot
-from cull_sh.edit_feedback import select_feedback_picks
-from cull_sh.edit_feedback import select_machine_picks
-from cull_sh.edit_feedback import _validate_render_dimensions
-from cull_sh.models import EditReview
-from cull_sh.models import EditReviewPair
-from cull_sh.models import EditReviewVerdict
-from cull_sh.models import EditSuggestion
-from cull_sh.models import FinalDecision
-from cull_sh.models import PreviewImage
+from cull_sh.edit_feedback import (
+    _calibrate_baseline,
+    _validate_render_dimensions,
+    export_feedback_stage,
+    run_feedback_pilot,
+    select_feedback_picks,
+    select_machine_picks,
+)
+from cull_sh.models import (
+    EditReview,
+    EditReviewPair,
+    EditReviewVerdict,
+    EditSuggestion,
+    FinalDecision,
+    PreviewImage,
+)
 
 
 class _FakeBackend(VisionBackend):
@@ -74,7 +81,7 @@ class _FakeBackend(VisionBackend):
         return [
             EditReview(
                 filename=pair.asset.filename,
-                verdict=EditReviewVerdict.REFINE,
+                verdict=EditReviewVerdict.ACCEPT if pair.delivery_check else EditReviewVerdict.REFINE,
                 final_suggestion=EditSuggestion(
                     filename=pair.asset.filename,
                     asset_id=str(pair.asset.raw_path),
@@ -127,6 +134,103 @@ class _FailIfCalledBackend(_FakeBackend):
 
 
 class EditFeedbackPilotTests(unittest.TestCase):
+    def test_camera_calibration_lifts_daylight_without_forcing_night_brighter(self):
+        for camera_level, original_level, expected_brightness in [(150, 100, 1.0), (30, 30, 0.0)]:
+            with self.subTest(camera_level=camera_level), TemporaryDirectory() as tmp:
+                root = Path(tmp)
+                raw = root / 'frame.ARW'
+                raw.write_bytes(b'raw fixture')
+                baseline = root / 'baseline.jpg'
+                Image.new('RGB', (80, 60), (original_level,) * 3).save(baseline)
+                camera = BytesIO()
+                Image.new('RGB', (80, 60), (camera_level,) * 3).save(camera, format='JPEG')
+                neutral = EditSuggestion(filename=raw.name)
+                def runner(command, raw=raw, original_level=original_level):
+                    recipe = json.loads(raw.with_name(raw.name + '.rrdata').read_text())['adjustments']
+                    level = int(original_level + 50 * recipe['brightness'])
+                    Image.new('RGB', (80, 60), (level,) * 3).save(Path(command[command.index('--output') + 1]))
+                    return subprocess.CompletedProcess(command, 0, '', '')
+                with patch('cull_sh.edit_feedback.ExifToolPreviewExtractor.extract_preview_bytes', return_value=camera.getvalue()):
+                    suggestion, report = _calibrate_baseline(raw, baseline, root, root / 'binary', 95, runner, neutral)
+                self.assertEqual(suggestion.brightness, expected_brightness)
+                self.assertEqual(suggestion.exposure, 0)
+                self.assertEqual(report['policy'], 'camera-midtones-v1')
+
+    def _new_stage(self, root, backend=None):
+        from cull_sh.models import RawAsset
+        source=root/'source'; source.mkdir()
+        raw=source/'frame.ARW'; raw.write_bytes(b'raw')
+        binary=root/'RapidRAW'; binary.write_bytes(b'fake'); binary.chmod(0o755)
+        def runner(command):
+            Image.new('RGB',(80,60),'gray').save(Path(command[command.index('--output')+1]))
+            return subprocess.CompletedProcess(command,0,'','')
+        args=([RawAsset(raw,raw.with_suffix('.xmp'))],root/'stage',binary,backend or _FakeBackend())
+        kwargs=dict(prompt='natural',model='qwen',cull_run=root/'run',human_baseline=root/'backup',command_runner=runner)
+        return args,kwargs
+
+    def test_failed_final_review_cannot_be_exported_or_retried_on_resume(self):
+        class Failing(_FakeBackend):
+            def review_edits(self,prompt,pairs):
+                result=super().review_edits(prompt,pairs)
+                if pairs[0].delivery_check:
+                    result[0].verdict=EditReviewVerdict.REFINE
+                    result[0].summary='Still milky edges'
+                return result
+        with TemporaryDirectory() as tmp:
+            args,kwargs=self._new_stage(Path(tmp),Failing())
+            with self.assertRaisesRegex(RuntimeError,'delivery quality check failed'):
+                run_feedback_pilot(*args,**kwargs)
+            saved=json.loads((args[1]/'feedback-manifest.json').read_text())
+            self.assertEqual(saved['records'][0]['delivery_validation']['status'],'failed')
+            with self.assertRaisesRegex(ValueError,'missing or failed'):
+                export_feedback_stage(args[1],args[2],Path(tmp)/'delivery')
+            resumed=(*args[:3],_FailIfCalledBackend())
+            with self.assertRaisesRegex(RuntimeError,'delivery quality check failed'):
+                run_feedback_pilot(*resumed,**kwargs)
+
+    def test_export_blocks_modified_final_recipe_and_pixels(self):
+        with TemporaryDirectory() as tmp:
+            root=Path(tmp); args,kwargs=self._new_stage(root)
+            result=run_feedback_pilot(*args,**kwargs)
+            original=result.manifest_path.read_text()
+            payload=json.loads(original); payload['records'][0]['final_suggestion']['exposure']=2
+            result.manifest_path.write_text(json.dumps(payload))
+            with self.assertRaisesRegex(ValueError,'recipe changed'):
+                export_feedback_stage(args[1],args[2],root/'delivery')
+            result.manifest_path.write_text(original)
+            Image.new('RGB',(80,60),'red').save(args[1]/'final/frame.jpg')
+            with self.assertRaisesRegex(ValueError,'pixels changed'):
+                export_feedback_stage(args[1],args[2],root/'delivery')
+
+    def test_changed_prompt_requires_new_stage(self):
+        with TemporaryDirectory() as tmp:
+            args,kwargs=self._new_stage(Path(tmp))
+            run_feedback_pilot(*args,**kwargs)
+            with self.assertRaisesRegex(ValueError,'different prompt'):
+                run_feedback_pilot(*args,**{**kwargs,'prompt':'new style'})
+
+    def test_changed_renderer_preferences_block_export(self):
+        with TemporaryDirectory() as tmp:
+            root=Path(tmp)
+            args,kwargs=self._new_stage(root)
+            run_feedback_pilot(*args,**kwargs)
+            with patch('cull_sh.edit_feedback.rapidraw_render_environment', return_value={'linearRawMode':'changed'}):
+                with self.assertRaisesRegex(ValueError,'rendering preferences changed'):
+                    export_feedback_stage(args[1],args[2],root/'delivery')
+
+    def test_failed_export_pixels_never_enter_delivery_folder(self):
+        with TemporaryDirectory() as tmp:
+            root=Path(tmp)
+            args, kwargs=self._new_stage(root)
+            run_feedback_pilot(*args,**kwargs)
+            def bad_renderer(command):
+                Image.new('RGB',(80,60),'red').save(Path(command[command.index('--output')+1]))
+                return subprocess.CompletedProcess(command,0,'','')
+            with self.assertRaisesRegex(ValueError,'pixels differ'):
+                export_feedback_stage(args[1], args[2], root/'delivery', command_runner=bad_renderer)
+            self.assertEqual(list((root/'delivery').iterdir()),[])
+            self.assertEqual(len(list(args[1].glob('delivery-candidate-*/frame.jpg'))),1)
+
     def test_rejects_implausibly_small_crop_render(self) -> None:
         with TemporaryDirectory() as tmp_dir:
             root = Path(tmp_dir)
@@ -302,7 +406,8 @@ class EditFeedbackPilotTests(unittest.TestCase):
             self.assertTrue((stage / "final/machine.jpg").is_file())
             payload = json.loads(result.manifest_path.read_text(encoding="utf-8"))
             self.assertFalse(payload["originals_modified"])
-            self.assertEqual(payload["schema_version"], 3)
+            self.assertEqual(payload["schema_version"], 4)
+            self.assertEqual(payload["records"][0]["delivery_validation"]["status"], "passed")
             self.assertEqual(payload["suggestion_batch_size"], 1)
             self.assertEqual(payload["review_batch_size"], 1)
             self.assertEqual(payload["maximum_refinements"], 1)
@@ -376,7 +481,7 @@ class EditFeedbackPilotTests(unittest.TestCase):
             def export_runner(command: list[str]) -> subprocess.CompletedProcess[str]:
                 commands.append(command)
                 output = Path(command[command.index("--output") + 1])
-                Image.new("RGB", (32, 24), "green").save(output)
+                Image.new("RGB", (32, 24), "gray").save(output)
                 return subprocess.CompletedProcess(command, 0, "ok", "")
 
             result = export_feedback_stage(
@@ -440,7 +545,7 @@ class EditFeedbackPilotTests(unittest.TestCase):
             binary.write_bytes(b"#!/bin/sh\n")
             binary.chmod(0o755)
 
-            with self.assertRaisesRegex(ValueError, "is incomplete"):
+            with self.assertRaisesRegex(ValueError, "lacks final-pixel"):
                 export_feedback_stage(stage, binary, root / "delivery")
 
 

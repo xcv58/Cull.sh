@@ -70,6 +70,19 @@ def rapidraw_install_info(binary: Path) -> dict[str, object]:
     return info
 
 
+def rapidraw_render_environment(binary: Path) -> dict[str, object]:
+    """Snapshot render-affecting macOS preferences, excluding private UI state."""
+    if rapidraw_install_info(binary).get("bundle_id") != "io.github.CyberTimon.RapidRAW":
+        return {}
+    path = Path.home() / "Library/Application Support/io.github.CyberTimon.RapidRAW/settings.json"
+    settings = json.loads(path.read_text()) if path.is_file() else {}
+    return {key: settings.get(key) for key in (
+        "tonemapperOverrideEnabled", "defaultRawTonemapper", "defaultNonRawTonemapper",
+        "linearRawMode", "rawHighlightCompression", "rawPreprocessingColorNr",
+        "rawPreprocessingSharpening", "applyPreprocessingToNonRaws", "processingBackend",
+    )}
+
+
 def rapidraw_adjustments_from_suggestion(
     suggestion: dict[str, object],
     *,
