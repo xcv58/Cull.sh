@@ -155,6 +155,15 @@ It does not change the default production prompt or remove refinement limits.
 Improvement on these selected failures cannot be reported as an unbiased
 benchmark or as a fully unattended success.
 
+The authorized `pilot-v2-correction-1` completed at 17:32 EDT on August 28.
+DSC03797 returned to its calibrated baseline (brightness 0.5); DSC03806 restored
+brightness 1.0 with gentle contrast/dehaze and small highlight/shadow adjustments.
+Median luminance moved from 69.75 to 83.63 and from 112.71 to 144.56 respectively
+(baselines: 83.63 and 144.93). Both new final checks passed. All twelve delivery
+JPEGs were verified against export hashes, geometry, sRGB profiles and validated
+pixels (292.1 MiB total). The parent manifest and ten inherited passed records
+remain unchanged. The full album remains prepared, not processed.
+
 - Work branch: `codex/sentosa-unattended-quality`.
 - Inputs: 389 hash-verified isolated RAWs from the original blind experiment.
 - Full selection prepared as 90 chronological cohorts in

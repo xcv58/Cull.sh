@@ -12,12 +12,15 @@
   handling are implemented. See [quality validation](docs/unattended-quality-validation.md).
 - Frozen Sentosa source/human/first-machine artifacts remain untouched.
 - The parent `runs/sentosa-quality-v2/pilot-v2` is preserved. User-authorized
-  two-photo correction progress is in `pilot-v2-correction-1/status.json`, using
+  two-photo correction is complete in `pilot-v2-correction-1/status.json`, using
   the explicit `cull_sh.feedback_correction` workflow. Ten passed records are
-  copied unchanged; only two failed photos get a correction and new final check.
+  copied unchanged; only two failed photos received a correction and new final
+  check. Both passed. Twelve verified sRGB delivery JPEGs (292.1 MiB total) are
+  in `runs/sentosa-quality-v2/pilot-v2-correction-1/delivery`. The job exited at
+  17:32 EDT. The old shutdown heartbeat remains paused.
   The full 389-photo selection stage remains prepared with zero decisions in
   `runs/sentosa-quality-v2/album`; no automatic album continuation is enabled.
-- Runtime recovery preserves six completed reviews after a worker reset and a
+- Earlier runtime recovery preserved six completed reviews after a worker reset and a
   reproduced oversized-request error. Resume this job with `--context-tokens
   65536`; bounded overviews leave full-resolution renders and native detail
   patches intact. Prior failures and runtime transitions are recorded in the run.
