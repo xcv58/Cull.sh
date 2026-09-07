@@ -1,6 +1,6 @@
 # Cull.sh Handoff
 
-## Current workflow decision — September 6
+## Current workflow decision — September 7
 
 - Keep Cull.sh for culling, ranking, duplicate handling, and Lightroom-compatible
   metadata. Continue to use Qwen for semantic culling and TOPIQ only at its
@@ -14,22 +14,24 @@
   isolated RAW copies and lens-correction sidecars, but no verified Adaptive
   Color payloads and no JPEG exports. Nothing in that pilot needs to be resumed
   or committed.
-- The full reviewed checkpoint is backed up at
-  `origin/codex/sentosa-unattended-quality`. Use the stacked, gated procedure in
-  [the main integration plan](docs/main-integration-plan.md); do not merge the
-  complete branch directly into `main`. A test workflow is present on this
-  checkpoint but must land independently on `main` as gate zero before any
-  feature layer is merged.
-- Remote `main` now contains the first opt-in AI-suggestion layer at `1f97bcb`
-  (PR #2 is recorded merged); that exact checkout passed CLI import and 72 tests.
-  PR #3 remains unmerged at `dafef4e`. PR #4, `codex/main-ci-gate`, is the
-  one-file CI gate that must merge before any additional feature layer.
-  Repository-local `push.default=simple` overrides the user's global `matching`
-  setting; still use explicit refspecs for all integration pushes.
+- The full reviewed checkpoint is backed up on the forward-only branch
+  `origin/codex/sentosa-unattended-quality`. The staged integration procedure is
+  recorded in [the main integration plan](docs/main-integration-plan.md).
+- Remote `main` contains the AI-suggestion foundation (PR #2), the required CI
+  gate (PR #4), TOPIQ/benchmark/initial RapidRAW tooling (PR #5), and the Qwen
+  culling/rendered-validation layer (PR #3). Each gated layer and its post-merge
+  `main` commit passed exact-head CI. The final Sentosa quality/correction layer
+  remains the only integration layer in flight.
+- `main` requires an up-to-date `pytest` check through a pull request, enforces
+  the rule for admins, requires resolved conversations, and disallows force
+  pushes and branch deletion. Repository-local `push.default=simple` overrides
+  the user's global `matching` setting; still use explicit refspecs for every
+  integration push.
 
 ## Current development iteration — August 28
 
-- Branch: `codex/sentosa-unattended-quality`, based on `codex/topiq-qwen-rapidraw`.
+- Branch: `codex/sentosa-unattended-quality`, updated through protected `main`
+  without rebasing or rewriting its recovery history.
 - Regression suite: 171 passed plus four subtests; installed-app control
   tests also passed. The twelve-photo pilot finished: ten passed and two failed
   final quality checks for darkening (DSC03797 and DSC03806). No delivery export
@@ -56,7 +58,7 @@
 
 The foundation notes below describe the prior branch and historical results.
 
-## Repository state
+## Historical repository state
 
 - Foundation branch: `feat/ai-develop-edits`
 - Foundation draft PR: <https://github.com/xcv58/Cull.sh/pull/2>
