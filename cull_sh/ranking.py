@@ -11,6 +11,70 @@ from cull_sh.models import WorkStatus
 ApplyLocalRejection = Callable[[WorkItem, LocalQualityMetrics, str], None]
 
 
+def apply_topiq_rank_blend(
+    items: list[WorkItem],
+    topiq_weight: float,
+) -> int:
+    """Blend folder-relative local and TOPIQ percentiles for ranking only."""
+    if not 0.0 <= topiq_weight <= 1.0:
+        raise ValueError("TOPIQ rank weight must be between 0 and 1")
+
+    scoreable = [
+        item
+        for item in items
+        if item.metrics is not None and item.metrics.local_rank_score is not None
+    ]
+    if not scoreable:
+        return 0
+
+    if topiq_weight == 0.0:
+        for item in scoreable:
+            assert item.metrics is not None
+            item.metrics.combined_rank_score = None
+        return len(scoreable)
+
+    missing = [
+        item.filename
+        for item in scoreable
+        if item.metrics is not None and item.metrics.topiq_score is None
+    ]
+    if missing:
+        raise ValueError(
+            "TOPIQ ranking requires a score for every locally scored photo; "
+            f"missing {len(missing)} (first={missing[0]})"
+        )
+
+    local_percentiles = _percentile_ranks(
+        [float(item.metrics.local_rank_score) for item in scoreable if item.metrics]
+    )
+    topiq_percentiles = _percentile_ranks(
+        [float(item.metrics.topiq_score) for item in scoreable if item.metrics]
+    )
+    for item, local_percentile, topiq_percentile in zip(
+        scoreable,
+        local_percentiles,
+        topiq_percentiles,
+    ):
+        assert item.metrics is not None
+        item.metrics.combined_rank_score = (
+            ((1.0 - topiq_weight) * local_percentile)
+            + (topiq_weight * topiq_percentile)
+        )
+        if item.local_trace is not None:
+            scores = item.local_trace.get("scores")
+            if isinstance(scores, dict):
+                scores["combined_rank"] = item.metrics.combined_rank_score
+            item.local_trace["ranking"] = {
+                "method": "folder_percentile_blend",
+                "local_weight": 1.0 - topiq_weight,
+                "topiq_weight": topiq_weight,
+                "local_percentile": local_percentile,
+                "topiq_percentile": topiq_percentile,
+                "combined_score": item.metrics.combined_rank_score,
+            }
+    return len(scoreable)
+
+
 def suppress_duplicates_and_rerank(
     items: list[WorkItem],
     duplicate_hamming_threshold: int,
@@ -83,7 +147,7 @@ def sort_candidates_for_vision(items: list[WorkItem]) -> list[WorkItem]:
         candidates,
         key=lambda item: (
             item.scene_id or "ungrouped",
-            -(item.metrics.local_rank_score if item.metrics and item.metrics.local_rank_score else 0.0),
+            -_effective_rank_score(item.metrics),
             item.scene_index or 0,
             item.filename,
         ),
@@ -182,12 +246,20 @@ def _find_duplicate_anchor(
 def _scene_rank_key(item: WorkItem) -> tuple[float, float, float, float, str]:
     metrics = item.metrics or LocalQualityMetrics()
     return (
-        metrics.local_rank_score or 0.0,
+        _effective_rank_score(metrics),
         metrics.blur_score or 0.0,
         metrics.tenengrad_score or 0.0,
         metrics.contrast_stddev or 0.0,
         item.filename,
     )
+
+
+def _effective_rank_score(metrics: LocalQualityMetrics | None) -> float:
+    if metrics is None:
+        return 0.0
+    if metrics.combined_rank_score is not None:
+        return metrics.combined_rank_score
+    return metrics.local_rank_score or 0.0
 
 
 def _is_viable_scene_fallback(
@@ -201,3 +273,22 @@ def _is_viable_scene_fallback(
         blur_score >= (min_blur_score * 0.75)
         or tenengrad_score >= (min_tenengrad_score * 0.75)
     )
+
+
+def _percentile_ranks(values: list[float]) -> list[float]:
+    if len(values) == 1:
+        return [0.5]
+
+    order = sorted(range(len(values)), key=values.__getitem__)
+    ranks = [0.0] * len(values)
+    index = 0
+    while index < len(order):
+        end = index + 1
+        while end < len(order) and values[order[end]] == values[order[index]]:
+            end += 1
+        average_position = (index + (end - 1)) / 2.0
+        percentile = average_position / (len(values) - 1)
+        for ordered_index in order[index:end]:
+            ranks[ordered_index] = percentile
+        index = end
+    return ranks

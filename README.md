@@ -9,7 +9,8 @@ The intended workflow is:
 3. Run fast local quality checks such as blur detection.
 4. Send only viable candidates to a vision model backend.
 5. Write Lightroom-compatible culling metadata with ratings and labels.
-6. Optionally apply safe Lightroom sidecar edits to RAWs.
+6. Generate fail-fast local AI develop suggestions for selected RAWs.
+7. Review and render approved edits through RapidRAW, or optionally write XMP.
 
 The repository is scaffolded around a provider-agnostic backend interface so local models such as Ollama can be used for development, while Anthropic or OpenAI can be added later without changing the pipeline shape.
 
@@ -43,6 +44,7 @@ This scaffold includes:
 - RAW and JPEG discovery
 - provisional scene grouping
 - multi-metric local preview analysis
+- TOPIQ NR assisted candidate ranking with a thumbnail disagreement review
 - portrait-aware local face / eye hints
 - scene-relative candidate reranking
 - near-duplicate suppression before vision scoring
@@ -50,13 +52,16 @@ This scaffold includes:
 - XMP sidecar writing with merge support for existing RAW sidecars
 - embedded JPEG culling metadata
 - optional Lightroom sidecar edits for RAWs
-- opt-in AI-suggested Lightroom develop edits written as reversible XMP sidecar settings
+- opt-in Qwen develop suggestions with no fallback model
+- approval-gated RapidRAW staging, preview rendering, and final export
 - architecture plan for the full app
 
 ## Current Workflow
 
 ```bash
 python main.py doctor
+python main.py benchmark --path /path/to/human-reviewed/raws --facet-db /path/to/facet.db
+python main.py benchmark --path /path/to/newly-reviewed/raws --shadow-run runs/<original-cull-run>
 python main.py cull --path /path/to/raws --prompt "Keep the sharpest wildlife photos"
 python main.py cull --path /path/to/raws --genre portrait
 python main.py cull --path /path/to/raws --genre street --prefer "interesting gestures and layering"
@@ -68,9 +73,39 @@ python main.py lightroom-adaptive-color --path "/path/to/culled raws"
 python main.py lightroom-jpeg-auto --path "/path/to/culled raws"
 python main.py suggest-edits --path "/path/to/culled raws"
 python main.py suggest-edits --path "/path/to/culled raws" --no-dry-run
+python main.py rapidraw-stage --suggestions runs/<timestamp>/edit-suggestions.jsonl --output /path/to/new-stage
+python main.py rapidraw-preview --stage /path/to/new-stage
+python main.py rapidraw-export --stage /path/to/new-stage --approvals ~/Downloads/rapidraw-approvals.json
 python main.py repair-sidecars
 python main.py repair-sidecars --run-dir runs/20260411-220756-823242
 ```
+
+`suggest-edits` uses the local
+`orcarouter/Qwen3.8-27B-Uncensored` model by default. Model calls are fail-fast:
+the command makes no fallback-model or per-image recovery request, and stops on
+the first failed cohort so the underlying local-model problem can be fixed.
+Both culling and editing also send a bounded Ollama `num_predict` value
+(`--backend-max-output-tokens`, default 1024) so a malformed structured response
+cannot generate indefinitely while keeping the HTTP connection active.
+
+`benchmark` reads existing Lightroom XMP picks, ratings, and rejects as human
+ground truth without modifying photos or sidecars. It compares the current
+MUSIQ/NIMA/local-quality signals with any cached Facet signals, writes a
+resumable current-signal cache, and reports global AUC, within-burst ranking,
+false-reject safety, and the behavior of the current local reject gate under
+`runs/<timestamp>/`.
+
+Regular `cull` runs enable `--topiq-ranking` by default. Folder-relative TOPIQ
+and local-score percentiles are blended with a 25% TOPIQ weight for candidate
+ordering; TOPIQ does not participate in the hard quality-reject gate. Scores
+are saved to the manifest and `--topiq-shadow` controls a capped disagreement
+review artifact. Use `--no-topiq-ranking` to restore local-only ordering and
+`--no-topiq-shadow` to skip the review page without disabling ranking.
+
+For a prospective benchmark, keep the original cull run, finish reviewing the
+folder normally in Lightroom, then pass that run to `benchmark --shadow-run`.
+The benchmark reuses the frozen pre-review TOPIQ/current scores and decisions,
+compares them with the final XMP, and does not rescore the folder.
 
 If you omit `--prompt`, the CLI can generate one from a genre preset:
 
@@ -166,13 +201,11 @@ python main.py lightroom-jpeg-auto --path "/path/to/culled-raws" --lightroom-edi
 ## AI Develop Edits
 
 `suggest-edits` is an explicit opt-in stage. Regular culling does not run local
-AI develop edits. When you run this command, it asks the vision model for
-natural global develop adjustments and can write them as standard, fully
-reversible Camera Raw settings into the `.xmp` sidecar next to each culled,
-non-rejected RAW. It is a dry run by default; sidecars are only modified when
-you pass `--no-dry-run`. Rejected RAW files and RAW files without existing
-sidecars are skipped by default, and existing culling state in the sidecar is
-preserved.
+AI develop edits. It asks the configured vision model for natural global
+adjustments and freezes the recipes in `edit-suggestions.jsonl`. It is a dry
+run by default; source sidecars are only modified when you pass
+`--no-dry-run`. Rejected RAW files and RAW files without existing sidecars are
+skipped by default, and existing culling state is preserved.
 
 ```bash
 python main.py suggest-edits --path "/path/to/culled-raws"            # dry run: show suggestions only
@@ -182,15 +215,43 @@ python main.py suggest-edits --path "/path/to/culled-raws" --with-crop --batch-s
 python main.py suggest-edits --path "/path/to/raws" --include-unculled
 ```
 
-The model suggests a small set of global sliders — exposure, contrast,
-highlights, shadows, and vibrance — clamped to safe ranges. Suggestions are also
-recorded with the source RAW/XMP path under
-`runs/<timestamp>/edit-suggestions.jsonl`. Because these are ordinary `crs:`
-settings, Lightroom shows them as normal Develop edits you can adjust or reset.
-Crop suggestions are off by default; pass `--with-crop` to allow normalized
-Camera Raw crop bounds and crop angle suggestions. A no-crop suggestion leaves
-any existing crop tags untouched. Local/AI edits such as Adaptive Color and
-masking still require the Lightroom UI handoff stages.
+The model suggests exposure, contrast, highlights, shadows, vibrance, and an
+optional crop, all validated before a renderer receives them. Crop suggestions
+are off by default. The selected Qwen model is intentionally fail-fast: Cull.sh
+does not fall back to Gemma or retry failed photographs individually.
+
+## RapidRAW Develop Workflow
+
+RapidRAW is the primary automated renderer. Lightroom remains an optional XMP
+interoperability and manual-review surface; a Lightroom-versus-RapidRAW bakeoff
+is not required for this workflow.
+
+The RapidRAW path has three explicit gates:
+
+1. `rapidraw-stage` copies suggested RAWs into a new isolated directory, writes
+   `.rrdata`, records the Cull.sh commit and suggestion provenance, and refuses
+   to reuse an existing stage. Original RAW/XMP files are not modified.
+2. `rapidraw-preview` runs the installed headless exporter and creates
+   `review.html` with real before/after renders. Review choices stay local and
+   download as `rapidraw-approvals.json`.
+3. `rapidraw-export` verifies that the approval file matches the immutable
+   stage manifest, exports only approved photographs, retains metadata by
+   default, and records resumable completion in `rapidraw-export.json`.
+
+```bash
+python main.py rapidraw-stage \
+  --suggestions runs/<timestamp>/edit-suggestions.jsonl \
+  --output /path/to/new-stage
+python main.py rapidraw-preview --stage /path/to/new-stage
+python main.py rapidraw-export \
+  --stage /path/to/new-stage \
+  --approvals ~/Downloads/rapidraw-approvals.json
+```
+
+`rapidraw-export --approve-all` is available only as an explicit bypass for a
+controlled pilot. Final export otherwise fails without a matching approval
+file. Generated review and output files live inside the stage, never beside the
+original photographs.
 
 `--limit` now applies after whole-folder scene grouping, so `--limit 24` means
 "process the first 24 scenes" rather than "stop after 24 files".

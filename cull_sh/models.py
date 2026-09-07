@@ -76,6 +76,7 @@ class LocalQualityMetrics:
     tenengrad_score: float | None = None
     musiq_score: float | None = None
     nima_score: float | None = None
+    topiq_score: float | None = None
     brisque_score: float | None = None
     cpbd_score: float | None = None
     brightness_mean: float | None = None
@@ -83,6 +84,7 @@ class LocalQualityMetrics:
     face_count: int | None = None
     eye_count: int | None = None
     local_rank_score: float | None = None
+    combined_rank_score: float | None = None
     perceptual_hash: str | None = None
 
 

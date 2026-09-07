@@ -31,13 +31,16 @@ from cull_sh.quality import analyze_local_quality
 from cull_sh.quality import build_local_decision_trace
 from cull_sh.quality import support_metric_import_errors
 from cull_sh.quality import should_reject_for_local_quality
+from cull_sh.quality import score_topiq_quality
 from cull_sh.ranking import build_scene_cohorts
+from cull_sh.ranking import apply_topiq_rank_blend
 from cull_sh.ranking import rescue_scene_review_candidates
 from cull_sh.ranking import sort_candidates_for_vision
 from cull_sh.ranking import suppress_duplicates_and_rerank
 from cull_sh.reporting import NullReporter
 from cull_sh.reporting import PipelineReporter
 from cull_sh.scanner import discover_photo_assets
+from cull_sh.shadow import write_topiq_shadow_report
 from cull_sh.xmp import write_photo_metadata
 
 
@@ -86,6 +89,17 @@ def run_pipeline(
     extract_previews(items, extractor, config, run_dir, reporter)
     write_manifest(run_dir, items)
     score_previews(items, config, reporter)
+    score_topiq_shadow(items, config, reporter)
+    ranked_count = apply_topiq_rank_blend(
+        items,
+        config.topiq_rank_weight if config.enable_topiq_ranking else 0.0,
+    )
+    if config.enable_topiq_ranking and ranked_count:
+        reporter.message(
+            "TOPIQ NR promoted into candidate ranking: "
+            f"weight={config.topiq_rank_weight:.0%}, photos={ranked_count}; "
+            "hard-reject votes remain unchanged."
+        )
     optimize_scene_candidates(items, config, reporter)
     rescue_scene_candidates(items, config, reporter)
     local_sidecars_written = persist_decisions(items, config)
@@ -104,6 +118,32 @@ def run_pipeline(
             f"Persisted mirrored JPEG decisions and wrote {mirrored_metadata_written} metadata record(s)."
         )
     write_manifest(run_dir, items)
+    if config.enable_topiq_shadow:
+        try:
+            shadow_summary = write_topiq_shadow_report(
+                items,
+                run_dir,
+                low_percentile=config.topiq_shadow_low_percentile,
+                high_percentile=config.topiq_shadow_high_percentile,
+                max_items=config.topiq_shadow_max_items,
+                rank_weight=(
+                    config.topiq_rank_weight if config.enable_topiq_ranking else 0.0
+                ),
+            )
+        except Exception as exc:  # Shadow reporting must never fail a production cull.
+            reporter.message(f"TOPIQ shadow report failed without affecting decisions: {exc}")
+        else:
+            if shadow_summary is None:
+                reporter.message(
+                    "TOPIQ shadow produced no scores; production decisions were unaffected."
+                )
+            else:
+                reporter.message(
+                    "TOPIQ shadow review ready: "
+                    f"{shadow_summary.review_items} item(s), "
+                    f"{shadow_summary.scene_winner_disagreements} scene disagreement(s), "
+                    f"report={shadow_summary.html_path}"
+                )
     summary = summarize_items(items)
     return items, summary, run_dir
 
@@ -219,6 +259,54 @@ def score_previews(
                     support_errors_reported = True
             reporter.advance_phase("quality")
     reporter.complete_phase("quality", "Scoring local quality")
+
+
+def score_topiq_shadow(
+    items: list[WorkItem],
+    config: PipelineConfig,
+    reporter: PipelineReporter,
+) -> None:
+    if not config.enable_topiq_shadow and not config.enable_topiq_ranking:
+        return
+    candidates = [
+        item
+        for item in items
+        if item.preview is not None
+        and item.metrics is not None
+        and not item.asset.mirrors_paired_raw
+    ]
+    if not candidates:
+        reporter.message("TOPIQ had no extracted previews to score.")
+        return
+
+    failures: list[str] = []
+    reporter.start_phase("topiq", "Scoring TOPIQ NR", len(candidates))
+    with ProcessPoolExecutor(max_workers=config.topiq_shadow_workers) as executor:
+        futures = {
+            executor.submit(score_topiq_quality, item.preview.image_bytes): item
+            for item in candidates
+            if item.preview is not None
+        }
+        for future in as_completed(futures):
+            item = futures[future]
+            try:
+                score = future.result()
+            except Exception as exc:
+                failures.append(f"{item.filename}: {exc}")
+            else:
+                assert item.metrics is not None
+                item.metrics.topiq_score = score
+                if item.local_trace is not None:
+                    scores = item.local_trace.get("scores")
+                    if isinstance(scores, dict):
+                        scores["topiq_shadow"] = score
+            reporter.advance_phase("topiq")
+    reporter.complete_phase("topiq", "Scoring TOPIQ NR")
+    if failures:
+        message = f"TOPIQ scoring failed for {len(failures)}/{len(candidates)}; first={failures[0]}"
+        if config.enable_topiq_ranking:
+            raise RuntimeError(message)
+        reporter.message(message + "; ranking was disabled, so production decisions were unaffected.")
 
 
 def summarize_items(items: list[WorkItem]) -> PipelineSummary:

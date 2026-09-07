@@ -54,6 +54,7 @@ def write_manifest(run_dir: Path, items: list[WorkItem]) -> Path:
                 "tenengrad_score": item.metrics.tenengrad_score if item.metrics else None,
                 "musiq_score": item.metrics.musiq_score if item.metrics else None,
                 "nima_score": item.metrics.nima_score if item.metrics else None,
+                "topiq_score": item.metrics.topiq_score if item.metrics else None,
                 "brisque_score": item.metrics.brisque_score if item.metrics else None,
                 "cpbd_score": item.metrics.cpbd_score if item.metrics else None,
                 "brightness_mean": item.metrics.brightness_mean if item.metrics else None,
@@ -61,6 +62,9 @@ def write_manifest(run_dir: Path, items: list[WorkItem]) -> Path:
                 "face_count": item.metrics.face_count if item.metrics else None,
                 "eye_count": item.metrics.eye_count if item.metrics else None,
                 "local_rank_score": item.metrics.local_rank_score if item.metrics else None,
+                "combined_rank_score": (
+                    item.metrics.combined_rank_score if item.metrics else None
+                ),
                 "perceptual_hash": item.metrics.perceptual_hash if item.metrics else None,
                 "decision": (
                     {
@@ -140,6 +144,9 @@ def write_run_config(run_dir: Path, config: PipelineConfig) -> Path:
         "provider": config.backend.provider,
         "model": config.backend.model,
         "backend_url": config.backend.base_url,
+        "backend_timeout_seconds": config.backend.timeout_seconds,
+        "backend_max_attempts": config.backend.max_attempts,
+        "backend_max_output_tokens": config.backend.max_output_tokens,
         "batch_size": config.batch_size,
         "extract_workers": config.extract_workers,
         "score_workers": config.score_workers,
@@ -148,6 +155,13 @@ def write_run_config(run_dir: Path, config: PipelineConfig) -> Path:
         "min_blur_score": config.min_blur_score,
         "min_tenengrad_score": config.min_tenengrad_score,
         "enable_learned_iqa": config.enable_learned_iqa,
+        "enable_topiq_ranking": config.enable_topiq_ranking,
+        "topiq_rank_weight": config.topiq_rank_weight,
+        "enable_topiq_shadow": config.enable_topiq_shadow,
+        "topiq_shadow_workers": config.topiq_shadow_workers,
+        "topiq_shadow_low_percentile": config.topiq_shadow_low_percentile,
+        "topiq_shadow_high_percentile": config.topiq_shadow_high_percentile,
+        "topiq_shadow_max_items": config.topiq_shadow_max_items,
         "min_musiq_score": config.min_musiq_score,
         "min_nima_score": config.min_nima_score,
         "enable_brisque": config.enable_brisque,

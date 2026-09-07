@@ -17,6 +17,11 @@ def discover_raw_assets(
     for path in root.rglob("*"):
         if not path.is_file():
             continue
+        if path.name.startswith("._"):
+            # macOS writes AppleDouble companions on some external volumes.
+            # They share the photo extension but contain resource-fork data,
+            # not an image that the pipeline can process.
+            continue
         if path.suffix.lower() not in normalized:
             continue
         assets.append(RawAsset(raw_path=path, xmp_path=path.with_suffix(".xmp")))
@@ -40,6 +45,8 @@ def discover_jpeg_assets(
 
     for path in root.rglob("*"):
         if not path.is_file():
+            continue
+        if path.name.startswith("._"):
             continue
         if path.suffix.lower() not in normalized:
             continue

@@ -20,6 +20,16 @@ class ScannerTests(unittest.TestCase):
 
             self.assertEqual([asset.filename for asset in assets], ["a.ARW", "b.ARW", "c.ARW"])
 
+    def test_discover_raw_assets_ignores_appledouble_companions(self) -> None:
+        with TemporaryDirectory() as tmp_dir:
+            root = Path(tmp_dir)
+            (root / "frame.ARW").write_bytes(b"raw")
+            (root / "._frame.ARW").write_bytes(b"appledouble")
+
+            assets = discover_raw_assets(root, (".arw",))
+
+            self.assertEqual([asset.filename for asset in assets], ["frame.ARW"])
+
     def test_discover_photo_assets_includes_jpegs(self) -> None:
         with TemporaryDirectory() as tmp_dir:
             root = Path(tmp_dir)
@@ -38,6 +48,16 @@ class ScannerTests(unittest.TestCase):
                 ["a.ARW", "b.JPG", "c.jpeg"],
             )
             self.assertEqual([asset.is_jpeg for asset in assets], [False, True, True])
+
+    def test_discover_jpeg_assets_ignores_appledouble_companions(self) -> None:
+        with TemporaryDirectory() as tmp_dir:
+            root = Path(tmp_dir)
+            (root / "frame.JPG").write_bytes(b"jpeg")
+            (root / "._frame.JPG").write_bytes(b"appledouble")
+
+            assets = discover_jpeg_assets(root, (".jpg",))
+
+            self.assertEqual([asset.filename for asset in assets], ["frame.JPG"])
 
     def test_discover_jpeg_assets_marks_same_stem_raw_pairs(self) -> None:
         with TemporaryDirectory() as tmp_dir:
