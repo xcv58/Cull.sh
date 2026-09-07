@@ -4,6 +4,7 @@ from pathlib import Path
 from tempfile import TemporaryDirectory
 import unittest
 
+from click import unstyle
 from typer.testing import CliRunner
 
 from cull_sh.cli import app
@@ -28,7 +29,7 @@ class FeedbackExportCliTests(unittest.TestCase):
             )
 
             self.assertNotEqual(result.exit_code, 0)
-            self.assertIn("pass --unattended", result.output)
+            self.assertIn("pass --unattended", unstyle(result.output))
 
 
 if __name__ == "__main__":
