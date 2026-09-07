@@ -263,9 +263,11 @@ not a production dependency.
 
 ## RapidRAW Develop Workflow
 
-RapidRAW is the primary automated renderer. Lightroom remains an optional XMP
-interoperability and manual-review surface; a Lightroom-versus-RapidRAW bakeoff
-is not required for this workflow.
+This is an available experimental workflow, not the current production
+finishing path. The current supported handoff is Lightroom-compatible XMP,
+followed by manual finishing and JPEG export in Lightroom. RapidRAW development
+is paused after its rendered results did not establish Lightroom parity; the
+commands below remain documented so completed experiments stay reproducible.
 
 The RapidRAW path has three explicit gates:
 

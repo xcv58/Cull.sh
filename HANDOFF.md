@@ -1,5 +1,20 @@
 # Cull.sh Handoff
 
+## Current workflow decision — September 6
+
+- Keep Cull.sh for culling, ranking, duplicate handling, and Lightroom-compatible
+  metadata. Continue to use Qwen for semantic culling and TOPIQ only at its
+  existing ranking weight.
+- Use Lightroom as the manual finishing and JPEG-export surface. Do not invest
+  further in Lightroom UI automation unless the user explicitly reopens it.
+- Pause RapidRAW editing/export development. The implementation and completed
+  experiments remain as development evidence, but RapidRAW is not the current
+  production finishing path and its results did not establish Lightroom parity.
+- The ignored twelve-photo Lightroom pilot is intentionally unfinished: it has
+  isolated RAW copies and lens-correction sidecars, but no verified Adaptive
+  Color payloads and no JPEG exports. Nothing in that pilot needs to be resumed
+  or committed.
+
 ## Current development iteration — August 28
 
 - Branch: `codex/sentosa-unattended-quality`, based on `codex/topiq-qwen-rapidraw`.
@@ -66,8 +81,9 @@ TOPIQ/Qwen migration, rendered-feedback pilot, and expanded RapidRAW recipe work
   remove rotated black edges. Preserve
   unsupported but useful HSL/curve/mask/healing/lens ideas as explicit
   `additional_edits`; never report them as rendered.
-- Use RapidRAW as the primary automated renderer/exporter. Lightroom-compatible
-  XMP remains optional interoperability.
+- RapidRAW editing/export is paused and is not the current production finishing
+  path. Lightroom-compatible XMP remains the supported handoff from Cull.sh;
+  finishing and JPEG export are manual in Lightroom.
 
 ## RapidRAW workflow
 
