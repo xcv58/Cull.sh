@@ -2,7 +2,11 @@ from __future__ import annotations
 
 from abc import ABC, abstractmethod
 
-from cull_sh.models import EditSuggestion, FinalDecision, PreviewImage
+from cull_sh.models import EditReview
+from cull_sh.models import EditReviewPair
+from cull_sh.models import EditSuggestion
+from cull_sh.models import FinalDecision
+from cull_sh.models import PreviewImage
 
 
 class VisionBackendError(RuntimeError):
@@ -36,4 +40,12 @@ class VisionBackend(ABC):
 
         Edits are judged per image, so the cohort here is only a batching unit.
         """
+        raise NotImplementedError
+
+    def review_edits(
+        self,
+        prompt: str,
+        pairs: list[EditReviewPair],
+    ) -> list[EditReview]:
+        """Review actual baseline/edited renders and optionally refine once."""
         raise NotImplementedError

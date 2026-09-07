@@ -27,16 +27,30 @@ class CliHelperTests(unittest.TestCase):
                 filename="frame.ARW",
                 asset_id=str(asset.raw_path),
                 exposure=0.1,
+                brightness=0.05,
                 contrast=5,
                 highlights=-10,
                 shadows=4,
+                whites=6,
+                blacks=-3,
+                temperature=4,
+                tint=-2,
                 vibrance=3,
+                saturation=1,
+                clarity=7,
+                dehaze=2,
+                structure=3,
+                sharpness=5,
+                luma_noise_reduction=9,
+                color_noise_reduction=4,
+                vignette_amount=-5,
                 has_crop=True,
                 crop_left=0.1,
                 crop_top=0.05,
                 crop_right=0.9,
                 crop_bottom=0.95,
                 crop_angle=-1.5,
+                additional_edits=["Mask the face."],
                 summary="Slightly dark foreground.",
             )
 
@@ -66,7 +80,30 @@ class CliHelperTests(unittest.TestCase):
             self.assertEqual(rows[1]["crop_right"], 0.9)
             self.assertEqual(rows[1]["crop_bottom"], 0.95)
             self.assertEqual(rows[1]["crop_angle"], -1.5)
+            self.assertEqual(rows[1]["brightness"], 0.05)
+            self.assertEqual(rows[1]["temperature"], 4)
+            self.assertEqual(rows[1]["clarity"], 7)
+            self.assertEqual(rows[1]["luma_noise_reduction"], 9)
+            self.assertEqual(rows[1]["additional_edits"], ["Mask the face."])
             self.assertEqual(rows[1]["summary"], "Slightly dark foreground.")
+
+    def test_edit_suggestion_header_records_inference_policy(self) -> None:
+        with TemporaryDirectory() as tmp_dir:
+            path = _write_edit_suggestions_header(
+                Path(tmp_dir),
+                "prompt",
+                dry_run=True,
+                provider="ollama",
+                model="qwen:test",
+                backend_think=True,
+                backend_max_attempts=1,
+            )
+
+            header = json.loads(path.read_text(encoding="utf-8"))
+
+        self.assertTrue(header["backend_think"])
+        self.assertEqual(header["backend_max_attempts"], 1)
+        self.assertEqual(header["schema_version"], 2)
 
     def test_edit_suggestion_failure_does_not_retry_or_fallback(self) -> None:
         previews = [

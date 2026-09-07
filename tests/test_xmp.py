@@ -16,6 +16,7 @@ from cull_sh.models import LightroomEditScope
 from cull_sh.xmp import CRS_NS
 from cull_sh.xmp import NAMESPACES
 from cull_sh.xmp import jpeg_is_rejected
+from cull_sh.xmp import sidecar_is_picked
 from cull_sh.xmp import sidecar_is_rejected
 from cull_sh.xmp import write_develop_sidecar
 from cull_sh.xmp import write_jpeg_metadata
@@ -24,6 +25,50 @@ from cull_sh.xmp import write_xmp_sidecar
 
 
 class XmpSidecarTests(unittest.TestCase):
+    def test_sidecar_is_picked_prefers_lightroom_good_flag(self) -> None:
+        with TemporaryDirectory() as tmp_dir:
+            target = Path(tmp_dir) / "frame.xmp"
+            target.write_text(
+                """<?xml version="1.0" encoding="UTF-8"?>
+<x:xmpmeta xmlns:x="adobe:ns:meta/" xmlns:rdf="http://www.w3.org/1999/02/22-rdf-syntax-ns#" xmlns:xmp="http://ns.adobe.com/xap/1.0/" xmlns:xmpDM="http://ns.adobe.com/xmp/1.0/DynamicMedia/">
+  <rdf:RDF>
+    <rdf:Description rdf:about="" xmp:Rating="5" xmpDM:Pick="1" xmpDM:good="False"/>
+  </rdf:RDF>
+</x:xmpmeta>
+""",
+                encoding="utf-8",
+            )
+
+            self.assertFalse(sidecar_is_picked(target))
+
+            tree = ET.parse(target)
+            description = tree.getroot().find("rdf:RDF/rdf:Description", NAMESPACES)
+            assert description is not None
+            description.set(
+                "{http://ns.adobe.com/xmp/1.0/DynamicMedia/}good", "True"
+            )
+            description.set("{http://ns.adobe.com/xap/1.0/}Rating", "-1")
+            description.set(
+                "{http://ns.adobe.com/xmp/1.0/DynamicMedia/}Pick", "-1"
+            )
+            tree.write(target, encoding="utf-8", xml_declaration=True)
+
+            self.assertTrue(sidecar_is_picked(target))
+
+    def test_sidecar_is_picked_falls_back_to_positive_rating_or_pick(self) -> None:
+        with TemporaryDirectory() as tmp_dir:
+            target = Path(tmp_dir) / "frame.xmp"
+            target.write_text(
+                """<?xml version="1.0" encoding="UTF-8"?>
+<x:xmpmeta xmlns:x="adobe:ns:meta/" xmlns:rdf="http://www.w3.org/1999/02/22-rdf-syntax-ns#" xmlns:xmp="http://ns.adobe.com/xap/1.0/">
+  <rdf:RDF><rdf:Description rdf:about="" xmp:Rating="4"/></rdf:RDF>
+</x:xmpmeta>
+""",
+                encoding="utf-8",
+            )
+
+            self.assertTrue(sidecar_is_picked(target))
+
     def test_write_new_sidecar(self) -> None:
         with TemporaryDirectory() as tmp_dir:
             target = Path(tmp_dir) / "frame.xmp"

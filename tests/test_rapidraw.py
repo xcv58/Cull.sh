@@ -9,6 +9,7 @@ import unittest
 
 from PIL import Image
 
+from cull_sh.models import EditSuggestion
 from cull_sh.rapidraw import export_rapidraw_stage
 from cull_sh.rapidraw import rapidraw_adjustments_from_suggestion
 from cull_sh.rapidraw import RapidRawError
@@ -17,34 +18,113 @@ from cull_sh.rapidraw import stage_rapidraw_develop
 
 
 class RapidRawWorkflowTests(unittest.TestCase):
+    def test_noop_tracks_every_executable_control_but_not_future_intents(self) -> None:
+        self.assertTrue(
+            EditSuggestion(
+                filename="frame.ARW",
+                additional_edits=["Consider a subject mask."],
+            ).is_noop
+        )
+        self.assertFalse(
+            EditSuggestion(filename="frame.ARW", temperature=1).is_noop
+        )
+        self.assertFalse(
+            EditSuggestion(filename="frame.ARW", crop_angle=0.5).is_noop
+        )
+
     def test_maps_qwen_edit_fields_and_normalized_crop(self) -> None:
         adjustments = rapidraw_adjustments_from_suggestion(
             {
                 "exposure": 0.3,
+                "brightness": 0.1,
                 "contrast": 10,
                 "highlights": -20,
                 "shadows": 25,
+                "whites": 12,
+                "blacks": -8,
+                "temperature": 7,
+                "tint": -3,
                 "vibrance": 5,
+                "saturation": 2,
+                "clarity": 9,
+                "dehaze": 4,
+                "structure": 3,
+                "sharpness": 11,
+                "luma_noise_reduction": 14,
+                "color_noise_reduction": 8,
+                "vignette_amount": -6,
                 "has_crop": True,
                 "crop_left": 0.1,
                 "crop_top": 0.2,
                 "crop_right": 0.9,
                 "crop_bottom": 0.8,
                 "crop_angle": 1.5,
-            }
+            },
+            image_size=(1000, 500),
         )
 
         self.assertEqual(adjustments["exposure"], 0.3)
+        self.assertEqual(adjustments["brightness"], 0.1)
         self.assertEqual(adjustments["highlights"], -20)
+        self.assertEqual(adjustments["whites"], 12)
+        self.assertEqual(adjustments["blacks"], -8)
+        self.assertEqual(adjustments["temperature"], 7)
+        self.assertEqual(adjustments["tint"], -3)
+        self.assertEqual(adjustments["clarity"], 9)
+        self.assertEqual(adjustments["lumaNoiseReduction"], 14)
+        self.assertEqual(adjustments["colorNoiseReduction"], 8)
+        self.assertEqual(adjustments["vignetteAmount"], -6)
         self.assertEqual(
             adjustments["crop"],
-            {"unit": "%", "x": 10.0, "y": 20.0, "width": 80.0, "height": 60.0},
+            {"x": 100.0, "y": 100.0, "width": 800.0, "height": 300.0},
         )
         self.assertEqual(adjustments["rotation"], 1.5)
+
+    def test_rejects_rotation_without_a_crop(self) -> None:
+        with self.assertRaisesRegex(ValueError, "rotation requires a crop"):
+            rapidraw_adjustments_from_suggestion(
+                {
+                    "has_crop": False,
+                    "crop_angle": -2.25,
+                }
+            )
+        with self.assertRaisesRegex(ValueError, "non-default crop bounds"):
+            rapidraw_adjustments_from_suggestion(
+                {
+                    "has_crop": True,
+                    "crop_angle": -2.25,
+                    "crop_left": 0.0,
+                    "crop_top": 0.0,
+                    "crop_right": 1.0,
+                    "crop_bottom": 1.0,
+                },
+                image_size=(1000, 500),
+            )
+
+    def test_rotation_insets_an_optimistic_crop_to_avoid_fill_edges(self) -> None:
+        adjustments = rapidraw_adjustments_from_suggestion(
+            {
+                "has_crop": True,
+                "crop_angle": 5.0,
+                "crop_left": 0.01,
+                "crop_top": 0.01,
+                "crop_right": 0.99,
+                "crop_bottom": 0.99,
+            },
+            image_size=(1000, 500),
+        )
+
+        crop = adjustments["crop"]
+        self.assertGreater(crop["x"], 70.0)
+        self.assertGreater(crop["y"], 35.0)
+        self.assertLess(crop["x"] + crop["width"], 930.0)
+        self.assertLess(crop["y"] + crop["height"], 465.0)
 
     def test_rejects_out_of_range_slider_and_extreme_crop(self) -> None:
         with self.assertRaisesRegex(ValueError, "contrast"):
             rapidraw_adjustments_from_suggestion({"contrast": 101})
+        with self.assertRaisesRegex(ValueError, "luma_noise_reduction"):
+            rapidraw_adjustments_from_suggestion({"luma_noise_reduction": -1})
         with self.assertRaisesRegex(ValueError, "retain at least 10%"):
             rapidraw_adjustments_from_suggestion(
                 {
@@ -53,6 +133,19 @@ class RapidRawWorkflowTests(unittest.TestCase):
                     "crop_top": 0.45,
                     "crop_right": 0.55,
                     "crop_bottom": 0.55,
+                },
+                image_size=(1000, 500),
+            )
+
+    def test_crop_mapping_requires_image_dimensions(self) -> None:
+        with self.assertRaisesRegex(ValueError, "source image dimensions"):
+            rapidraw_adjustments_from_suggestion(
+                {
+                    "has_crop": True,
+                    "crop_left": 0.1,
+                    "crop_top": 0.1,
+                    "crop_right": 0.9,
+                    "crop_bottom": 0.9,
                 }
             )
 
@@ -75,6 +168,9 @@ class RapidRawWorkflowTests(unittest.TestCase):
                 (stage.input_dir / "source.ARW.rrdata").read_text(encoding="utf-8")
             )
             self.assertEqual(sidecar["adjustments"]["exposure"], 0.2)
+            self.assertEqual(sidecar["adjustments"]["temperature"], 6)
+            self.assertEqual(sidecar["adjustments"]["clarity"], 8)
+            self.assertEqual(sidecar["adjustments"]["lumaNoiseReduction"], 12)
             manifest = json.loads(stage.manifest_path.read_text(encoding="utf-8"))
             self.assertFalse(manifest["originals_modified"])
             self.assertTrue(manifest["approval_required"])
@@ -117,6 +213,8 @@ class RapidRawWorkflowTests(unittest.TestCase):
             self.assertIn("Before: embedded RAW preview", html)
             self.assertIn("After: RapidRAW preview render", html)
             self.assertIn("Download approvals", html)
+            self.assertIn("temperature 6", html)
+            self.assertIn("Consider a subtle subject mask.", html)
             self.assertIn(stage.manifest_sha256, html)
 
     def test_export_requires_matching_approval_and_exports_only_approved(self) -> None:
@@ -237,11 +335,26 @@ def _suggestion(source: Path) -> dict[str, object]:
         "filename": source.name,
         "raw_path": str(source),
         "exposure": 0.2,
+        "brightness": 0.1,
         "contrast": 10,
         "highlights": -15,
         "shadows": 20,
+        "whites": 5,
+        "blacks": -4,
+        "temperature": 6,
+        "tint": -2,
         "vibrance": 10,
+        "saturation": 2,
+        "clarity": 8,
+        "dehaze": 3,
+        "structure": 2,
+        "sharpness": 7,
+        "luma_noise_reduction": 12,
+        "color_noise_reduction": 6,
+        "vignette_amount": -4,
         "has_crop": False,
+        "crop_angle": 0.0,
+        "additional_edits": ["Consider a subtle subject mask."],
         "summary": "Natural tonal balance.",
     }
 

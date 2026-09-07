@@ -1,5 +1,27 @@
 # Prospective Validation Baseline
 
+## Qwen-only production dry run (2026-08-21)
+
+- Source: `/Volumes/Sandisk 4T/RAW Photos/2026-05-20 tainan`
+- Run: `runs/20260821-174408-515822`
+- Scope: 66 top-level RAW files; a nested `DONE` subtree was outside the scanner's
+  current-folder scope
+- Model policy: `orcarouter/Qwen3.8-27B-Uncensored`, thinking enabled, one attempt,
+  fail-fast, no fallback
+- Pipeline policy: dry-run, RAW-only, no learned MUSIQ/NIMA, TOPIQ rank weight 0.25
+
+The run grouped the folder into nine scenes. Local/duplicate filtering rejected
+31 photographs before semantic scoring. Qwen returned valid structured decisions
+for all 35 remaining candidates across 12 cohorts: 33 total rejects, 30 review,
+and 3 picks, with zero failed records. No sidecars or Lightroom edit records were
+written. The aggregate SHA-1 over all 132 XMP files, including the nested subtree,
+was unchanged before and after the run:
+`e0660ec7e64d01a97283ba91fa5abb221cab0f18`.
+
+Qwen semantic scoring took 20 minutes 35 seconds. The run therefore validates
+correctness and fail-fast configuration, while also establishing that thinking
+mode has a material latency cost for full-folder processing.
+
 ## Locked cohort
 
 - Folder: `/Volumes/Sandisk 4T/RAW Photos/2026-05-06 Kuala Lumpur`

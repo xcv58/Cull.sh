@@ -136,7 +136,7 @@ def write_develop_sidecar(path: Path, suggestion: EditSuggestion) -> None:
 
 
 def apply_develop_settings(description: ET.Element, suggestion: EditSuggestion) -> None:
-    """Set Camera Raw develop attributes for a suggested global edit."""
+    """Set the safely interoperable Camera Raw subset of a RapidRAW recipe."""
     description.set(
         f"{{{CRS_NS}}}Version",
         description.get(f"{{{CRS_NS}}}Version", "18.3"),
@@ -188,6 +188,30 @@ def sidecar_is_rejected(path: Path) -> bool:
     return rating == "-1" or pick == "-1"
 
 
+def sidecar_is_picked(path: Path) -> bool:
+    """Return True when an existing sidecar marks the photo as picked.
+
+    Lightroom Desktop Local mode treats xmpDM:good as its visible flag state.
+    When present, it is authoritative because older Rating/Pick attributes may
+    remain after a human changes the flag.
+    """
+    if not path.exists():
+        return False
+
+    tree = ET.parse(path)
+    description = _find_description(tree.getroot())
+    if description is None:
+        return False
+
+    good = _metadata_boolean(description.get(f"{{{XMP_DM_NS}}}good"))
+    if good is not None:
+        return good
+
+    rating = _metadata_integer(description.get(f"{{{XMP_NS}}}Rating"))
+    pick = _metadata_integer(description.get(f"{{{XMP_DM_NS}}}Pick"))
+    return (rating is not None and rating > 0) or (pick is not None and pick > 0)
+
+
 def jpeg_is_rejected(path: Path) -> bool:
     exiftool = shutil.which("exiftool")
     if exiftool is None:
@@ -220,10 +244,52 @@ def jpeg_is_rejected(path: Path) -> bool:
     )
 
 
+def jpeg_is_picked(path: Path) -> bool:
+    exiftool = shutil.which("exiftool")
+    if exiftool is None:
+        raise RuntimeError("exiftool is required to read JPEG metadata")
+
+    result = subprocess.run(
+        [
+            exiftool,
+            "-j",
+            "-XMP-xmp:Rating",
+            "-XMP-xmpDM:Pick",
+            "-XMP-xmpDM:good",
+            str(path),
+        ],
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+    if result.returncode != 0:
+        error = result.stderr.strip() or result.stdout.strip()
+        raise RuntimeError(f"exiftool failed to read JPEG metadata: {error}")
+
+    import json
+
+    payload = json.loads(result.stdout)
+    if not payload:
+        return False
+    metadata = payload[0]
+    good = _metadata_boolean(metadata.get("Good"))
+    if good is not None:
+        return good
+    rating = _metadata_integer(metadata.get("Rating"))
+    pick = _metadata_integer(metadata.get("Pick"))
+    return (rating is not None and rating > 0) or (pick is not None and pick > 0)
+
+
 def photo_is_rejected(asset: RawAsset) -> bool:
     if asset.is_jpeg:
         return jpeg_is_rejected(asset.raw_path)
     return sidecar_is_rejected(asset.xmp_path)
+
+
+def photo_is_picked(asset: RawAsset) -> bool:
+    if asset.is_jpeg:
+        return jpeg_is_picked(asset.raw_path)
+    return sidecar_is_picked(asset.xmp_path)
 
 
 def sidecar_has_adaptive_color_payload(path: Path) -> bool:
@@ -322,6 +388,33 @@ def _metadata_is_negative(value: object) -> bool:
     if value == -1 or value == "-1":
         return True
     return False
+
+
+def _metadata_integer(value: object) -> int | None:
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, int):
+        return value
+    if isinstance(value, str):
+        try:
+            return int(value.strip())
+        except ValueError:
+            return None
+    return None
+
+
+def _metadata_boolean(value: object) -> bool | None:
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, int) and value in {0, 1}:
+        return bool(value)
+    if isinstance(value, str):
+        normalized = value.strip().casefold()
+        if normalized in {"true", "1", "yes"}:
+            return True
+        if normalized in {"false", "0", "no"}:
+            return False
+    return None
 
 
 def _load_or_create_tree(path: Path) -> ET.ElementTree:

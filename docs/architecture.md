@@ -20,7 +20,7 @@ The current production split is:
 - Dry run is the default for culling and XMP edit commands.
 - Merge existing XMP rather than replacing unrelated metadata.
 - Keep TOPIQ out of the hard quality-reject vote.
-- Fail fast when required TOPIQ scores or Qwen edit responses are unavailable.
+- Fail fast when required TOPIQ scores or Qwen production responses are unavailable.
 - Stage RapidRAW work in a new isolated directory.
 - Require a manifest-matched approval file before final RapidRAW export, unless
   the caller explicitly passes `--approve-all`.
@@ -57,11 +57,13 @@ changing decisions. `--no-topiq-ranking` restores local-only ordering;
 
 The provider-agnostic backend receives only viable, scene-ranked previews and a
 resolved prompt. Responses are schema-validated and normalized into ratings,
-labels, pick/review/reject buckets, and audit text. The current Qwen 27B model is
-not used for this phase because its independent culling benchmark materially
-underperformed the frozen production pipeline. Ollama generation is capped with
-`num_predict`; this bounds malformed responses that continue streaming and
-therefore do not trigger an inactivity timeout.
+labels, pick/review/reject buckets, and audit text. Qwen 27B is the shared
+production semantic model for culling and editing. It runs with thinking enabled,
+one attempt, no fallback model, and aborts the run after the first failed cohort.
+The deterministic local gate and TOPIQ-assisted ranking remain the primary culling
+structure; Qwen supplies the final semantic triage rather than acting as a
+standalone selector. Ollama generation is capped at 2,048 tokens with
+`num_predict`; this leaves bounded space for thinking plus the final JSON response.
 
 ### 5. Persistence
 
@@ -74,20 +76,33 @@ or JPEG embedded metadata. Source image bytes are never rewritten for RAWs.
 ### 1. Suggest
 
 `suggest-edits` selects culled, non-rejected RAWs and asks
-`orcarouter/Qwen3.8-27B-Uncensored` for bounded exposure, contrast, highlights,
-shadows, vibrance, and optional crop values. The model is fail-fast with one
-attempt and no fallback by default. Recipes and model/prompt provenance are
-frozen in `edit-suggestions.jsonl`.
+`orcarouter/Qwen3.8-27B-Uncensored` for a bounded RapidRAW recipe. The executable
+surface includes global tone, white-balance/color, presence, detail/noise,
+vignette, crop, and safely cropped rotation controls. The model may also preserve
+unbounded editing ideas as explicit `additional_edits`; these notes are never
+represented as rendered changes. Editing uses one image per request, is
+fail-fast with one attempt and no fallback, and freezes recipe plus
+model/prompt provenance in `edit-suggestions.jsonl`.
+The transport schema requires an explicit value for every executable control,
+while persisted recipes retain backward-compatible neutral defaults.
 
 ### 2. Stage
 
 `rapidraw-stage` creates a new directory, copies each source RAW, translates the
 recipe into a colocated `.rrdata` sidecar, and writes an immutable
 `rapidraw-manifest.json` plus an approval template. Duplicate basenames are
-disambiguated. Slider bounds, crop geometry, and a minimum retained crop area
-are validated before any copy is rendered.
+disambiguated. Scalar bounds, rotation-with-crop, crop geometry, and a
+minimum retained crop area are validated before any copy is rendered. Spatial
+operations such as masks and healing remain explicit future-work intents until
+a mask-generation stage can supply real geometry or mask pixels.
 
 ### 3. Preview and approve
+
+The bounded validation stage receives the neutral and rendered pair plus actual
+decoded dimensions and measured outer-edge facts. This prevents aspect-ratio
+padding introduced by vision preprocessing from being reported as image
+letterboxing. The validator may accept, reject, or make one bounded refinement;
+the human preference recorded by the review page remains authoritative.
 
 `rapidraw-preview` invokes RapidRAW's headless CLI on the staged copies and
 builds a private `review.html` with actual before/after renders. Choices are
@@ -103,10 +118,11 @@ exports.
 
 ## Model Policy
 
-- Culling: retain the validated existing local/semantic pipeline.
+- Culling: retain the validated local/TOPIQ structure with Qwen 27B semantic triage.
 - Candidate rank: local percentile 75%, TOPIQ-NR percentile 25%.
 - Hard reject: deterministic multi-signal technical gate; no TOPIQ vote.
-- Editing: Qwen 27B, fail-fast, no fallback.
+- Production model: Qwen 27B with thinking enabled, one attempt, fail-fast, no fallback.
+- Gemma: historical benchmark support only; not a production dependency.
 - Facet: benchmark/reference source only; do not depend on its complete pipeline.
 
 ## Primary Modules
@@ -116,7 +132,8 @@ exports.
 - `cull_sh.quality`: local and TOPIQ scoring.
 - `cull_sh.ranking`: scene-relative ranking and TOPIQ percentile blend.
 - `cull_sh.backends`: structured provider contracts and Ollama implementation.
-- `cull_sh.benchmark`, `edit_benchmark`, `vlm_benchmark`: frozen evaluations.
+- `cull_sh.benchmark`, `edit_benchmark`, `vlm_benchmark`, `culling_blind`:
+  frozen evaluations and hidden-identity human review.
 - `cull_sh.shadow`: capped local/TOPIQ disagreement review.
 - `cull_sh.rapidraw`: isolated staging, real-render review, approval enforcement,
   export provenance, and resume state.

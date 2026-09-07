@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from concurrent.futures import ThreadPoolExecutor
 from concurrent.futures import as_completed
+from dataclasses import asdict
 import json
 from pathlib import Path
 import shutil
@@ -16,7 +17,16 @@ from rich.table import Table
 from cull_sh.backends import build_backend
 from cull_sh.backends import VisionBackendError
 from cull_sh.benchmark import run_internal_benchmark
-from cull_sh.config import BackendConfig, DEFAULT_EXTENSIONS, JPEG_EXTENSIONS, PipelineConfig
+from cull_sh.config import BackendConfig
+from cull_sh.config import DEFAULT_EXTENSIONS
+from cull_sh.config import DEFAULT_PRODUCTION_MODEL
+from cull_sh.config import JPEG_EXTENSIONS
+from cull_sh.config import PipelineConfig
+from cull_sh.culling_blind import run_culling_blind_test
+from cull_sh.culling_blind import run_ground_truth_culling_test
+from cull_sh.culling_blind import run_sampled_culling_blind_test
+from cull_sh.culling_blind import score_blind_culling_choices
+from cull_sh.culling_blind import score_ground_truth_culling_choices
 from cull_sh.extractors import PreviewExtractionError
 from cull_sh.extractors import build_default_extractor
 from cull_sh.edit_benchmark import EditDatasetSpec
@@ -24,6 +34,9 @@ from cull_sh.edit_benchmark import EditModelSpec
 from cull_sh.edit_benchmark import run_edit_benchmark
 from cull_sh.edit_benchmark import stage_lightroom_blind_review
 from cull_sh.edit_benchmark import write_blind_review_page
+from cull_sh.edit_feedback import export_feedback_stage
+from cull_sh.edit_feedback import run_feedback_pilot
+from cull_sh.edit_feedback import select_feedback_picks
 from cull_sh.lightroom_ui import build_adaptive_color_stage
 from cull_sh.lightroom_ui import build_jpeg_auto_stage
 from cull_sh.lightroom_ui import write_adaptive_color_handoff
@@ -52,6 +65,7 @@ from cull_sh.rapidraw import render_rapidraw_review
 from cull_sh.rapidraw import stage_rapidraw_develop
 from cull_sh.reporting import RichPipelineReporter
 from cull_sh.scanner import discover_raw_assets
+from cull_sh.xmp import photo_is_picked
 from cull_sh.xmp import sidecar_is_rejected
 from cull_sh.xmp import write_develop_sidecar
 from cull_sh.xmp import write_photo_metadata
@@ -61,10 +75,12 @@ from cull_sh.vlm_benchmark import run_vlm_benchmark
 
 
 DEFAULT_EDIT_PROMPT = (
-    "Suggest natural, balanced global edits that improve each photo while keeping "
-    "a realistic look."
+    "Treat the neutral RapidRAW render as a starting point. Diagnose each photo, "
+    "then suggest natural, balanced global and composition edits that produce a "
+    "meaningful realistic improvement. Keep a control at zero when changing it "
+    "would not help, and record useful edits outside the executable controls as "
+    "additional edit intents."
 )
-DEFAULT_EDIT_MODEL = "orcarouter/Qwen3.8-27B-Uncensored"
 DEFAULT_RAPIDRAW_BINARY = (
     Path.home() / "Applications/RapidRAW.app/Contents/MacOS/RapidRAW"
 )
@@ -350,6 +366,296 @@ def model_benchmark(
     console.print(f"Report: {run_dir / 'vlm-benchmark.md'}")
 
 
+@app.command("blind-culling-test")
+def blind_culling_test(
+    frozen_run: Path = typer.Option(
+        ...,
+        exists=True,
+        file_okay=False,
+        dir_okay=True,
+        help="Frozen prospective Cull.sh run that defines semantic candidates.",
+    ),
+    gemma_model: str = typer.Option("gemma4:12b"),
+    qwen_model: str = typer.Option("orcarouter/Qwen3.8-27B-Uncensored"),
+    batch_size: int = typer.Option(4, min=1),
+    seed: int = typer.Option(20260821),
+    timeout_seconds: float = typer.Option(600.0, min=1.0),
+    max_attempts: int = typer.Option(2, min=1),
+    resume_run: Path | None = typer.Option(
+        None,
+        exists=True,
+        file_okay=False,
+        dir_okay=True,
+    ),
+    runs_root: Path = typer.Option(
+        Path("runs/culling-blind-tests"),
+        file_okay=False,
+        dir_okay=True,
+    ),
+) -> None:
+    """Create a hidden-identity Gemma/Qwen culling review without reading XMP."""
+    specs = [
+        VLMModelSpec(label="gemma4-12b", model=gemma_model),
+        VLMModelSpec(
+            label="qwen3-8-27b-nothink",
+            model=qwen_model,
+            think=False,
+        ),
+    ]
+    console.print("Blind culling test is read-only for photos and does not read XMP.")
+    try:
+        page, _answer_key = run_culling_blind_test(
+            frozen_run,
+            specs,
+            runs_root,
+            batch_size=batch_size,
+            seed=seed,
+            timeout_seconds=timeout_seconds,
+            max_attempts=max_attempts,
+            cull_sh_commit=_current_git_commit(),
+            resume_run=resume_run,
+            progress=console.print,
+        )
+    except (FileNotFoundError, VisionBackendError, ValueError) as exc:
+        console.print(f"Blind culling test failed: {exc}")
+        raise typer.Exit(code=1) from exc
+    console.print(f"Blind review page: {page}")
+    console.print(
+        "The hidden answer key is stored beside the page; do not open it until "
+        "after downloading blind-culling-choices.csv."
+    )
+
+
+@app.command("score-blind-culling")
+def score_blind_culling(
+    run_dir: Path = typer.Option(
+        ...,
+        exists=True,
+        file_okay=False,
+        dir_okay=True,
+    ),
+    choices: Path = typer.Option(
+        ...,
+        exists=True,
+        file_okay=True,
+        dir_okay=False,
+        help="blind-culling-choices.csv downloaded from the review page.",
+    ),
+) -> None:
+    """Reveal and score a completed blind culling-model review."""
+    payload = score_blind_culling_choices(run_dir, choices)
+    counts = payload["counts"]
+    assert isinstance(counts, dict)
+    table = Table(title="Blind culling review")
+    table.add_column("Outcome")
+    table.add_column("Count", justify="right")
+    for label, count in counts.items():
+        table.add_row(str(label), str(count))
+    console.print(table)
+    console.print(f"Scored {payload['reviewed']} reviewed photo(s).")
+    console.print(f"Report: {run_dir / 'blind-culling-score.md'}")
+
+
+@app.command("blind-culling-sample")
+def blind_culling_sample(
+    photos_root: Path = typer.Option(
+        Path("/Volumes/Sandisk 4T/RAW Photos"),
+        exists=True,
+        file_okay=False,
+        dir_okay=True,
+        help="Root containing candidate photo folders.",
+    ),
+    folder_count: int = typer.Option(6, min=1),
+    photos_per_folder: int = typer.Option(2, min=1),
+    min_sequence_gap: int = typer.Option(
+        10,
+        min=1,
+        help="Minimum numeric filename distance within each selected folder.",
+    ),
+    exclude_folder: list[str] = typer.Option(
+        [],
+        "--exclude-folder",
+        help="Exact folder name to exclude; may be repeated.",
+    ),
+    prompt: str | None = typer.Option(None),
+    gemma_model: str = typer.Option("gemma4:12b"),
+    qwen_model: str = typer.Option("orcarouter/Qwen3.8-27B-Uncensored"),
+    seed: int = typer.Option(20260821),
+    timeout_seconds: float = typer.Option(600.0, min=1.0),
+    max_attempts: int = typer.Option(2, min=1),
+    resume_run: Path | None = typer.Option(
+        None,
+        exists=True,
+        file_okay=False,
+        dir_okay=True,
+    ),
+    runs_root: Path = typer.Option(
+        Path("runs/culling-blind-tests"),
+        file_okay=False,
+        dir_okay=True,
+    ),
+) -> None:
+    """Blind-test a spaced random sample drawn across multiple folders."""
+    resolved_prompt = (prompt or resolve_prompt(None, GenrePreset.AUTO).prompt).strip()
+    specs = [
+        VLMModelSpec(label="gemma4-12b", model=gemma_model),
+        VLMModelSpec(
+            label="qwen3-8-27b-nothink",
+            model=qwen_model,
+            think=False,
+        ),
+    ]
+    console.print(
+        "Random multi-folder blind test is read-only for photos and does not read XMP."
+    )
+    try:
+        page, _answer_key = run_sampled_culling_blind_test(
+            photos_root,
+            resolved_prompt,
+            specs,
+            runs_root,
+            folder_count=folder_count,
+            photos_per_folder=photos_per_folder,
+            min_sequence_gap=min_sequence_gap,
+            seed=seed,
+            excluded_folders=tuple(exclude_folder),
+            timeout_seconds=timeout_seconds,
+            max_attempts=max_attempts,
+            cull_sh_commit=_current_git_commit(),
+            resume_run=resume_run,
+            progress=console.print,
+        )
+    except (FileNotFoundError, VisionBackendError, ValueError) as exc:
+        console.print(f"Random blind culling test failed: {exc}")
+        raise typer.Exit(code=1) from exc
+    console.print(f"Blind review page: {page}")
+    console.print(
+        "The hidden answer key is stored beside the page; do not open it until "
+        "after downloading blind-culling-choices.csv."
+    )
+
+
+@app.command("culling-ground-truth-test")
+def culling_ground_truth_test(
+    photos_root: Path = typer.Option(
+        Path("/Volumes/Sandisk 4T/RAW Photos"),
+        exists=True,
+        file_okay=False,
+        dir_okay=True,
+    ),
+    folder_count: int = typer.Option(13, min=1),
+    total_photos: int = typer.Option(30, min=1),
+    min_sequence_gap: int = typer.Option(25, min=1),
+    exclude_folder: list[str] = typer.Option([], "--exclude-folder"),
+    exclude_run: list[Path] = typer.Option(
+        [],
+        "--exclude-run",
+        exists=True,
+        file_okay=False,
+        dir_okay=True,
+        help="Earlier blind-test run whose sampled RAW files must be excluded.",
+    ),
+    prompt: str | None = typer.Option(None),
+    gemma_model: str = typer.Option("gemma4:12b"),
+    qwen_model: str = typer.Option("orcarouter/Qwen3.8-27B-Uncensored"),
+    seed: int = typer.Option(20260822),
+    timeout_seconds: float = typer.Option(600.0, min=1.0),
+    max_attempts: int = typer.Option(2, min=1),
+    resume_run: Path | None = typer.Option(
+        None,
+        exists=True,
+        file_okay=False,
+        dir_okay=True,
+    ),
+    runs_root: Path = typer.Option(
+        Path("runs/culling-ground-truth-tests"),
+        file_okay=False,
+        dir_okay=True,
+    ),
+) -> None:
+    """Run a photo-only human ground-truth test with all model output hidden."""
+    resolved_prompt = (prompt or resolve_prompt(None, GenrePreset.AUTO).prompt).strip()
+    specs = [
+        VLMModelSpec(label="gemma4-12b", model=gemma_model),
+        VLMModelSpec(
+            label="qwen3-8-27b-nothink",
+            model=qwen_model,
+            think=False,
+        ),
+    ]
+    console.print(
+        "Ground-truth test is read-only for photos, does not read XMP, and hides "
+        "all model output during review."
+    )
+    try:
+        page, _key = run_ground_truth_culling_test(
+            photos_root,
+            resolved_prompt,
+            specs,
+            runs_root,
+            folder_count=folder_count,
+            total_photos=total_photos,
+            min_sequence_gap=min_sequence_gap,
+            seed=seed,
+            excluded_folders=tuple(exclude_folder),
+            excluded_runs=tuple(exclude_run),
+            timeout_seconds=timeout_seconds,
+            max_attempts=max_attempts,
+            cull_sh_commit=_current_git_commit(),
+            resume_run=resume_run,
+            progress=console.print,
+        )
+    except (FileNotFoundError, VisionBackendError, ValueError) as exc:
+        console.print(f"Ground-truth culling test failed: {exc}")
+        raise typer.Exit(code=1) from exc
+    console.print(f"Independent review page: {page}")
+    console.print(
+        "Choose your own reject/review/pick labels, download "
+        "culling-ground-truth-choices.csv, and score only after review."
+    )
+
+
+@app.command("score-culling-ground-truth")
+def score_culling_ground_truth(
+    run_dir: Path = typer.Option(
+        ...,
+        exists=True,
+        file_okay=False,
+        dir_okay=True,
+    ),
+    choices: Path = typer.Option(
+        ...,
+        exists=True,
+        file_okay=True,
+        dir_okay=False,
+    ),
+) -> None:
+    """Compare hidden model decisions with independent human culling labels."""
+    payload = score_ground_truth_culling_choices(run_dir, choices)
+    table = Table(title="Independent culling ground truth")
+    table.add_column("Model")
+    table.add_column("Exact", justify="right")
+    table.add_column("Accuracy", justify="right")
+    table.add_column("Ordinal error", justify="right")
+    table.add_column("False rejects", justify="right")
+    table.add_column("Missed picks", justify="right")
+    models = payload["models"]
+    assert isinstance(models, dict)
+    for label, metrics in models.items():
+        assert isinstance(metrics, dict)
+        table.add_row(
+            str(label),
+            f"{metrics['exact_matches']}/{metrics['covered']}",
+            f"{float(metrics['accuracy']):.1%}",
+            f"{float(metrics['mean_ordinal_error']):.3f}",
+            str(metrics["false_rejects"]),
+            str(metrics["missed_picks"]),
+        )
+    console.print(table)
+    console.print(f"Paired result: {payload['paired']}")
+    console.print(f"Report: {run_dir / 'culling-ground-truth-score.md'}")
+
+
 @app.command("edit-model-benchmark")
 def edit_model_benchmark(
     xiuling_path: Path = typer.Option(
@@ -503,14 +809,14 @@ def doctor(
             for model in models
             if isinstance(model, dict)
         }
-        edit_model_ready = DEFAULT_EDIT_MODEL in installed_names or any(
-            name.startswith(f"{DEFAULT_EDIT_MODEL}:") for name in installed_names
+        production_model_ready = DEFAULT_PRODUCTION_MODEL in installed_names or any(
+            name.startswith(f"{DEFAULT_PRODUCTION_MODEL}:") for name in installed_names
         )
         health.add_row(
-            "Edit model",
-            f"ready ({DEFAULT_EDIT_MODEL})"
-            if edit_model_ready
-            else f"missing ({DEFAULT_EDIT_MODEL})",
+            "Production model",
+            f"ready ({DEFAULT_PRODUCTION_MODEL})"
+            if production_model_ready
+            else f"missing ({DEFAULT_PRODUCTION_MODEL})",
         )
     except Exception as exc:  # pragma: no cover - environment dependent
         health.add_row("Ollama API", f"unreachable: {exc}")
@@ -540,7 +846,7 @@ def cull(
         help="Ask for genre and preferences when no prompt is provided.",
     ),
     provider: str = typer.Option("ollama", help="Vision backend provider."),
-    model: str = typer.Option("gemma4:12b", help="Vision backend model name."),
+    model: str = typer.Option(DEFAULT_PRODUCTION_MODEL, help="Vision backend model name."),
     backend_url: str = typer.Option(
         "http://localhost:11434",
         help="Base URL for the selected backend.",
@@ -551,12 +857,22 @@ def cull(
         help="Per-request Ollama inactivity timeout in seconds.",
     ),
     backend_max_attempts: int = typer.Option(
-        3,
+        1,
         min=1,
-        help="Maximum attempts for a failed or malformed culling response.",
+        help="Maximum attempts for a failed or malformed culling response; defaults to fail-fast.",
+    ),
+    backend_think: bool = typer.Option(
+        True,
+        "--backend-think/--no-backend-think",
+        help="Enable the production model's thinking mode.",
+    ),
+    backend_fail_fast: bool = typer.Option(
+        True,
+        "--backend-fail-fast/--continue-on-backend-error",
+        help="Stop after the first failed or malformed vision cohort.",
     ),
     backend_max_output_tokens: int = typer.Option(
-        1024,
+        2048,
         min=1,
         help="Hard Ollama generation ceiling for each structured response.",
     ),
@@ -710,6 +1026,8 @@ def cull(
             base_url=backend_url,
             timeout_seconds=backend_timeout,
             max_attempts=backend_max_attempts,
+            think=backend_think,
+            fail_fast=backend_fail_fast,
             max_output_tokens=backend_max_output_tokens,
         ),
         limit=limit,
@@ -745,8 +1063,13 @@ def cull(
         dry_run=dry_run,
     )
 
-    with RichPipelineReporter(console) as reporter:
-        items, summary, run_dir = run_pipeline(config, reporter=reporter)
+    try:
+        with RichPipelineReporter(console) as reporter:
+            items, summary, run_dir = run_pipeline(config, reporter=reporter)
+    except VisionBackendError as exc:
+        console.print(f"Culling stopped after the first vision-model failure: {exc}")
+        console.print("No fallback model or additional cohort was attempted.")
+        raise typer.Exit(code=1) from exc
     console.print(f"Discovered {summary.discovered} photo file(s) under {path}")
     console.print(
         f"Assets: RAW={summary.raw_discovered}, JPEG={summary.jpeg_discovered}"
@@ -1133,7 +1456,7 @@ def suggest_edits(
         help="Optional short preference appended to the edit prompt.",
     ),
     provider: str = typer.Option("ollama", help="Vision backend provider."),
-    model: str = typer.Option(DEFAULT_EDIT_MODEL, help="Vision backend model name."),
+    model: str = typer.Option(DEFAULT_PRODUCTION_MODEL, help="Vision backend model name."),
     backend_url: str = typer.Option(
         "http://localhost:11434",
         help="Base URL for the selected backend.",
@@ -1148,15 +1471,20 @@ def suggest_edits(
         min=1,
         help="Maximum attempts for each edit suggestion model call; defaults to fail-fast.",
     ),
+    backend_think: bool = typer.Option(
+        True,
+        "--backend-think/--no-backend-think",
+        help="Enable the production model's thinking mode.",
+    ),
     backend_max_output_tokens: int = typer.Option(
-        1024,
+        2048,
         min=1,
         help="Hard Ollama generation ceiling for each structured edit response.",
     ),
     batch_size: int = typer.Option(
-        4,
+        1,
         min=1,
-        help="Maximum images per cohort sent to the model in one request.",
+        help="Images per request; one avoids cross-image edit leakage.",
     ),
     limit: int | None = typer.Option(
         None,
@@ -1175,16 +1503,17 @@ def suggest_edits(
         help="Also suggest edits for RAW files with no existing XMP sidecar.",
     ),
     with_crop: bool = typer.Option(
-        False,
+        True,
         "--with-crop/--no-with-crop",
-        help="Allow the model to suggest composition crop and leveling settings.",
+        help="Allow the model to suggest crop and safely cropped rotation/leveling.",
     ),
 ) -> None:
     """Suggest optional develop edits for culled, non-rejected RAW files.
 
     The default dry run produces a frozen JSONL recipe for the RapidRAW workflow.
-    With --no-dry-run, edits are also written as standard, fully reversible Camera
-    Raw settings into XMP. Rejected and unculled RAW files are skipped unless
+    With --no-dry-run, the Lightroom-compatible subset is also written as fully
+    reversible Camera Raw settings into XMP. The complete RapidRAW recipe remains
+    frozen in JSONL. Rejected and unculled RAW files are skipped unless
     --include-unculled is passed.
     """
     edit_prompt = (prompt or DEFAULT_EDIT_PROMPT).strip()
@@ -1242,6 +1571,8 @@ def suggest_edits(
                 base_url=backend_url,
                 timeout_seconds=backend_timeout,
                 max_attempts=max_attempts,
+                think=backend_think,
+                fail_fast=True,
                 max_output_tokens=backend_max_output_tokens,
             )
         )
@@ -1257,8 +1588,15 @@ def suggest_edits(
         provider=provider,
         model=model,
         source_root=path,
+        backend_think=backend_think,
+        backend_max_attempts=max_attempts,
     )
     console.print(f"Run artifacts: {run_dir}")
+    if not dry_run:
+        console.print(
+            "XMP interoperability writes only the Lightroom-compatible core; "
+            "the complete expanded recipe is preserved for RapidRAW in JSONL."
+        )
 
     suggestions: list[tuple[RawAsset, EditSuggestion]] = []
     written = 0
@@ -1316,24 +1654,57 @@ def suggest_edits(
         "Crop suggestions",
         str(sum(1 for _, suggestion in suggestions if suggestion.has_crop)),
     )
+    summary.add_row(
+        "Rotation suggestions",
+        str(sum(1 for _, suggestion in suggestions if suggestion.crop_angle != 0.0)),
+    )
+    summary.add_row(
+        "Additional edit intents",
+        str(sum(len(suggestion.additional_edits) for _, suggestion in suggestions)),
+    )
     summary.add_row("Model failure policy", "fail-fast")
-    summary.add_row("Sidecars written", str(written))
+    summary.add_row("XMP sidecars written (compatible subset)", str(written))
     summary.add_row("Dry run", "yes" if dry_run else "no")
     console.print(summary)
 
     if suggestions:
         preview_table = Table(title="Suggested Edits (first 10)")
-        for column in ("Filename", "Exp", "Contr", "High", "Shad", "Vib", "Crop", "Note"):
+        for column in (
+            "Filename",
+            "Tone",
+            "Color",
+            "Presence",
+            "Detail",
+            "Composition",
+            "Other",
+            "Note",
+        ):
             preview_table.add_column(column)
         for _, suggestion in suggestions[:10]:
             preview_table.add_row(
                 suggestion.filename,
-                f"{suggestion.exposure:+.2f}",
-                str(suggestion.contrast),
-                str(suggestion.highlights),
-                str(suggestion.shadows),
-                str(suggestion.vibrance),
-                "yes" if suggestion.has_crop else "no",
+                (
+                    f"exp {suggestion.exposure:+.2f}, bright {suggestion.brightness:+.2f}, "
+                    f"C {suggestion.contrast}, H {suggestion.highlights}, S {suggestion.shadows}, "
+                    f"W {suggestion.whites}, B {suggestion.blacks}"
+                ),
+                (
+                    f"temp {suggestion.temperature}, tint {suggestion.tint}, "
+                    f"vib {suggestion.vibrance}, sat {suggestion.saturation}"
+                ),
+                (
+                    f"clarity {suggestion.clarity}, dehaze {suggestion.dehaze}, "
+                    f"structure {suggestion.structure}"
+                ),
+                (
+                    f"sharp {suggestion.sharpness}, NR "
+                    f"{suggestion.luma_noise_reduction}/{suggestion.color_noise_reduction}"
+                ),
+                (
+                    f"crop {'yes' if suggestion.has_crop else 'no'}, "
+                    f"rotation {suggestion.crop_angle:+.2f}"
+                ),
+                str(len(suggestion.additional_edits)),
                 (suggestion.summary[:40] + "…")
                 if len(suggestion.summary) > 41
                 else suggestion.summary,
@@ -1343,6 +1714,178 @@ def suggest_edits(
     if read_errors:
         _print_error_table("Suggest Edits Errors", read_errors)
         raise typer.Exit(code=1)
+
+
+@app.command("rapidraw-feedback-pilot")
+def rapidraw_feedback_pilot(
+    path: Path = typer.Option(..., exists=True, file_okay=False, dir_okay=True),
+    cull_run: Path = typer.Option(
+        ...,
+        exists=True,
+        file_okay=False,
+        dir_okay=True,
+        help="Frozen culling run whose final picks define the pilot.",
+    ),
+    human_baseline: Path = typer.Option(
+        ...,
+        exists=True,
+        file_okay=False,
+        dir_okay=True,
+        help="Pre-application XMP backup defining existing human picks.",
+    ),
+    output: Path = typer.Option(
+        ...,
+        file_okay=False,
+        dir_okay=True,
+        help="Isolated resumable RapidRAW feedback stage.",
+    ),
+    prompt: str = typer.Option(DEFAULT_EDIT_PROMPT),
+    model: str = typer.Option(DEFAULT_PRODUCTION_MODEL),
+    backend_url: str = typer.Option("http://localhost:11434"),
+    backend_timeout: float = typer.Option(600.0, min=1.0),
+    backend_max_output_tokens: int = typer.Option(2048, min=1),
+    suggestion_batch_size: int = typer.Option(
+        1, min=1, help="Images per suggestion request; one avoids cross-image leakage."
+    ),
+    review_batch_size: int = typer.Option(
+        1, min=1, help="Rendered pairs per review request; one avoids pair leakage."
+    ),
+    include_existing_picks: bool = typer.Option(
+        False,
+        "--include-existing-picks/--machine-picks-only",
+        help="Edit the union of protected baseline picks and frozen machine picks.",
+    ),
+    frozen_machine_picks: bool = typer.Option(
+        False,
+        "--frozen-machine-picks",
+        help=(
+            "Use every pick from the frozen manifest while ignoring pre-existing "
+            "flags; intended for an uncontaminated automated test arm."
+        ),
+    ),
+    with_crop: bool = typer.Option(True, "--with-crop/--no-with-crop"),
+    rapidraw_binary: Path = typer.Option(DEFAULT_RAPIDRAW_BINARY),
+) -> None:
+    """Run a neutral-render, suggest, render, and one-refinement edit loop."""
+    if include_existing_picks and frozen_machine_picks:
+        raise typer.BadParameter(
+            "use either --include-existing-picks or --frozen-machine-picks, not both"
+        )
+    assets = select_feedback_picks(
+        cull_run,
+        human_baseline,
+        path,
+        include_existing_picks=include_existing_picks,
+        ignore_baseline_picks=frozen_machine_picks,
+    )
+    scope = (
+        "frozen machine"
+        if frozen_machine_picks
+        else "all final"
+        if include_existing_picks
+        else "machine-added"
+    )
+    console.print(f"{scope.capitalize()} picked pilot photos: {len(assets)}")
+    if not assets:
+        raise typer.BadParameter(f"the frozen run has no {scope} picks")
+    console.print(", ".join(asset.filename for asset in assets))
+    backend = build_backend(
+        BackendConfig(
+            provider="ollama",
+            model=model,
+            base_url=backend_url,
+            timeout_seconds=backend_timeout,
+            max_attempts=1,
+            think=True,
+            fail_fast=True,
+            max_output_tokens=backend_max_output_tokens,
+        )
+    )
+    try:
+        result = run_feedback_pilot(
+            assets,
+            output,
+            rapidraw_binary,
+            backend,
+            prompt=prompt,
+            model=model,
+            cull_run=cull_run,
+            human_baseline=human_baseline,
+            suggestion_batch_size=suggestion_batch_size,
+            review_batch_size=review_batch_size,
+            include_crop=with_crop,
+            selection_scope=(
+                "frozen-machine-picks"
+                if frozen_machine_picks
+                else "protected-and-machine-picks"
+                if include_existing_picks
+                else "machine-added-picks"
+            ),
+            progress=console.print,
+        )
+    except (FileNotFoundError, RuntimeError, ValueError, VisionBackendError) as exc:
+        console.print(f"RapidRAW feedback pilot stopped: {exc}")
+        console.print("The isolated stage is resumable; originals were not modified.")
+        raise typer.Exit(code=1) from exc
+    console.print(
+        f"Pilot complete: photos={result.photos} accept={result.accepted} "
+        f"refine={result.refined} revert={result.reverted}"
+    )
+    console.print(f"Manifest: {result.manifest_path}")
+    console.print(f"Human review: {result.review_page}")
+
+
+@app.command("rapidraw-feedback-export")
+def rapidraw_feedback_export(
+    stage: Path = typer.Option(
+        ...,
+        exists=True,
+        file_okay=False,
+        dir_okay=True,
+        help="Completed stage created by rapidraw-feedback-pilot.",
+    ),
+    output: Path = typer.Option(
+        ...,
+        file_okay=False,
+        dir_okay=True,
+        help="Delivery folder containing JPEG files only; supports safe resume.",
+    ),
+    unattended: bool = typer.Option(
+        False,
+        "--unattended",
+        help="Explicitly accept Qwen validation without human approval.",
+    ),
+    rapidraw_binary: Path = typer.Option(DEFAULT_RAPIDRAW_BINARY),
+    quality: int = typer.Option(95, min=1, max=100),
+    keep_metadata: bool = typer.Option(
+        True,
+        "--keep-metadata/--strip-metadata",
+        help="Retain capture metadata in delivery JPEGs.",
+    ),
+) -> None:
+    """Export all completed Qwen-validated finals as delivery JPEGs."""
+    if not unattended:
+        raise typer.BadParameter(
+            "pass --unattended to acknowledge export without human approval"
+        )
+    try:
+        result = export_feedback_stage(
+            stage,
+            rapidraw_binary,
+            output,
+            quality=quality,
+            keep_metadata=keep_metadata,
+        )
+    except (FileExistsError, FileNotFoundError, RuntimeError, ValueError) as exc:
+        console.print(f"RapidRAW unattended feedback export stopped: {exc}")
+        console.print("The isolated stage and completed delivery JPEGs are resumable.")
+        raise typer.Exit(code=1) from exc
+    console.print(
+        f"Unattended delivery complete: photos={result.photos} "
+        f"newly_exported={result.exported} resumed={result.resumed}"
+    )
+    console.print(f"Delivery JPEGs: {result.output_dir}")
+    console.print(f"Export manifest: {result.manifest_path}")
 
 
 @app.command("rapidraw-stage")
@@ -1498,7 +2041,6 @@ def repair_sidecars(
     ),
     runs_root: Path = typer.Option(
         Path("runs"),
-        exists=True,
         file_okay=False,
         dir_okay=True,
         help="Root directory containing run artifacts when --run-dir is omitted.",
@@ -1513,6 +2055,16 @@ def repair_sidecars(
         "--lightroom-edit-scope",
         help="Which repaired sidecars receive Lightroom edits: all or kept.",
     ),
+    preserve_existing_picks: bool = typer.Option(
+        False,
+        "--preserve-existing-picks/--replace-existing-picks",
+        help="Leave photos currently marked as picks completely unchanged.",
+    ),
+    dry_run: bool = typer.Option(
+        True,
+        "--dry-run/--no-dry-run",
+        help="Preview replay counts without writing metadata (the default).",
+    ),
 ) -> None:
     """Rewrite sidecars from an existing manifest without rerunning scoring."""
     try:
@@ -1523,6 +2075,7 @@ def repair_sidecars(
 
     rewritten = 0
     skipped = 0
+    preserved_picks = 0
     for record in records:
         decision = decision_from_manifest_record(record)
         if decision is None:
@@ -1538,16 +2091,24 @@ def repair_sidecars(
             kind=asset_kind,
             paired_raw_path=Path(str(paired_raw_path)) if paired_raw_path else None,
         )
-        write_photo_metadata(
-            asset,
-            decision,
-            apply_lightroom_edit=lightroom_auto_edit,
-            lightroom_edit_scope=lightroom_edit_scope,
-        )
+        if preserve_existing_picks and photo_is_picked(asset):
+            preserved_picks += 1
+            continue
+        if not dry_run:
+            write_photo_metadata(
+                asset,
+                decision,
+                apply_lightroom_edit=lightroom_auto_edit,
+                lightroom_edit_scope=lightroom_edit_scope,
+            )
         rewritten += 1
 
     console.print(f"Run artifacts: {target_run_dir}")
-    console.print(f"Sidecars rewritten: {rewritten}")
+    console.print(f"Mode: {'dry run' if dry_run else 'write'}")
+    console.print(
+        f"Sidecars {'that would be rewritten' if dry_run else 'rewritten'}: {rewritten}"
+    )
+    console.print(f"Existing picks preserved: {preserved_picks}")
     console.print(f"Records skipped: {skipped}")
     console.print(
         "Lightroom auto edit: "
@@ -1617,6 +2178,8 @@ def _write_edit_suggestions_header(
     provider: str | None = None,
     model: str | None = None,
     source_root: Path | None = None,
+    backend_think: bool | str | None = None,
+    backend_max_attempts: int | None = None,
 ) -> Path:
     path = run_dir / "edit-suggestions.jsonl"
     header: dict[str, object] = {
@@ -1625,13 +2188,17 @@ def _write_edit_suggestions_header(
         "with_crop": with_crop,
     }
     if provider is not None:
-        header["schema_version"] = 1
+        header["schema_version"] = 2
         header["kind"] = "cull-sh-edit-suggestions"
         header["provider"] = provider
     if model is not None:
         header["model"] = model
     if source_root is not None:
         header["source_root"] = str(source_root.expanduser().resolve())
+    if backend_think is not None:
+        header["backend_think"] = backend_think
+    if backend_max_attempts is not None:
+        header["backend_max_attempts"] = backend_max_attempts
     with path.open("w", encoding="utf-8") as handle:
         handle.write(
             json.dumps(header, sort_keys=True)
@@ -1646,26 +2213,18 @@ def _append_edit_suggestions(
 ) -> None:
     with path.open("a", encoding="utf-8") as handle:
         for asset, suggestion in suggestions:
+            record = asdict(suggestion)
+            record.update(
+                {
+                    "asset_id": suggestion.asset_id or asset.raw_path.as_posix(),
+                    "filename": suggestion.filename,
+                    "raw_path": str(asset.raw_path),
+                    "xmp_path": str(asset.xmp_path),
+                }
+            )
             handle.write(
                 json.dumps(
-                    {
-                        "asset_id": suggestion.asset_id or asset.raw_path.as_posix(),
-                        "filename": suggestion.filename,
-                        "raw_path": str(asset.raw_path),
-                        "xmp_path": str(asset.xmp_path),
-                        "exposure": suggestion.exposure,
-                        "contrast": suggestion.contrast,
-                        "highlights": suggestion.highlights,
-                        "shadows": suggestion.shadows,
-                        "vibrance": suggestion.vibrance,
-                        "has_crop": suggestion.has_crop,
-                        "crop_left": suggestion.crop_left,
-                        "crop_top": suggestion.crop_top,
-                        "crop_right": suggestion.crop_right,
-                        "crop_bottom": suggestion.crop_bottom,
-                        "crop_angle": suggestion.crop_angle,
-                        "summary": suggestion.summary,
-                    },
+                    record,
                     sort_keys=True,
                 )
                 + "\n"

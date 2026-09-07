@@ -22,15 +22,19 @@ JPEG_EXTENSIONS = (
     ".jpeg",
 )
 
+DEFAULT_PRODUCTION_MODEL = "orcarouter/Qwen3.8-27B-Uncensored"
+
 
 @dataclass(slots=True)
 class BackendConfig:
     provider: str = "ollama"
-    model: str = "gemma4:12b"
+    model: str = DEFAULT_PRODUCTION_MODEL
     base_url: str = "http://localhost:11434"
     timeout_seconds: float = 300.0
-    max_attempts: int = 3
-    max_output_tokens: int = 1024
+    max_attempts: int = 1
+    think: bool | str | None = True
+    fail_fast: bool = True
+    max_output_tokens: int = 2048
 
 
 @dataclass(slots=True)

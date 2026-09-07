@@ -24,7 +24,26 @@ from cull_sh.xmp import write_develop_sidecar
 
 
 ProgressCallback = Callable[[str], None]
-EDIT_FIELDS = ("exposure", "contrast", "highlights", "shadows", "vibrance")
+EDIT_FIELDS = (
+    "exposure",
+    "brightness",
+    "contrast",
+    "highlights",
+    "shadows",
+    "whites",
+    "blacks",
+    "temperature",
+    "tint",
+    "vibrance",
+    "saturation",
+    "clarity",
+    "dehaze",
+    "structure",
+    "sharpness",
+    "luma_noise_reduction",
+    "color_noise_reduction",
+    "vignette_amount",
+)
 
 
 @dataclass(frozen=True, slots=True)
@@ -410,9 +429,14 @@ def _analyze(
         ok_maps[spec.label] = ok
         durations = [float(record["duration_seconds"]) for record in records]
         suggestions = [record["suggestion"] for record in ok.values()]
-        vectors = [tuple(suggestion[field] for field in EDIT_FIELDS) for suggestion in suggestions]
+        vectors = [
+            tuple(suggestion.get(field, 0) for field in EDIT_FIELDS)
+            for suggestion in suggestions
+        ]
         sliders = {
-            field: _summarize_numbers([float(suggestion[field]) for suggestion in suggestions])
+            field: _summarize_numbers(
+                [float(suggestion.get(field, 0)) for suggestion in suggestions]
+            )
             for field in EDIT_FIELDS
         }
         model_results.append(
@@ -428,7 +452,10 @@ def _analyze(
                 "duplicate_vector_rate": (
                     1.0 - len(set(vectors)) / len(vectors) if vectors else None
                 ),
-                "noops": sum(all(float(s[field]) == 0.0 for field in EDIT_FIELDS) for s in suggestions),
+                "noops": sum(
+                    all(float(s.get(field, 0)) == 0.0 for field in EDIT_FIELDS)
+                    for s in suggestions
+                ),
                 "sliders": sliders,
             }
         )
@@ -440,8 +467,12 @@ def _analyze(
             field_deltas = {
                 field: statistics.fmean(
                     abs(
-                        float(ok_maps[left.label][item_id]["suggestion"][field])
-                        - float(ok_maps[right.label][item_id]["suggestion"][field])
+                        float(
+                            ok_maps[left.label][item_id]["suggestion"].get(field, 0)
+                        )
+                        - float(
+                            ok_maps[right.label][item_id]["suggestion"].get(field, 0)
+                        )
                     )
                     for item_id in shared
                 )
@@ -517,7 +548,7 @@ def _write_blind_review(
         for side, label in (("A", labels[0]), ("B", labels[1])):
             suggestion = result_maps[label][item_id]["suggestion"]
             for field in EDIT_FIELDS:
-                row[f"{side}_{field}"] = suggestion[field]
+                row[f"{side}_{field}"] = suggestion.get(field, 0)
             row[f"{side}_summary"] = suggestion["summary"]
         row.update({"preferred": "", "confidence_1_to_5": "", "notes": ""})
         rows.append(row)

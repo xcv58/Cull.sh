@@ -52,7 +52,7 @@ This scaffold includes:
 - XMP sidecar writing with merge support for existing RAW sidecars
 - embedded JPEG culling metadata
 - optional Lightroom sidecar edits for RAWs
-- opt-in Qwen develop suggestions with no fallback model
+- shared Qwen culling and develop suggestions with thinking enabled and no fallback model
 - approval-gated RapidRAW staging, preview rendering, and final export
 - architecture plan for the full app
 
@@ -62,6 +62,11 @@ This scaffold includes:
 python main.py doctor
 python main.py benchmark --path /path/to/human-reviewed/raws --facet-db /path/to/facet.db
 python main.py benchmark --path /path/to/newly-reviewed/raws --shadow-run runs/<original-cull-run>
+python main.py blind-culling-test --frozen-run runs/<prospective-cull-run>
+python main.py blind-culling-sample --folder-count 12 --photos-per-folder 1 --exclude-folder "2026-05-06 Kuala Lumpur"
+python main.py culling-ground-truth-test --folder-count 13 --total-photos 30 --exclude-run runs/culling-blind-tests/<earlier-run>
+python main.py score-blind-culling --run-dir runs/culling-blind-tests/<timestamp> --choices ~/Downloads/blind-culling-choices.csv
+python main.py score-culling-ground-truth --run-dir runs/culling-ground-truth-tests/<timestamp> --choices ~/Downloads/culling-ground-truth-choices.csv
 python main.py cull --path /path/to/raws --prompt "Keep the sharpest wildlife photos"
 python main.py cull --path /path/to/raws --genre portrait
 python main.py cull --path /path/to/raws --genre street --prefer "interesting gestures and layering"
@@ -80,12 +85,13 @@ python main.py repair-sidecars
 python main.py repair-sidecars --run-dir runs/20260411-220756-823242
 ```
 
-`suggest-edits` uses the local
-`orcarouter/Qwen3.8-27B-Uncensored` model by default. Model calls are fail-fast:
-the command makes no fallback-model or per-image recovery request, and stops on
-the first failed cohort so the underlying local-model problem can be fixed.
-Both culling and editing also send a bounded Ollama `num_predict` value
-(`--backend-max-output-tokens`, default 1024) so a malformed structured response
+Both `cull` and `suggest-edits` use the local
+`orcarouter/Qwen3.8-27B-Uncensored` model by default, with thinking enabled.
+Production model calls are fail-fast: each command makes one attempt, uses no
+fallback model, and stops on the first failed cohort so the underlying local-model
+problem can be fixed. Both culling and editing also send a bounded Ollama `num_predict` value
+(`--backend-max-output-tokens`, default 2048) so thinking has room to finish while
+a malformed structured response
 cannot generate indefinitely while keeping the HTTP connection active.
 
 `benchmark` reads existing Lightroom XMP picks, ratings, and rejects as human
@@ -94,6 +100,26 @@ MUSIQ/NIMA/local-quality signals with any cached Facet signals, writes a
 resumable current-signal cache, and reports global AUC, within-burst ranking,
 false-reject safety, and the behavior of the current local reject gate under
 `runs/<timestamp>/`.
+
+`blind-culling-test` compares Gemma 4 and Qwen 27B on the semantic candidates
+already locked by a prospective dry run. It reuses the frozen prompt, reads no
+XMP, writes no photo metadata, randomizes the per-photo A/B assignment, and
+keeps the answer key outside the generated HTML. Complete the review page,
+download `blind-culling-choices.csv`, and reveal the result only with
+`score-blind-culling`.
+
+`blind-culling-sample` builds a seeded, reproducible sample across incomplete
+top-level photo folders without reading XMP. Completed `DONE`/`EXPORTED`
+folders, hidden files, and explicitly excluded folders are skipped. Use one
+photo per folder for maximum subject diversity, or multiple photos with
+`--min-sequence-gap` to prevent adjacent filename runs.
+
+For model-selection decisions, prefer `culling-ground-truth-test`. Its review
+page shows only each photograph and asks the reviewer to independently assign
+reject, review, or pick. Model decisions, explanations, and identities remain
+hidden until scoring, avoiding explanation-quality and A/B anchoring bias.
+`--total-photos` is balanced across the requested folder count, and repeated
+`--exclude-run` options prevent reuse of earlier blind-test photos.
 
 Regular `cull` runs enable `--topiq-ranking` by default. Folder-relative TOPIQ
 and local-score percentiles are blended with a 25% TOPIQ weight for candidate
@@ -201,24 +227,39 @@ python main.py lightroom-jpeg-auto --path "/path/to/culled-raws" --lightroom-edi
 ## AI Develop Edits
 
 `suggest-edits` is an explicit opt-in stage. Regular culling does not run local
-AI develop edits. It asks the configured vision model for natural global
-adjustments and freezes the recipes in `edit-suggestions.jsonl`. It is a dry
-run by default; source sidecars are only modified when you pass
-`--no-dry-run`. Rejected RAW files and RAW files without existing sidecars are
-skipped by default, and existing culling state is preserved.
+AI develop edits. It asks the configured vision model for natural global and
+composition adjustments and freezes the complete RapidRAW recipes in
+`edit-suggestions.jsonl`. It is a dry run by default; the Lightroom-compatible
+subset is only written to source XMP sidecars when you pass `--no-dry-run`.
+Rejected RAW files and RAW files without existing sidecars are skipped by
+default, and existing culling state is preserved.
 
 ```bash
 python main.py suggest-edits --path "/path/to/culled-raws"            # dry run: show suggestions only
 python main.py suggest-edits --path "/path/to/culled-raws" --no-dry-run
 python main.py suggest-edits --path "/path/to/culled-raws" --prefer "warm, punchy look"
-python main.py suggest-edits --path "/path/to/culled-raws" --with-crop --batch-size 1
+python main.py suggest-edits --path "/path/to/culled-raws" --batch-size 1
 python main.py suggest-edits --path "/path/to/raws" --include-unculled
 ```
 
-The model suggests exposure, contrast, highlights, shadows, vibrance, and an
-optional crop, all validated before a renderer receives them. Crop suggestions
-are off by default. The selected Qwen model is intentionally fail-fast: Cull.sh
-does not fall back to Gemma or retry failed photographs individually.
+The executable recipe covers exposure/brightness, contrast, highlights,
+shadows, whites, blacks, temperature, tint, vibrance, saturation, clarity,
+dehaze, structure, sharpening, luminance/color noise reduction, vignette,
+crop, and rotation. Crop and rotation evaluation are enabled by default;
+nonzero rotation requires crop bounds that remove RapidRAW's rotated black
+edges. Useful ideas outside that executable surface—such as HSL,
+curves, color grading, masks, healing, or lens work—are retained as explicit
+`additional_edits` instead of being silently dropped or falsely reported as
+applied.
+
+Editing defaults to one image per model request to avoid cross-image leakage.
+Every executable field is marked required in the structured model schema, so
+Qwen must explicitly decide each expanded control instead of silently omitting
+newer fields. Stored legacy recipes remain readable with neutral defaults.
+The selected Qwen model runs with thinking enabled and is intentionally
+fail-fast: Cull.sh does not use a fallback model or retry failed photographs
+individually. Gemma remains supported by historical benchmark commands, but is
+not a production dependency.
 
 ## RapidRAW Develop Workflow
 
@@ -252,6 +293,70 @@ python main.py rapidraw-export \
 controlled pilot. Final export otherwise fails without a matching approval
 file. Generated review and output files live inside the stage, never beside the
 original photographs.
+
+### Rendered edit feedback pilot
+
+`rapidraw-feedback-pilot` tests a bounded render-and-review loop on picks that
+were added by a frozen machine cull but were not picks in the pre-application
+human XMP backup:
+
+```bash
+python main.py rapidraw-feedback-pilot \
+  --path "/path/to/photos" \
+  --cull-run runs/<frozen-cull-run> \
+  --human-baseline "/path/to/pre-application-xmp-backup" \
+  --output "/path/to/new-or-resumable-feedback-stage" \
+  --include-existing-picks \
+  --with-crop
+```
+
+By default the pilot retains its historical machine-added-picks-only scope.
+`--include-existing-picks` selects the union of protected picks in the baseline
+and new picks in the frozen cull manifest. It fails rather than silently omit a
+protected pick that is absent from the manifest. For a clean automated-versus-
+human experiment, use `--frozen-machine-picks` instead: every frozen manifest
+pick is included and all pre-existing flags are ignored, preventing prior human
+judgment from leaking into the automated arm. The two flags are mutually
+exclusive.
+
+For each selected RAW, RapidRAW first creates a neutral baseline render. Qwen
+suggests a structured recipe from that renderer-consistent baseline, RapidRAW
+renders the recipe, and an independent Qwen pass compares the real before/after
+pair. Suggestions and rendered pairs default to one photo per request. The
+review can accept, revert, or make one bounded refinement; it cannot iterate
+indefinitely. Unrendered `additional_edits` never count as visible improvement
+but remain available for later mask or advanced-edit stages.
+The reviewer receives decoded image dimensions and measured outer-edge facts so
+vision-model letterboxing outside a cropped image is not mistaken for black
+pixels in the photograph. Validation remains advisory: human preferences from
+the review page are the final quality signal.
+The generated `review.html` shows baseline, first edit, and validated final side
+by side and records a human preference locally.
+
+The stage is resumable and never writes the source RAW/XMP files. Normalized
+crop suggestions are converted to the full-resolution pixel coordinates used by
+RapidRAW's headless export path, and implausibly small crop renders fail fast.
+
+For an explicitly unattended experiment, export every completed Qwen-validated
+recipe into a separate delivery folder:
+
+```bash
+python main.py rapidraw-feedback-export \
+  --stage "/path/to/completed-feedback-stage" \
+  --output "/path/to/delivery-jpegs" \
+  --quality 95 \
+  --keep-metadata \
+  --unattended
+```
+
+The delivery folder contains JPEGs only. Export provenance and resumable state
+remain in `feedback-export.json` inside the isolated stage. The exporter refuses
+incomplete validation records, a source-photo folder as its destination, changed
+completed JPEGs, or a non-empty output folder that it does not own. The explicit
+`--unattended` acknowledgement is required because Qwen's rendered-edit verdict
+replaces human approval in this mode. RapidRAW 1.6.1 retains supported EXIF such
+as camera and capture time, but its current `--keep-metadata` path does not retain
+GPS coordinates.
 
 `--limit` now applies after whole-folder scene grouping, so `--limit 24` means
 "process the first 24 scenes" rather than "stop after 24 files".
