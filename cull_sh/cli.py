@@ -2043,7 +2043,6 @@ def repair_sidecars(
     ),
     runs_root: Path = typer.Option(
         Path("runs"),
-        exists=True,
         file_okay=False,
         dir_okay=True,
         help="Root directory containing run artifacts when --run-dir is omitted.",
