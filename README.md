@@ -9,8 +9,10 @@ The intended workflow is:
 3. Run fast local quality checks such as blur detection.
 4. Send only viable candidates to a vision model backend.
 5. Write Lightroom-compatible culling metadata with ratings and labels.
-6. Generate fail-fast local AI develop suggestions for selected RAWs.
-7. Review and render approved edits through RapidRAW, or optionally write XMP.
+6. Finish and export selected photographs manually in Lightroom.
+
+AI develop suggestions and RapidRAW rendering remain available as explicit
+experimental commands, but they are not part of the current production path.
 
 The repository is scaffolded around a provider-agnostic backend interface so local models such as Ollama can be used for development, while Anthropic or OpenAI can be added later without changing the pipeline shape.
 
@@ -52,8 +54,8 @@ This scaffold includes:
 - XMP sidecar writing with merge support for existing RAW sidecars
 - embedded JPEG culling metadata
 - optional Lightroom sidecar edits for RAWs
-- shared Qwen culling and develop suggestions with thinking enabled and no fallback model
-- approval-gated RapidRAW staging, preview rendering, and final export
+- Qwen semantic culling with thinking enabled and no fallback model
+- experimental Qwen develop suggestions and approval-gated RapidRAW rendering
 - architecture plan for the full app
 
 ## Current Workflow

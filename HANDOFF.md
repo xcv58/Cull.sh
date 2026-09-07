@@ -14,6 +14,12 @@
   isolated RAW copies and lens-correction sidecars, but no verified Adaptive
   Color payloads and no JPEG exports. Nothing in that pilot needs to be resumed
   or committed.
+- The full reviewed checkpoint is backed up at
+  `origin/codex/sentosa-unattended-quality`. Use the stacked, gated procedure in
+  [the main integration plan](docs/main-integration-plan.md); do not merge the
+  complete branch directly into `main`. A test workflow is present on this
+  checkpoint but must land independently on `main` as gate zero before any
+  feature layer is merged.
 
 ## Current development iteration — August 28
 
