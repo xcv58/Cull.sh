@@ -12,10 +12,18 @@ The immutable backup branch is `codex/sentosa-unattended-quality`. Do not force
 push or rewrite it. The existing history is linear, so integration can use
 stacked PRs and preserve bisectable commits.
 
+On September 6, a plain push inherited the user's global
+`push.default=matching` setting. It fast-forwarded `main` through the first
+layer and expanded the remote PR #3 branch through `dafef4e`. No commit was lost
+and the checkpoint branch was published correctly. Repository-local
+`push.default=simple` now prevents another multi-branch push. Use an explicit
+source and destination ref for every integration push anyway.
+
 ## Required gate zero: CI on main
 
-Before merging feature code, land `.github/workflows/tests.yml` alone from a
-short branch based on current `origin/main`. Require its test job for later PRs.
+Before merging any additional feature code, land `.github/workflows/tests.yml`
+alone from `codex/main-ci-gate` (PR #4), based on current `origin/main`. Require
+its test job for later PRs.
 If repository settings do not allow a required check, still wait for a successful
 run on every exact PR head before merging. Do not treat a run from another SHA as
 evidence for the current head.
@@ -27,20 +35,24 @@ resolve only real conflicts, rerun the full test workflow, and perform the liste
 contract check. Use normal merge commits rather than squash or force-push so the
 validated boundaries and original history remain recoverable.
 
-1. **AI suggestion foundation — draft PR #2**
-   - Range: `origin/main..1f97bcb` (`feat/ai-develop-edits`).
+1. **AI suggestion foundation — PR #2, already on main**
+   - `main` fast-forwarded to `1f97bcb`; GitHub records PR #2 as merged.
+   - The exact `1f97bcb` checkout passed CLI import and all 72 tests locally.
+     Do not rewrite it merely to change the merge mechanism.
    - Contract: regular `cull` behavior remains separate from the explicit
      `suggest-edits` command; dry run remains the default; XMP writes remain
      opt-in.
-2. **TOPIQ, benchmark, and initial RapidRAW experiment — draft PR #3**
+2. **TOPIQ, benchmark, and initial RapidRAW experiment — recover original PR #3 boundary**
    - Range: `1f97bcb..e61912d`
-     (`codex/topiq-qwen-rapidraw` as currently published).
+   - After PR #4 is green and merged, publish a new immutable branch at
+     `e61912d` with an explicit refspec and open it against `main`.
+   - Leave PR #3 unmerged; its head now points to the later `dafef4e` boundary.
    - Contract: TOPIQ affects ordering only at 25 percent and never casts a hard
      reject vote; RapidRAW requires its explicit stage/preview/export commands.
 3. **Qwen culling, blind review, and rendered-validation development**
    - Range: `e61912d..dafef4e`.
-   - Publish a new immutable branch at `dafef4e` and open it against the PR #3
-     branch. Do not expand PR #3 by moving its existing head.
+   - After layer two merges, change PR #3's base to `main`, retitle it for this
+     actual layer, and review the newly narrowed diff. Do not move its head.
    - Contract: Qwen uses one attempt, thinking enabled, bounded output, and no
      fallback; existing human picks survive replay; blind-test answer keys remain
      separated from review pages.
@@ -51,8 +63,8 @@ validated boundaries and original history remain recoverable.
      no local experiment is described as an independent benchmark; production
      documentation keeps Lightroom finishing manual and RapidRAW paused.
 
-Do not open layers three and four against `main` prematurely: their diffs would
-include unmerged parent work and obscure the actual review boundary.
+Do not merge PR #3 or open layer four against `main` prematurely: their diffs
+would include unmerged parent work and obscure the actual review boundary.
 
 ## Gate for every PR head
 

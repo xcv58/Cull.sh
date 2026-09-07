@@ -20,6 +20,12 @@
   complete branch directly into `main`. A test workflow is present on this
   checkpoint but must land independently on `main` as gate zero before any
   feature layer is merged.
+- Remote `main` now contains the first opt-in AI-suggestion layer at `1f97bcb`
+  (PR #2 is recorded merged); that exact checkout passed CLI import and 72 tests.
+  PR #3 remains unmerged at `dafef4e`. PR #4, `codex/main-ci-gate`, is the
+  one-file CI gate that must merge before any additional feature layer.
+  Repository-local `push.default=simple` overrides the user's global `matching`
+  setting; still use explicit refspecs for all integration pushes.
 
 ## Current development iteration — August 28
 
