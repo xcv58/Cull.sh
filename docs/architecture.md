@@ -11,9 +11,15 @@ The current production split is:
 
 - Cull.sh decides what to review and records why.
 - Ollama supplies structured semantic culling through the configured Qwen model.
-- Cull.sh writes Lightroom-compatible XMP for the finishing handoff.
-- Finishing and JPEG export are manual in Lightroom.
+- Cull.sh writes Lightroom-compatible culling XMP and the lens-correction
+  baseline for every RAW in the production folder.
+- Lightroom applies Adaptive Color to every RAW as one native batch operation.
+- Lightroom batch-exports only the picked photographs as JPEGs.
 - AI edit suggestions and RapidRAW rendering remain experimental, paused paths.
+
+The operational sequence and verification gates are defined in the
+[new-folder production workflow](new-folder-workflow.md). Per-photo edit
+automation is not part of the production path.
 
 ## Safety Invariants
 

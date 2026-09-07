@@ -9,7 +9,8 @@ The intended workflow is:
 3. Run fast local quality checks such as blur detection.
 4. Send only viable candidates to a vision model backend.
 5. Write Lightroom-compatible culling metadata with ratings and labels.
-6. Finish and export selected photographs manually in Lightroom.
+6. Apply lens corrections and Adaptive Color to all RAWs as Lightroom batches,
+   then batch-export only the selected photographs.
 
 AI develop suggestions and RapidRAW rendering remain available as explicit
 experimental commands, but they are not part of the current production path.
@@ -21,6 +22,7 @@ The repository is scaffolded around a provider-agnostic backend interface so loc
 - `main.py`: thin entrypoint
 - `cull_sh/`: application package
 - `docs/architecture.md`: architecture plan and build order
+- `docs/new-folder-workflow.md`: canonical production runbook for a new folder
 - `requirements.txt`: bootstrap dependencies
 
 ## Quickstart
@@ -59,6 +61,15 @@ This scaffold includes:
 - architecture plan for the full app
 
 ## Current Workflow
+
+For normal production work on a new folder, follow the
+[new-folder workflow](docs/new-folder-workflow.md). It preserves dry-run and
+verification gates, replays frozen culling decisions without a second inference
+run, applies lens correction plus Adaptive Color to all RAWs in batches, and
+exports only the picks.
+
+The commands below are reference entry points for development, benchmarks, and
+individual workflow stages.
 
 ```bash
 python main.py doctor
