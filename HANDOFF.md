@@ -5,8 +5,12 @@
 - Keep Cull.sh for culling, ranking, duplicate handling, and Lightroom-compatible
   metadata. Continue to use Qwen for semantic culling and TOPIQ only at its
   existing ranking weight.
-- Use Lightroom as the manual finishing and JPEG-export surface. Do not invest
-  further in Lightroom UI automation unless the user explicitly reopens it.
+- Use the [canonical new-folder workflow](docs/new-folder-workflow.md): Cull.sh
+  writes merge-safe culling metadata and lens corrections, Lightroom applies
+  Adaptive Color to all RAWs in one batch, and Lightroom batch-exports only the
+  selected photographs. This is a native batch operation, not per-photo edit
+  automation. Do not invest further in per-photo Lightroom UI automation unless
+  the user explicitly reopens it.
 - Pause RapidRAW editing/export development. The implementation and completed
   experiments remain as development evidence, but RapidRAW is not the current
   production finishing path and its results did not establish Lightroom parity.
@@ -19,9 +23,10 @@
   recorded in [the main integration plan](docs/main-integration-plan.md).
 - Remote `main` contains the AI-suggestion foundation (PR #2), the required CI
   gate (PR #4), TOPIQ/benchmark/initial RapidRAW tooling (PR #5), and the Qwen
-  culling/rendered-validation layer (PR #3). Each gated layer and its post-merge
-  `main` commit passed exact-head CI. The final Sentosa quality/correction layer
-  remains the only integration layer in flight.
+  culling/rendered-validation layer (PR #3), and the final Sentosa
+  quality/correction layer (PR #6). Every staged integration layer is merged,
+  and each gated layer plus the final post-merge `main` commit passed exact-head
+  CI.
 - `main` requires an up-to-date `pytest` check through a pull request, enforces
   the rule for admins, requires resolved conversations, and disallows force
   pushes and branch deletion. Repository-local `push.default=simple` overrides
