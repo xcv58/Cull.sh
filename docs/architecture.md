@@ -10,9 +10,10 @@ separate tools.
 The current production split is:
 
 - Cull.sh decides what to review and records why.
-- Ollama supplies structured semantic culling and edit suggestions.
-- RapidRAW renders approved edit recipes and exports final files.
-- Lightroom-compatible XMP remains an optional interoperability path.
+- Ollama supplies structured semantic culling through the configured Qwen model.
+- Cull.sh writes Lightroom-compatible XMP for the finishing handoff.
+- Finishing and JPEG export are manual in Lightroom.
+- AI edit suggestions and RapidRAW rendering remain experimental, paused paths.
 
 ## Safety Invariants
 
@@ -71,7 +72,10 @@ Run configuration and `manifest.jsonl` are written incrementally. With
 `--no-dry-run`, Cull.sh merges Lightroom-compatible culling state into RAW XMP
 or JPEG embedded metadata. Source image bytes are never rewritten for RAWs.
 
-## AI Develop and RapidRAW Pipeline
+## Experimental AI Develop and RapidRAW Pipeline
+
+This pipeline remains implemented for reproducibility and future experiments,
+but it is not the current production finishing path.
 
 ### 1. Suggest
 

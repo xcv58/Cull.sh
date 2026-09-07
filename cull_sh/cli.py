@@ -1764,6 +1764,7 @@ def rapidraw_feedback_pilot(
         ),
     ),
     with_crop: bool = typer.Option(True, "--with-crop/--no-with-crop"),
+    baseline_mode: str = typer.Option("neutral", help="neutral or experimental camera-midtones-v1; stored for safe resume."),
     rapidraw_binary: Path = typer.Option(DEFAULT_RAPIDRAW_BINARY),
 ) -> None:
     """Run a neutral-render, suggest, render, and one-refinement edit loop."""
@@ -1814,6 +1815,7 @@ def rapidraw_feedback_pilot(
             suggestion_batch_size=suggestion_batch_size,
             review_batch_size=review_batch_size,
             include_crop=with_crop,
+            baseline_mode=baseline_mode,
             selection_scope=(
                 "frozen-machine-picks"
                 if frozen_machine_picks

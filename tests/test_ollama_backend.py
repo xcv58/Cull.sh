@@ -1,36 +1,107 @@
 from __future__ import annotations
 
-from io import BytesIO
 import json
-from pathlib import Path
 import unittest
-from unittest.mock import MagicMock
-from unittest.mock import patch
+from io import BytesIO
+from pathlib import Path
+from unittest.mock import MagicMock, patch
 
 import httpx
 from PIL import Image
 
 from cull_sh.backends import build_backend
 from cull_sh.backends.base import VisionBackendError
-from cull_sh.backends.ollama import OllamaVisionBackend
-from cull_sh.backends.ollama import _image_boundary_facts
-from cull_sh.backends.ollama import _parse_batch_payload
-from cull_sh.backends.ollama import _parse_edit_payload
-from cull_sh.backends.ollama import _parse_edit_review_payload
-from cull_sh.backends.ollama import _edit_payload
-from cull_sh.backends.ollama import _normalize_label
-from cull_sh.config import BackendConfig
-from cull_sh.config import DEFAULT_PRODUCTION_MODEL
-from cull_sh.models import ColorLabel
-from cull_sh.models import DecisionBucket
-from cull_sh.models import EditReviewPair
-from cull_sh.models import EditReviewVerdict
-from cull_sh.models import EditSuggestion
-from cull_sh.models import PreviewImage
-from cull_sh.models import RawAsset
+from cull_sh.backends.ollama import (
+    OllamaVisionBackend,
+    _edit_payload,
+    _image_boundary_facts,
+    _normalize_label,
+    _parse_batch_payload,
+    _parse_edit_payload,
+    _parse_edit_review_payload,
+)
+from cull_sh.config import DEFAULT_PRODUCTION_MODEL, BackendConfig
+from cull_sh.models import (
+    ColorLabel,
+    DecisionBucket,
+    EditReviewPair,
+    EditReviewVerdict,
+    EditSuggestion,
+    PreviewImage,
+    RawAsset,
+)
 
 
 class OllamaBackendTests(unittest.TestCase):
+    def test_scoped_context_limit_is_forwarded_without_changing_default(self):
+        backend = build_backend(BackendConfig(context_tokens=65536, max_output_tokens=4096))
+        client = MagicMock()
+        client.post.return_value.json.return_value = {'prompt_eval_count': 13000}
+        payload = {'options': {'num_predict': 4096}}
+        backend._chat_structured(client, payload, lambda result: result)
+        self.assertEqual(client.post.call_args.kwargs['json']['options'], {'num_predict': 4096, 'num_ctx': 65536})
+        self.assertIsNone(build_backend(BackendConfig()).context_tokens)
+        self.assertTrue(backend.think)
+        self.assertEqual(backend.max_attempts, 1)
+
+    def test_context_headroom_and_server_error_are_fail_fast(self):
+        backend = build_backend(BackendConfig(context_tokens=65536, max_output_tokens=4096))
+        client = MagicMock()
+        client.post.return_value.json.return_value = {'prompt_eval_count': 64000}
+        with self.assertRaisesRegex(VisionBackendError, 'insufficient headroom'):
+            backend._chat_structured(client, {}, lambda result: result)
+        self.assertEqual(client.post.call_count, 1)
+        response = httpx.Response(500, json={'error': 'runner connection reset'}, request=httpx.Request('POST', 'http://localhost/api/chat'))
+        client = MagicMock()
+        client.post.return_value = response
+        with self.assertRaisesRegex(VisionBackendError, 'runner connection reset.*1 attempt'):
+            backend._chat_structured(client, {}, lambda result: result)
+        self.assertEqual(client.post.call_count, 1)
+        with self.assertRaises(ValueError):
+            build_backend(BackendConfig(context_tokens=4096, max_output_tokens=4096))
+
+    def test_edit_prompt_preserves_starting_recipe_without_zero_noop_conflict(self):
+        backend = OllamaVisionBackend(base_url='http://localhost:11434', model='qwen')
+        preview = _build_preview('frame.ARW')
+        preview.starting_suggestion = EditSuggestion(filename='frame.ARW', brightness=1.0)
+        response = MagicMock()
+        response.json.return_value = {'message': {'content': json.dumps({'edits': [{
+            **_edit_payload(preview.starting_suggestion), 'id': 'image-1', 'filename': 'frame.ARW',
+            'summary': 'Already balanced daylight.'}]})}}
+        client = MagicMock()
+        client.__enter__.return_value = client
+        client.post.return_value = response
+        with patch('cull_sh.backends.ollama.httpx.Client', return_value=client):
+            result = backend.suggest_edits('natural', [preview])
+        prompt = client.post.call_args.kwargs['json']['messages'][1]['content']
+        self.assertIn('copy its starting_adjustments value exactly', prompt)
+        self.assertIn('A zero is NOT a no-op', prompt)
+        self.assertNotIn('use 0 only after deciding', prompt)
+        self.assertNotIn('every nonzero field must address the visible diagnosis', prompt)
+        self.assertEqual(result[0].brightness, 1.0)
+
+    def test_album_policy_does_not_defer_to_humans_or_pick_sparingly(self):
+        backend=OllamaVisionBackend('http://localhost:11434','qwen',max_attempts=1)
+        response=MagicMock(); response.json.return_value={'message':{'content':json.dumps({'decisions':[
+            {'id':'image-1','filename':'frame.ARW','bucket':'pick','rating':4,'summary':'Useful establishing view.'}]})}}
+        client=MagicMock(); client.__enter__.return_value=client; client.post.return_value=response
+        with patch('cull_sh.backends.ollama.httpx.Client',return_value=client):
+            result=backend.select_album_batch('Travel album',[_build_preview('frame.ARW')])
+        payload=client.post.call_args.kwargs['json']; content=payload['messages'][1]['content']
+        self.assertNotIn('Use pick sparingly',content)
+        self.assertIn('No fixed pick count',content)
+        self.assertEqual(payload['format']['$defs']['OllamaDecisionPayload']['properties']['bucket']['enum'],['pick','reject'])
+        self.assertEqual(result[0].bucket,DecisionBucket.PICK)
+
+    def test_abbreviated_reject_preserves_calibrated_baseline(self):
+        pair=EditReviewPair(asset=_build_preview('frame.ARW').asset,
+                           baseline_bytes=_jpeg_bytes((40,30),'gray'),edited_bytes=_jpeg_bytes((40,30),'gray'),
+                           suggestion=EditSuggestion(filename='frame.ARW',brightness=1.4),
+                           baseline_suggestion=EditSuggestion(filename='frame.ARW',brightness=1.0))
+        payload={'message':{'content':json.dumps({'reviews':[{'id':'image-1','verdict':'reject','summary':'Baseline is better.'}]})}}
+        result=_parse_edit_review_payload(payload,[pair])
+        self.assertEqual(result.reviews[0].brightness,1.0)
+
     def test_image_boundary_facts_distinguish_real_pixels_from_display_padding(
         self,
     ) -> None:
@@ -58,8 +129,8 @@ class OllamaBackendTests(unittest.TestCase):
         preview = _build_preview("frame.ARW")
         pair = EditReviewPair(
             asset=preview.asset,
-            baseline_bytes=b"baseline",
-            edited_bytes=b"edited",
+            baseline_bytes=_jpeg_bytes((40, 30), "gray"),
+            edited_bytes=_jpeg_bytes((40, 30), "gray"),
             suggestion=EditSuggestion(
                 filename="frame.ARW",
                 asset_id=preview.asset.raw_path.as_posix(),
@@ -122,7 +193,7 @@ class OllamaBackendTests(unittest.TestCase):
             reviews[0].final_suggestion.additional_edits, ["Mask the subject."]
         )
         request_payload = fake_client.post.call_args.kwargs["json"]
-        self.assertEqual(len(request_payload["messages"][1]["images"]), 2)
+        self.assertEqual(len(request_payload["messages"][1]["images"]), 4)
         self.assertIn("baseline", request_payload["messages"][1]["content"])
         self.assertIn(
             "Judge the rendered result",
@@ -191,8 +262,8 @@ class OllamaBackendTests(unittest.TestCase):
         preview = _build_preview("frame.ARW")
         pair = EditReviewPair(
             asset=preview.asset,
-            baseline_bytes=b"baseline",
-            edited_bytes=b"edited",
+            baseline_bytes=_jpeg_bytes((40, 30), "gray"),
+            edited_bytes=_jpeg_bytes((40, 30), "gray"),
             suggestion=EditSuggestion(
                 filename="frame.ARW",
                 exposure=0.3,
@@ -247,8 +318,8 @@ class OllamaBackendTests(unittest.TestCase):
         )
         pair = EditReviewPair(
             asset=preview.asset,
-            baseline_bytes=b"baseline",
-            edited_bytes=b"edited",
+            baseline_bytes=_jpeg_bytes((40, 30), "gray"),
+            edited_bytes=_jpeg_bytes((40, 30), "gray"),
             suggestion=suggestion,
         )
         response = MagicMock()
@@ -286,8 +357,8 @@ class OllamaBackendTests(unittest.TestCase):
         preview = _build_preview("frame.ARW")
         pair = EditReviewPair(
             asset=preview.asset,
-            baseline_bytes=b"baseline",
-            edited_bytes=b"edited",
+            baseline_bytes=_jpeg_bytes((40, 30), "gray"),
+            edited_bytes=_jpeg_bytes((40, 30), "gray"),
             suggestion=EditSuggestion(filename="frame.ARW", exposure=0.3),
         )
         response = MagicMock()
@@ -314,8 +385,8 @@ class OllamaBackendTests(unittest.TestCase):
         preview = _build_preview("frame.ARW")
         pair = EditReviewPair(
             asset=preview.asset,
-            baseline_bytes=b"baseline",
-            edited_bytes=b"edited",
+            baseline_bytes=_jpeg_bytes((40, 30), "gray"),
+            edited_bytes=_jpeg_bytes((40, 30), "gray"),
             suggestion=EditSuggestion(filename="frame.ARW", exposure=0.3),
         )
         adjustments = _edit_payload(
@@ -860,7 +931,7 @@ def _build_preview_from_path(raw_path: str) -> PreviewImage:
             raw_path=path,
             xmp_path=path.with_suffix(".xmp"),
         ),
-        image_bytes=b"jpeg-bytes",
+        image_bytes=_jpeg_bytes((40, 30), "gray"),
     )
 
 

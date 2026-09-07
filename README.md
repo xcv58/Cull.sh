@@ -9,8 +9,10 @@ The intended workflow is:
 3. Run fast local quality checks such as blur detection.
 4. Send only viable candidates to a vision model backend.
 5. Write Lightroom-compatible culling metadata with ratings and labels.
-6. Generate fail-fast local AI develop suggestions for selected RAWs.
-7. Review and render approved edits through RapidRAW, or optionally write XMP.
+6. Finish and export selected photographs manually in Lightroom.
+
+AI develop suggestions and RapidRAW rendering remain available as explicit
+experimental commands, but they are not part of the current production path.
 
 The repository is scaffolded around a provider-agnostic backend interface so local models such as Ollama can be used for development, while Anthropic or OpenAI can be added later without changing the pipeline shape.
 
@@ -52,8 +54,8 @@ This scaffold includes:
 - XMP sidecar writing with merge support for existing RAW sidecars
 - embedded JPEG culling metadata
 - optional Lightroom sidecar edits for RAWs
-- shared Qwen culling and develop suggestions with thinking enabled and no fallback model
-- approval-gated RapidRAW staging, preview rendering, and final export
+- Qwen semantic culling with thinking enabled and no fallback model
+- experimental Qwen develop suggestions and approval-gated RapidRAW rendering
 - architecture plan for the full app
 
 ## Current Workflow
@@ -263,9 +265,11 @@ not a production dependency.
 
 ## RapidRAW Develop Workflow
 
-RapidRAW is the primary automated renderer. Lightroom remains an optional XMP
-interoperability and manual-review surface; a Lightroom-versus-RapidRAW bakeoff
-is not required for this workflow.
+This is an available experimental workflow, not the current production
+finishing path. The current supported handoff is Lightroom-compatible XMP,
+followed by manual finishing and JPEG export in Lightroom. RapidRAW development
+is paused after its rendered results did not establish Lightroom parity; the
+commands below remain documented so completed experiments stay reproducible.
 
 The RapidRAW path has three explicit gates:
 
@@ -328,14 +332,19 @@ indefinitely. Unrendered `additional_edits` never count as visible improvement
 but remain available for later mask or advanced-edit stages.
 The reviewer receives decoded image dimensions and measured outer-edge facts so
 vision-model letterboxing outside a cropped image is not mistaken for black
-pixels in the photograph. Validation remains advisory: human preferences from
-the review page are the final quality signal.
-The generated `review.html` shows baseline, first edit, and validated final side
+pixels in the photograph. It also receives tonal measurements and native-pixel
+detail patches. A final check inspects the exact accepted/reverted/refined pixels;
+non-accept blocks unattended delivery without another automatic refinement.
+This is a model quality gate, not a guarantee of human preference.
+The generated `review.html` shows baseline, first edit, and final candidate side
 by side and records a human preference locally.
 
 The stage is resumable and never writes the source RAW/XMP files. Normalized
 crop suggestions are converted to the full-resolution pixel coordinates used by
 RapidRAW's headless export path, and implausibly small crop renders fail fast.
+`--baseline-mode camera-midtones-v1` opts into an experimental camera-JPEG-guided
+brightness calibration; neutral remains the default. New stages use schema 4
+and `delivery-pixels-v2`; historical stages are not silently upgraded.
 
 For an explicitly unattended experiment, export every completed Qwen-validated
 recipe into a separate delivery folder:
@@ -357,6 +366,10 @@ completed JPEGs, or a non-empty output folder that it does not own. The explicit
 replaces human approval in this mode. RapidRAW 1.6.1 retains supported EXIF such
 as camera and capture time, but its current `--keep-metadata` path does not retain
 GPS coordinates.
+
+See [unattended quality validation](docs/unattended-quality-validation.md) for
+renderer tests, baseline experiments, and the separate final-album selection
+policy that resolves assisted triage reviews into unattended decisions.
 
 `--limit` now applies after whole-folder scene grouping, so `--limit 24` means
 "process the first 24 scenes" rather than "stop after 24 files".

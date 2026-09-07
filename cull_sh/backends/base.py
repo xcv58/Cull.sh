@@ -14,6 +14,10 @@ class VisionBackendError(RuntimeError):
 
 
 class VisionBackend(ABC):
+    def select_album_batch(self, prompt: str, previews: list[PreviewImage]) -> list[FinalDecision]:
+        """Resolve usable frames into final album picks/exclusions, with no review bucket."""
+        raise NotImplementedError
+
     @abstractmethod
     def score_batch(
         self,

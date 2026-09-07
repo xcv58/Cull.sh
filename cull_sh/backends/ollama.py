@@ -1,33 +1,38 @@
 from __future__ import annotations
 
 import base64
-from io import BytesIO
 import json
 import time
-from typing import Callable
-from typing import Literal
-from typing import TypeVar
+from collections.abc import Callable
+from dataclasses import replace
+from io import BytesIO
+from typing import Literal, TypeVar
 
 import httpx
-from PIL import Image
-from PIL import UnidentifiedImageError
-from pydantic import BaseModel
-from pydantic import Field
-from pydantic import ValidationError
-from pydantic import field_validator
-from pydantic import model_validator
+from PIL import Image, UnidentifiedImageError
+from pydantic import BaseModel, Field, ValidationError, field_validator, model_validator
 
-from cull_sh.backends.base import VisionBackend
-from cull_sh.backends.base import VisionBackendError
-from cull_sh.models import ColorLabel
-from cull_sh.models import DecisionBucket
-from cull_sh.models import DecisionSource
-from cull_sh.models import EditReview
-from cull_sh.models import EditReviewPair
-from cull_sh.models import EditReviewVerdict
-from cull_sh.models import EditSuggestion
-from cull_sh.models import FinalDecision, PreviewImage
-
+from cull_sh.backends.base import VisionBackend, VisionBackendError
+from cull_sh.models import (
+    ColorLabel,
+    DecisionBucket,
+    DecisionSource,
+    EditReview,
+    EditReviewPair,
+    EditReviewVerdict,
+    EditSuggestion,
+    FinalDecision,
+    PreviewImage,
+)
+from cull_sh.render_diagnostics import (
+    CONTROL_GUIDANCE,
+    DELIVERY_GUIDANCE,
+    IMAGE_TRANSPORT_POLICY,
+    detail_sheet,
+    image_diagnostics,
+    leveling_evidence,
+    model_image_bytes,
+)
 
 T = TypeVar("T")
 EDIT_SCHEMA_FIELDS = (
@@ -191,6 +196,9 @@ class OllamaBatchEditReviewPayload(BaseModel):
 
 
 class OllamaVisionBackend(VisionBackend):
+    prompt_policy = "rapidraw-absolute-controls-v2"
+    image_transport_policy = IMAGE_TRANSPORT_POLICY
+
     """
     Local vision backend through Ollama.
 
@@ -208,6 +216,7 @@ class OllamaVisionBackend(VisionBackend):
         temperature: float = 0.0,
         think: bool | str | None = None,
         max_output_tokens: int = 1024,
+        context_tokens: int | None = None,
     ) -> None:
         self.base_url = base_url.rstrip("/")
         self.model = model
@@ -219,14 +228,19 @@ class OllamaVisionBackend(VisionBackend):
         if max_output_tokens < 1:
             raise ValueError("max_output_tokens must be at least 1")
         self.max_output_tokens = max_output_tokens
+        if context_tokens is not None and context_tokens <= max_output_tokens:
+            raise ValueError("context_tokens must leave room beyond the output token budget")
+        self.context_tokens = context_tokens
 
     def score_batch(
         self,
         prompt: str,
         previews: list[PreviewImage],
+        *,
+        album_mode: bool = False,
     ) -> list[FinalDecision]:
         with httpx.Client(timeout=self.timeout_seconds) as client:
-            parsed_batch = self._score_cohort(client, prompt, previews)
+            parsed_batch = self._score_cohort(client, prompt, previews, album_mode=album_mode)
 
         returned_by_id = {decision.id: decision for decision in parsed_batch.decisions}
         decisions: list[FinalDecision] = []
@@ -241,6 +255,8 @@ class OllamaVisionBackend(VisionBackend):
 
             label = _normalize_label(parsed.label)
             bucket = DecisionBucket(parsed.bucket)
+            if album_mode and (bucket == DecisionBucket.REVIEW or not parsed.summary.strip()):
+                raise VisionBackendError("unattended album decisions require pick/reject and a specific reason")
             rating = parsed.rating
             if bucket == DecisionBucket.REJECT and label is None:
                 label = ColorLabel.YELLOW
@@ -259,11 +275,16 @@ class OllamaVisionBackend(VisionBackend):
             )
         return decisions
 
+    def select_album_batch(self, prompt: str, previews: list[PreviewImage]) -> list[FinalDecision]:
+        return self.score_batch(prompt, previews, album_mode=True)
+
     def _score_cohort(
         self,
         client: httpx.Client,
         prompt: str,
         previews: list[PreviewImage],
+        *,
+        album_mode: bool = False,
     ) -> OllamaBatchDecisionPayload:
         image_specs = []
         encoded_images = []
@@ -275,7 +296,7 @@ class OllamaVisionBackend(VisionBackend):
                     "filename": preview.asset.filename,
                 }
             )
-            encoded_images.append(base64.b64encode(preview.image_bytes).decode("ascii"))
+            encoded_images.append(base64.b64encode(model_image_bytes(preview.image_bytes)).decode("ascii"))
 
         request_payload = {
             "model": self.model,
@@ -324,6 +345,30 @@ class OllamaVisionBackend(VisionBackend):
                 "num_predict": self.max_output_tokens,
             },
         }
+        if album_mode:
+            request_payload["messages"][0]["content"] = (
+                "You are selecting a complete natural travel album without human intervention. "
+                "This chronological group may contain more than one subject or moment. "
+                "Return strict JSON with exactly one decision for each provided id and filename. "
+                "The only outcomes are pick (include in the album) and reject (exclude from this album)."
+            )
+            request_payload["messages"][1]["content"] = (
+                json.dumps(image_specs) + "\n" + prompt + "\n"
+                "Select useful distinct views and moments, not just portfolio standouts. "
+                "Preserve establishing views, signs/details that tell the story, subjects and changes in light. "
+                "Include the best usable representative of each meaningful scene/moment; "
+                "exclude all only when none is usable or worthwhile. No fixed pick count or quota. "
+                "Keep different framing, subject action and useful context even when technically imperfect. "
+                "Among truly redundant frames prefer stronger composition, timing and subject readability. "
+                "Do not call low texture, haze, dusk or an intentional silhouette a focus failure without visual evidence. "
+                "Ordinary exposure/color issues can be edited; do not discard an otherwise useful frame for them. "
+                "Never defer to review or require a human decision. Explain each inclusion/exclusion in summary. "
+                "Use rating 4 for a pick and 0 for an exclusion; label Green for pick and null for exclusion."
+            )
+            schema = request_payload["format"]
+            item_schema = schema["$defs"]["OllamaDecisionPayload"]
+            item_schema["properties"]["bucket"]["enum"] = ["pick", "reject"]
+            item_schema["required"] = list(dict.fromkeys(item_schema.get("required", []) + ["summary"]))
         if self.think is not None:
             request_payload["think"] = self.think
 
@@ -407,9 +452,12 @@ class OllamaVisionBackend(VisionBackend):
                     "index": index,
                     "id": _preview_id(index),
                     "filename": preview.asset.filename,
+                    "render_diagnostics": image_diagnostics(preview.image_bytes),
+                    "starting_adjustments": _edit_payload(preview.starting_suggestion) if preview.starting_suggestion else None,
+                    "leveling_evidence": leveling_evidence(preview.image_bytes) if include_crop else None,
                 }
             )
-            encoded_images.append(base64.b64encode(preview.image_bytes).decode("ascii"))
+            encoded_images.append(base64.b64encode(model_image_bytes(preview.image_bytes)).decode("ascii"))
 
         system_crop_instruction = (
             " When composition fields are present in the schema, independently "
@@ -464,18 +512,21 @@ class OllamaVisionBackend(VisionBackend):
                         + "- signed integer controls: -100 to 100\n"
                         + "- luma_noise_reduction and color_noise_reduction: 0 to 100\n"
                         + "Editing guidance:\n"
+                        + CONTROL_GUIDANCE
+                        + "- starting_adjustments, when present, already produced the shown baseline. Return FINAL ABSOLUTE values, not deltas. "
+                        "Preserve a starting value when it is already suitable; zero would undo it.\n"
                         + "- Fill every required field for every image.\n"
                         + "- First diagnose tonal balance, white balance/color cast, presence, detail/noise, and composition independently.\n"
                         + "- The summary must be one short, image-specific diagnostic sentence about the starting render. Do not narrate slider actions or claim that an adjustment was applied. Never leave it empty.\n"
-                        + "- Every executable field is required. Make an explicit independent decision for every field; use 0 only after deciding that control would not improve this image.\n"
-                        + "- The numeric fields are the actual recipe. Any executable change described anywhere in the response must have a matching nonzero field, and every nonzero field must address the visible diagnosis.\n"
+                        + "- Every executable field is required. For an unchanged control, copy its starting_adjustments value exactly (or zero when no starting value was supplied). A zero is NOT a no-op when the starting value is nonzero.\n"
+                        + "- The numeric fields are the final absolute recipe. A retained starting value preserves an existing correction. Change a value only to address a visible diagnosis; reducing a nonzero starting value to zero deliberately removes that correction.\n"
                         + "- Do not fall back to only exposure, contrast, highlights, shadows, and vibrance. Use the broader executable controls when the diagnosis calls for them, without forcing unnecessary changes.\n"
                         + "- Inspect exposure, brightness, highlight and shadow detail, whites, blacks, contrast, temperature, tint, vibrance, and saturation separately.\n"
                         + "- exposure is a linear RAW EV shift; brightness is a filmic perceptual exposure control. Prefer one for the diagnosed need and move both only when their distinct roles are necessary.\n"
                         + "- Recover blown skies with negative highlights; open dark areas with positive shadows.\n"
                         + "- Lift or lower exposure when it improves the overall tonal balance.\n"
                         + "- Use clarity, dehaze, and structure only for a specific visible presence problem.\n"
-                        + "- Use sharpening or noise reduction only when the available render provides enough evidence; otherwise leave those fields at zero and record a full-resolution inspection in additional_edits.\n"
+                        + "- Change sharpening or noise reduction only when the available render provides enough evidence; otherwise preserve their starting values and record a full-resolution inspection in additional_edits.\n"
                         + "- Keep edits realistic unless the user asks for a stronger look.\n"
                         + "- Use 0 only when that slider already looks correct for that specific image.\n"
                         + "- additional_edits is only for useful edits outside the executable fields, including HSL, curves, color grading, masks, healing, lens corrections, or other local work. Never place global exposure, brightness, contrast, highlights, shadows, whites, blacks, temperature, tint, vibrance, saturation, clarity, dehaze, structure, sharpening, noise reduction, vignette, crop, or rotation work there. Use concise, actionable descriptions and never pretend they were applied.\n"
@@ -529,15 +580,14 @@ class OllamaVisionBackend(VisionBackend):
             if verdict == EditReviewVerdict.ACCEPT:
                 final_suggestion = pair.suggestion
             elif verdict == EditReviewVerdict.REJECT:
-                final_suggestion = EditSuggestion(
-                    filename=pair.asset.filename,
-                    asset_id=pair.asset.raw_path.as_posix(),
+                final_suggestion = replace(
+                    pair.baseline_suggestion or EditSuggestion(filename=pair.asset.filename, asset_id=pair.asset.raw_path.as_posix()),
                     additional_edits=(
                         list(parsed.additional_edits)
                         if parsed.additional_edits
                         else list(pair.suggestion.additional_edits)
                     ),
-                    summary="Reverted to the neutral RapidRAW baseline.",
+                    summary="Reverted to the supplied RapidRAW baseline.",
                 )
             else:
                 final_suggestion = _bounded_refinement(pair, parsed)
@@ -565,18 +615,24 @@ class OllamaVisionBackend(VisionBackend):
                 {
                     "id": review_id,
                     "filename": pair.asset.filename,
-                    "image_order": ["baseline", "edited"],
+                    "image_order": ["baseline", "edited", "baseline_native_detail_sheet", "edited_native_detail_sheet"],
+                    "delivery_check": pair.delivery_check,
+                    "baseline_tone": image_diagnostics(pair.baseline_bytes),
+                    "edited_tone": image_diagnostics(pair.edited_bytes),
                     "baseline_actual_pixels": _image_boundary_facts(
                         pair.baseline_bytes
                     ),
                     "edited_actual_pixels": _image_boundary_facts(pair.edited_bytes),
                     "current_adjustments": _edit_payload(pair.suggestion),
+                    "baseline_adjustments": _edit_payload(pair.baseline_suggestion) if pair.baseline_suggestion else None,
                 }
             )
             encoded_images.extend(
                 [
-                    base64.b64encode(pair.baseline_bytes).decode("ascii"),
-                    base64.b64encode(pair.edited_bytes).decode("ascii"),
+                    base64.b64encode(model_image_bytes(pair.baseline_bytes)).decode("ascii"),
+                    base64.b64encode(model_image_bytes(pair.edited_bytes)).decode("ascii"),
+                    base64.b64encode(detail_sheet(pair.baseline_bytes)).decode("ascii"),
+                    base64.b64encode(detail_sheet(pair.edited_bytes)).decode("ascii"),
                 ]
             )
 
@@ -587,8 +643,12 @@ class OllamaVisionBackend(VisionBackend):
                     "role": "system",
                     "content": (
                         "You are independently validating real photo edit renders. Each record has exactly "
-                        "two consecutive images: the neutral RapidRAW baseline followed by the "
-                        "RapidRAW render of the current adjustments. Return only valid JSON matching "
+                        "four consecutive images: baseline, edited render, baseline native-pixel patch sheet, "
+                        "then edited native-pixel patch sheet. Patch locations may differ after a crop; "
+                        "The first two images are bounded-resolution overviews for transport. "
+                        "Reported actual-pixel dimensions refer to the full-resolution source renders, "
+                        "not overview size. The patches retain native source-pixel scale. "
+                        "compare equivalent content only. Return only valid JSON matching "
                         "the schema, with one review per record. Judge the rendered result rather than "
                         "defending the first recipe."
                     ),
@@ -600,9 +660,13 @@ class OllamaVisionBackend(VisionBackend):
                         + json.dumps(image_specs, ensure_ascii=False, indent=2)
                         + "\n\n"
                         + f"User instructions: {prompt}\n"
+                        + CONTROL_GUIDANCE
+                        + (DELIVERY_GUIDANCE if any(p.delivery_check for p in pairs) else
+                           "Inspect white corner haze, halos, highlight loss, unwanted color casts and subject readability. "
+                           "Use refine for a material problem even when the result is better than baseline. ")
                         + "Compare each edited render only with its paired baseline. Diagnose the most important visible difference before choosing a verdict. "
-                        + "Use accept only when the edit is a meaningful natural improvement without a new visible problem. "
-                        + "Use reject when the neutral baseline is better or the edit has no meaningful benefit. "
+                        + "For ordinary reviews use accept only when the edit is a meaningful natural improvement without a new visible problem. "
+                        + "For ordinary reviews use reject when the neutral baseline is better or the edit has no meaningful benefit. "
                         + "Use refine to correct a specific visible issue introduced or left by the edit, or when one small bounded tone, color, detail, crop, or rotation change would clearly make an already-improved render better. For a crop, check whether it stops slightly early or cuts too far relative to the stated composition goal. Do not refine merely to make values different. "
                         + "The actual-pixel metadata gives the decoded image dimensions and measured outer-edge pixels. Vision preprocessing may add black or neutral padding outside images with different aspect ratios; that display padding is not part of the photo. Never report letterboxing or black bars from external presentation padding. Only report a black-border defect when a band is visibly inside the actual image and the measured edge facts corroborate it. A smaller edited height or width is expected after a crop. "
                         + "additional_edits are unrendered future-work notes: never count them as a visible improvement, but preserve or improve useful notes even when rejecting the executable recipe. "
@@ -634,6 +698,8 @@ class OllamaVisionBackend(VisionBackend):
         request_payload: dict[str, object],
         parse_fn: Callable[[dict[str, object]], T],
     ) -> T:
+        if self.context_tokens is not None:
+            request_payload.setdefault("options", {})["num_ctx"] = self.context_tokens
         last_error: str | None = None
         for attempt in range(1, self.max_attempts + 1):
             try:
@@ -650,6 +716,12 @@ class OllamaVisionBackend(VisionBackend):
                 status_code = exc.response.status_code
                 if 500 <= status_code < 600:
                     last_error = f"ollama request failed with {status_code}"
+                    try:
+                        detail = exc.response.json().get("error")
+                    except (ValueError, AttributeError):
+                        detail = None
+                    if isinstance(detail, str) and detail.strip():
+                        last_error += ": " + " ".join(detail.split())[:500]
                 else:
                     raise VisionBackendError(f"ollama request failed: {exc}") from exc
             except httpx.HTTPError as exc:  # pragma: no cover - network/service dependent
@@ -657,6 +729,10 @@ class OllamaVisionBackend(VisionBackend):
             else:
                 try:
                     payload = response.json()
+                    prompt_tokens = payload.get("prompt_eval_count")
+                    if (self.context_tokens is not None and isinstance(prompt_tokens, int)
+                        and prompt_tokens + self.max_output_tokens >= self.context_tokens):
+                        raise VisionBackendError("context budget has insufficient headroom; refusing possibly truncated input")
                     return parse_fn(payload)
                 except VisionBackendError as exc:
                     last_error = str(exc)
@@ -915,7 +991,7 @@ def _fill_unchanged_edit_review_fields(
         fallback = (
             pair.suggestion
             if verdict == "accept"
-            else EditSuggestion(
+            else pair.baseline_suggestion or EditSuggestion(
                 filename=pair.asset.filename,
                 asset_id=pair.asset.raw_path.as_posix(),
             )

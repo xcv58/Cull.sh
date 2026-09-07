@@ -1,6 +1,64 @@
 # Cull.sh Handoff
 
-## Repository state
+## Current workflow decision — September 7
+
+- Keep Cull.sh for culling, ranking, duplicate handling, and Lightroom-compatible
+  metadata. Continue to use Qwen for semantic culling and TOPIQ only at its
+  existing ranking weight.
+- Use Lightroom as the manual finishing and JPEG-export surface. Do not invest
+  further in Lightroom UI automation unless the user explicitly reopens it.
+- Pause RapidRAW editing/export development. The implementation and completed
+  experiments remain as development evidence, but RapidRAW is not the current
+  production finishing path and its results did not establish Lightroom parity.
+- The ignored twelve-photo Lightroom pilot is intentionally unfinished: it has
+  isolated RAW copies and lens-correction sidecars, but no verified Adaptive
+  Color payloads and no JPEG exports. Nothing in that pilot needs to be resumed
+  or committed.
+- The full reviewed checkpoint is backed up on the forward-only branch
+  `origin/codex/sentosa-unattended-quality`. The staged integration procedure is
+  recorded in [the main integration plan](docs/main-integration-plan.md).
+- Remote `main` contains the AI-suggestion foundation (PR #2), the required CI
+  gate (PR #4), TOPIQ/benchmark/initial RapidRAW tooling (PR #5), and the Qwen
+  culling/rendered-validation layer (PR #3). Each gated layer and its post-merge
+  `main` commit passed exact-head CI. The final Sentosa quality/correction layer
+  remains the only integration layer in flight.
+- `main` requires an up-to-date `pytest` check through a pull request, enforces
+  the rule for admins, requires resolved conversations, and disallows force
+  pushes and branch deletion. Repository-local `push.default=simple` overrides
+  the user's global `matching` setting; still use explicit refspecs for every
+  integration push.
+
+## Current development iteration — August 28
+
+- Branch: `codex/sentosa-unattended-quality`, updated through protected `main`
+  without rebasing or rewriting its recovery history.
+- Regression suite: 171 passed plus four subtests; installed-app control
+  tests also passed. The twelve-photo pilot finished: ten passed and two failed
+  final quality checks for darkening (DSC03797 and DSC03806). No delivery export
+  was authorized by that original pilot.
+- Renderer semantics, final-pixel validation, experimental calibrated baselines,
+  straightening evidence, cautious local rejects, and post-selection duplicate
+  handling are implemented. See [quality validation](docs/unattended-quality-validation.md).
+- Frozen Sentosa source/human/first-machine artifacts remain untouched.
+- The parent `runs/sentosa-quality-v2/pilot-v2` is preserved. User-authorized
+  two-photo correction is complete in `pilot-v2-correction-1/status.json`, using
+  the explicit `cull_sh.feedback_correction` workflow. Ten passed records are
+  copied unchanged; only two failed photos received a correction and new final
+  check. Both passed. Twelve verified sRGB delivery JPEGs (292.1 MiB total) are
+  in `runs/sentosa-quality-v2/pilot-v2-correction-1/delivery`. The job exited at
+  17:32 EDT. The old shutdown heartbeat remains paused.
+  The full 389-photo selection stage remains prepared with zero decisions in
+  `runs/sentosa-quality-v2/album`; no automatic album continuation is enabled.
+- Earlier runtime recovery preserved six completed reviews after a worker reset and a
+  reproduced oversized-request error. Resume this job with `--context-tokens
+  65536`; bounded overviews leave full-resolution renders and native detail
+  patches intact. Prior failures and runtime transitions are recorded in the run.
+- Keep Qwen thinking/one-attempt/no-fallback and existing TOPIQ ranking unchanged.
+- Do not call Sentosa tuning an independent benchmark or claim Lightroom parity.
+
+The foundation notes below describe the prior branch and historical results.
+
+## Historical repository state
 
 - Foundation branch: `feat/ai-develop-edits`
 - Foundation draft PR: <https://github.com/xcv58/Cull.sh/pull/2>
@@ -37,8 +95,9 @@ TOPIQ/Qwen migration, rendered-feedback pilot, and expanded RapidRAW recipe work
   remove rotated black edges. Preserve
   unsupported but useful HSL/curve/mask/healing/lens ideas as explicit
   `additional_edits`; never report them as rendered.
-- Use RapidRAW as the primary automated renderer/exporter. Lightroom-compatible
-  XMP remains optional interoperability.
+- RapidRAW editing/export is paused and is not the current production finishing
+  path. Lightroom-compatible XMP remains the supported handoff from Cull.sh;
+  finishing and JPEG export are manual in Lightroom.
 
 ## RapidRAW workflow
 

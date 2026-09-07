@@ -7,14 +7,25 @@ import cv2
 import numpy as np
 
 from cull_sh.models import LocalQualityMetrics
-from cull_sh.quality import analyze_local_quality
-from cull_sh.quality import build_local_decision_trace
-from cull_sh.quality import should_reject_for_local_quality
-from cull_sh.quality import compute_local_rank_score
-from cull_sh.quality import score_topiq_quality
+from cull_sh.quality import (
+    analyze_local_quality,
+    build_local_decision_trace,
+    compute_local_rank_score,
+    score_topiq_quality,
+    should_reject_for_local_quality,
+)
 
 
 class LocalQualityTests(unittest.TestCase):
+    def test_missing_metrics_never_lower_corroboration_requirement(self):
+        for metrics in [LocalQualityMetrics(blur_score=1, tenengrad_score=1, musiq_score=1),
+                        LocalQualityMetrics(blur_score=None, tenengrad_score=1, musiq_score=1, nima_score=1)]:
+            trace = build_local_decision_trace(metrics, min_blur_score=100, min_tenengrad_score=40,
+                min_musiq_score=45, min_nima_score=4.5, max_brisque_score=55, min_cpbd_score=.3,
+                use_brisque_for_reject=False, use_cpbd_for_reject=False, local_reject_required_support_votes=2)
+            self.assertFalse(trace['quality_reject'])
+            self.assertEqual(trace['required_support_votes'], 2)
+
     def test_topiq_shadow_score_is_normalized_to_ten_point_scale(self) -> None:
         image = np.zeros((80, 80, 3), dtype=np.uint8)
         ok, encoded = cv2.imencode(".jpg", image)
@@ -84,7 +95,7 @@ class LocalQualityTests(unittest.TestCase):
                 local_reject_required_support_votes=2,
             )
         )
-        self.assertTrue(
+        self.assertFalse(
             should_reject_for_local_quality(
                 metrics,
                 min_blur_score=metrics.blur_score + 1000.0,

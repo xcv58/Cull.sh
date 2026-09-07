@@ -1,15 +1,17 @@
 from __future__ import annotations
 
-from datetime import datetime
 import json
+from datetime import datetime
 from pathlib import Path
 
 from cull_sh.config import PipelineConfig
-from cull_sh.models import ColorLabel
-from cull_sh.models import DecisionBucket
-from cull_sh.models import DecisionSource
-from cull_sh.models import FinalDecision
-from cull_sh.models import WorkItem
+from cull_sh.models import (
+    ColorLabel,
+    DecisionBucket,
+    DecisionSource,
+    FinalDecision,
+    WorkItem,
+)
 
 
 def create_run_dir(root: Path) -> Path:
@@ -98,6 +100,14 @@ def write_manifest(run_dir: Path, items: list[WorkItem]) -> Path:
 
 def load_manifest_records(run_dir: Path) -> list[dict[str, object]]:
     manifest_path = run_dir / "manifest.jsonl"
+    album_state = run_dir / "album-state.json"
+    if album_state.is_file():
+        from hashlib import sha256
+        state = json.loads(album_state.read_text())
+        if state.get("status") != "complete":
+            raise ValueError("unattended album selection is not complete")
+        if sha256(manifest_path.read_bytes()).hexdigest() != state.get("manifest_sha256"):
+            raise ValueError("unattended album manifest changed after completion")
     records: list[dict[str, object]] = []
     with manifest_path.open("r", encoding="utf-8") as handle:
         for line in handle:
@@ -149,6 +159,7 @@ def write_run_config(run_dir: Path, config: PipelineConfig) -> Path:
         "backend_think": config.backend.think,
         "backend_fail_fast": config.backend.fail_fast,
         "backend_max_output_tokens": config.backend.max_output_tokens,
+        "backend_context_tokens": config.backend.context_tokens,
         "batch_size": config.batch_size,
         "extract_workers": config.extract_workers,
         "score_workers": config.score_workers,

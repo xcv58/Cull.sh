@@ -35,6 +35,7 @@ class BackendConfig:
     think: bool | str | None = True
     fail_fast: bool = True
     max_output_tokens: int = 2048
+    context_tokens: int | None = None
 
 
 @dataclass(slots=True)
