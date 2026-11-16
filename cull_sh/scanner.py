@@ -1,10 +1,43 @@
 from __future__ import annotations
 
-from collections.abc import Iterator
+from collections.abc import Iterable, Iterator
 from pathlib import Path
 
+from cull_sh.config import DEFAULT_EXTENSIONS
 from cull_sh.models import AssetKind
 from cull_sh.models import RawAsset
+
+
+class SidecarCollisionError(ValueError):
+    """Distinct RAW files share a sidecar name."""
+
+
+def validate_unique_sidecar_targets(assets: Iterable[RawAsset]) -> None:
+    claims: dict[str, Path] = {}
+    directories: set[Path] = set()
+
+    def check_claim(sidecar: Path, raw: Path) -> str:
+        # macOS commonly treats different casing as the same local filename.
+        key = str(sidecar.resolve()).casefold()
+        owner = claims.get(key)
+        if owner is not None and owner.resolve() != raw.resolve():
+            raise SidecarCollisionError(
+                f"RAW files {owner} and {raw} share the XMP sidecar {sidecar}. "
+                "Give them distinct basenames or move them into separate folders."
+            )
+        return key
+
+    for asset in assets:
+        if not asset.is_jpeg:
+            claims[check_claim(asset.xmp_path, asset.raw_path)] = asset.raw_path
+            directories.add(asset.xmp_path.parent.resolve())
+
+    # A limited manifest can omit a sibling RAW that would still read the same XMP.
+    for directory in sorted(directories):
+        if directory.is_dir():
+            for sibling in directory.iterdir():
+                if sibling.suffix.lower() in DEFAULT_EXTENSIONS and sibling.is_file():
+                    check_claim(sibling.with_suffix(".xmp"), sibling)
 
 
 def discover_raw_assets(

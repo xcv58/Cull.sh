@@ -51,7 +51,7 @@ class PipelineDecisionTests(unittest.TestCase):
                 )
 
             self.assertEqual(result.exit_code, 1, result.output)
-            self.assertIn("repair-sidecars --embed-dng-metadata", result.output)
+            self.assertRegex(result.output, r"repair-sidecars\s+--embed-dng-metadata")
             extractor.assert_not_called()
             self.assertEqual(list(root.glob("*.xmp")), [])
             self.assertEqual(dng.read_bytes(), b"photo with embedded edits")

@@ -83,14 +83,16 @@ unchanged. This makes a new run additive when a folder contains earlier human
 selections. Inspect the command summary and confirm that its expected and
 written counts agree.
 
-If Lightroom already saved edits inside the DNGs, use
+If any DNGs already contain active embedded Lightroom edits or culling tags, use
 `repair-sidecars --embed-dng-metadata` with the same verified manifest and
-keep a backup of the edited DNGs before replay. Lightroom 10 reads an external
-XMP as the active settings for a DNG when one is present; a new cull-only XMP
-can hide its embedded profile. The embedded replay only writes culling tags
-and refuses DNGs that already have an external XMP. Reopen Lightroom and
-verify both the flag and the profile before exporting. Even a flag-only
-embedded write can leave Lightroom's Adaptive Color render stale.
+keep a backup of those DNGs before replay. Lightroom 10 gives an existing
+external XMP precedence over the embedded settings. Replay updates existing
+sidecars, writes only culling tags inside DNGs with active embedded metadata,
+and creates sidecars for the other RAWs. If two RAW files share a sidecar path,
+such as `photo.ARW` and `photo.DNG` in the same folder, replay stops before
+writing. Resolve the collision and regenerate the manifest before retrying.
+Reopen Lightroom and verify both the flag and profile before exporting. Even a
+flag-only embedded write can leave Lightroom's Adaptive Color render stale.
 
 ## 4. Apply the RAW baseline to the whole folder
 
@@ -105,12 +107,14 @@ Ensure every RAW, including rejects, receives merge-safe lens-profile settings:
 
 This stage enables Lightroom lens corrections only. It preserves unrelated
 existing XMP fields and does not invent Lightroom's Adaptive Color payload.
-Verify the discovered count, edit-candidate count, written-sidecar count,
-lens-enabled count, and error count before opening Lightroom.
+Verify the discovered count, edit-candidate count, write counts, and errors
+before opening Lightroom.
 
-For a DNG that already has embedded Lightroom edits, use Lightroom's Optics
-panel to correct any missing lens setting. Do not create a new lens-only XMP
-next to that DNG.
+For DNGs with embedded culling tags and no embedded develop edits, the command
+enables lens defaults inside the DNG to keep those tags active. It recognizes
+lens corrections that are already enabled inside a DNG. For DNGs with embedded
+develop edits and missing lens corrections, enable them in Lightroom's Optics
+panel.
 
 ## 5. Apply Adaptive Color once as a Lightroom batch
 

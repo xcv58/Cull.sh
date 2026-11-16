@@ -28,6 +28,14 @@ NAMESPACES = {
     "xmpDM": XMP_DM_NS,
     "crs": CRS_NS,
 }
+LENS_CORRECTION_SETTINGS = {
+    "LensProfileEnable": "1",
+    "LensProfileSetup": "LensDefaults",
+    "LensProfileDistortionScale": "100",
+    "LensProfileVignettingScale": "100",
+    "LensManualDistortionAmount": "0",
+    "HasSettings": "True",
+}
 
 ET.register_namespace("x", ADOBE_NS)
 ET.register_namespace("rdf", RDF_NS)
@@ -37,7 +45,7 @@ ET.register_namespace("crs", CRS_NS)
 
 
 class DngMetadataError(RuntimeError):
-    """Reading the DNG or writing a new sidecar would risk its embedded edits."""
+    """The DNG metadata could not be read or safely written."""
 
 
 @dataclass(slots=True)
@@ -46,6 +54,11 @@ class EmbeddedDngState:
     has_develop_settings: bool = False
     has_adaptive_color: bool = False
     has_lens_corrections: bool = False
+    has_culling_metadata: bool = False
+
+    @property
+    def has_active_metadata(self) -> bool:
+        return self.has_develop_settings or self.has_lens_corrections or self.has_culling_metadata
 
 
 def read_embedded_dng_state(raw_path: Path) -> EmbeddedDngState | None:
@@ -68,6 +81,8 @@ def read_embedded_dng_state(raw_path: Path) -> EmbeddedDngState | None:
                 "-XMP-crs:LensProfileEnable",
                 "-XMP-xmp:Rating",
                 "-XMP-xmpDM:Pick",
+                "-XMP-xmpDM:Good",
+                "-XMP-xmp:Label",
                 str(raw_path),
             ],
             check=False,
@@ -101,20 +116,27 @@ def read_embedded_dng_state(raw_path: Path) -> EmbeddedDngState | None:
             and bool(metadata.get("AILookAILookData"))
         ),
         has_lens_corrections=metadata.get("LensProfileEnable") == 1,
+        has_culling_metadata=any(tag in metadata for tag in ("Rating", "Pick", "Good", "Label")),
     )
 
 
-def validate_culling_sidecar_target(asset: RawAsset) -> None:
+def read_active_embedded_dng_state(asset: RawAsset) -> EmbeddedDngState | None:
     if asset.raw_path.suffix.lower() != ".dng" or asset.xmp_path.exists():
-        return
+        return None
+    return read_embedded_dng_state(asset.raw_path)
 
-    embedded = read_embedded_dng_state(asset.raw_path)
-    if embedded and (embedded.has_develop_settings or embedded.has_lens_corrections):
+
+def culling_requires_embedded_dng(asset: RawAsset, *, allow_embedded: bool = False) -> bool:
+    embedded = read_active_embedded_dng_state(asset)
+    requires_embedded = embedded is not None and embedded.has_active_metadata
+    if requires_embedded and not allow_embedded:
         raise DngMetadataError(
-            f"{asset.raw_path} has embedded Lightroom edits that a new XMP sidecar would hide. "
+            f"{asset.raw_path} has embedded Lightroom edits or culling tags "
+            "that a new XMP sidecar would hide. "
             "Run cull in dry-run mode, then replay the manifest with "
             "repair-sidecars --embed-dng-metadata."
         )
+    return requires_embedded
 
 
 def write_xmp_sidecar(
@@ -167,7 +189,7 @@ def write_photo_metadata(
         write_jpeg_metadata(asset.raw_path, decision)
         return
 
-    validate_culling_sidecar_target(asset)
+    culling_requires_embedded_dng(asset)
     write_xmp_sidecar(
         asset.xmp_path,
         decision,
@@ -182,6 +204,18 @@ def write_jpeg_metadata(path: Path, decision: FinalDecision) -> None:
 
 def write_embedded_cull_metadata(path: Path, decision: FinalDecision) -> None:
     """Update culling tags without replacing Lightroom's embedded develop packet."""
+    _write_embedded_xmp(path, _jpeg_decision_args(decision))
+
+
+def write_embedded_lens_corrections(path: Path) -> None:
+    """Enable lens defaults in a DNG whose culling tags are embedded."""
+    _write_embedded_xmp(
+        path,
+        [f"-XMP-crs:{name}={value}" for name, value in LENS_CORRECTION_SETTINGS.items()],
+    )
+
+
+def _write_embedded_xmp(path: Path, arguments: list[str]) -> None:
     exiftool = shutil.which("exiftool")
     if exiftool is None:
         raise RuntimeError("exiftool is required to write embedded metadata")
@@ -189,7 +223,7 @@ def write_embedded_cull_metadata(path: Path, decision: FinalDecision) -> None:
     command = [
         exiftool,
         "-overwrite_original",
-        *_jpeg_decision_args(decision),
+        *arguments,
         str(path),
     ]
     result = subprocess.run(command, check=False, capture_output=True, text=True)
@@ -433,12 +467,8 @@ def apply_lightroom_sidecar_edit(description: ET.Element) -> None:
         f"{{{CRS_NS}}}ProcessVersion",
         description.get(f"{{{CRS_NS}}}ProcessVersion", "15.4"),
     )
-    description.set(f"{{{CRS_NS}}}LensProfileEnable", "1")
-    description.set(f"{{{CRS_NS}}}LensProfileSetup", "LensDefaults")
-    description.set(f"{{{CRS_NS}}}LensProfileDistortionScale", "100")
-    description.set(f"{{{CRS_NS}}}LensProfileVignettingScale", "100")
-    description.set(f"{{{CRS_NS}}}LensManualDistortionAmount", "0")
-    description.set(f"{{{CRS_NS}}}HasSettings", "True")
+    for name, value in LENS_CORRECTION_SETTINGS.items():
+        description.set(f"{{{CRS_NS}}}{name}", value)
 
     has_ai_look = _has_ai_look(description)
     if _has_adaptive_color_look(description) and not has_ai_look:

@@ -47,6 +47,7 @@ from cull_sh.manifests import find_latest_run_dir
 from cull_sh.manifests import load_manifest_records
 from cull_sh.models import AssetKind
 from cull_sh.models import EditSuggestion
+from cull_sh.models import FinalDecision
 from cull_sh.models import LightroomEditScope
 from cull_sh.models import PreviewImage
 from cull_sh.models import RawAsset
@@ -64,14 +65,17 @@ from cull_sh.rapidraw import rapidraw_install_info
 from cull_sh.rapidraw import render_rapidraw_review
 from cull_sh.rapidraw import stage_rapidraw_develop
 from cull_sh.reporting import RichPipelineReporter
+from cull_sh.scanner import SidecarCollisionError
 from cull_sh.scanner import discover_raw_assets
+from cull_sh.scanner import validate_unique_sidecar_targets
 from cull_sh.xmp import DngMetadataError
+from cull_sh.xmp import culling_requires_embedded_dng
 from cull_sh.xmp import photo_is_picked
-from cull_sh.xmp import read_embedded_dng_state
+from cull_sh.xmp import read_active_embedded_dng_state
 from cull_sh.xmp import sidecar_is_rejected
-from cull_sh.xmp import validate_culling_sidecar_target
 from cull_sh.xmp import write_develop_sidecar
 from cull_sh.xmp import write_embedded_cull_metadata
+from cull_sh.xmp import write_embedded_lens_corrections
 from cull_sh.xmp import write_photo_metadata
 from cull_sh.xmp import write_lightroom_edit_sidecar
 from cull_sh.vlm_benchmark import VLMModelSpec
@@ -1085,7 +1089,7 @@ def cull(
     try:
         with RichPipelineReporter(console) as reporter:
             items, summary, run_dir = run_pipeline(config, reporter=reporter)
-    except DngMetadataError as exc:
+    except (DngMetadataError, SidecarCollisionError) as exc:
         console.print(f"Culling stopped before writing metadata: {exc}", markup=False)
         raise typer.Exit(code=1) from exc
     except VisionBackendError as exc:
@@ -1244,16 +1248,20 @@ def lightroom_edit(
     dry_run: bool = typer.Option(
         True,
         "--dry-run/--no-dry-run",
-        help="Show what would be edited without writing sidecars.",
+        help="Show what would be edited without writing metadata.",
     ),
     edit_scope: LightroomEditScope = typer.Option(
         LightroomEditScope.ALL,
         "--lightroom-edit-scope",
-        help="Which RAW files receive Lightroom sidecar edits: all or kept.",
+        help="Which RAW files receive Lightroom lens corrections: all or kept.",
     ),
 ) -> None:
-    """Apply safe Lightroom sidecar edits to RAW files in a folder."""
+    """Apply lens corrections to sidecars or DNGs with embedded culling tags."""
     assets = discover_raw_assets(path, DEFAULT_EXTENSIONS)
+    try:
+        validate_unique_sidecar_targets(assets)
+    except SidecarCollisionError as exc:
+        raise typer.BadParameter(str(exc)) from exc
     if limit is not None:
         assets = assets[:limit]
 
@@ -1262,16 +1270,15 @@ def lightroom_edit(
     skipped_rejected = 0
     sidecars_written = 0
     embedded_lens_enabled = 0
+    embedded_lens_edits = 0
     failed: list[tuple[str, str]] = []
 
     for asset in assets:
         try:
-            embedded = (
-                None if asset.xmp_path.exists() else read_embedded_dng_state(asset.raw_path)
-            )
+            embedded = read_active_embedded_dng_state(asset)
             rejected = embedded.rejected if embedded else sidecar_is_rejected(asset.xmp_path)
         except Exception as exc:
-            failed.append((asset.filename, f"sidecar read failed: {exc}"))
+            failed.append((asset.filename, f"metadata read failed: {exc}"))
             continue
         if rejected:
             rejected_found += 1
@@ -1280,20 +1287,23 @@ def lightroom_edit(
             continue
 
         candidates += 1
+        if embedded and embedded.has_lens_corrections:
+            embedded_lens_enabled += 1
+            continue
         if embedded and embedded.has_develop_settings:
-            if embedded.has_lens_corrections:
-                embedded_lens_enabled += 1
-            else:
-                failed.append((asset.filename, "Use Lightroom Optics to preserve embedded edits"))
+            failed.append((asset.filename, "Use Lightroom Optics to preserve embedded edits"))
             continue
-        if dry_run:
-            continue
+        embed_lens = embedded is not None and embedded.has_culling_metadata
         try:
-            write_lightroom_edit_sidecar(asset.xmp_path)
+            if embed_lens:
+                if not dry_run:
+                    write_embedded_lens_corrections(asset.raw_path)
+                embedded_lens_edits += 1
+            elif not dry_run:
+                write_lightroom_edit_sidecar(asset.xmp_path)
+                sidecars_written += 1
         except Exception as exc:
-            failed.append((asset.filename, f"sidecar write failed: {exc}"))
-            continue
-        sidecars_written += 1
+            failed.append((asset.filename, f"metadata write failed: {exc}"))
 
     console.print(f"Discovered {len(assets)} RAW file(s) under {path}")
     console.print(f"Edit scope: {edit_scope.value}")
@@ -1301,10 +1311,13 @@ def lightroom_edit(
     console.print(f"Rejected RAW files: {rejected_found}")
     console.print(f"Rejected skipped: {skipped_rejected}")
     console.print(f"Sidecars written: {sidecars_written}")
+    if embedded_lens_edits:
+        action = "planned" if dry_run else "written"
+        console.print(f"Embedded DNG lens edits {action}: {embedded_lens_edits}")
     if embedded_lens_enabled:
         console.print(f"DNGs with lens corrections already embedded: {embedded_lens_enabled}")
     console.print(f"Dry run: {'yes' if dry_run else 'no'}")
-    console.print("Sidecar edit: lens corrections")
+    console.print("Lightroom edit: lens corrections")
     console.print("Adaptive Color: requires Lightroom UI/preset automation")
 
     if failed:
@@ -2110,7 +2123,7 @@ def repair_sidecars(
     embed_dng_metadata: bool = typer.Option(
         False,
         "--embed-dng-metadata",
-        help="Write DNG culling tags in place when Lightroom already stores edits there.",
+        help="Allow in-place culling writes when a DNG has active embedded edits or culling tags.",
     ),
     dry_run: bool = typer.Option(
         True,
@@ -2118,7 +2131,7 @@ def repair_sidecars(
         help="Preview replay counts without writing metadata (the default).",
     ),
 ) -> None:
-    """Rewrite sidecars from an existing manifest without rerunning scoring."""
+    """Replay culling metadata from an existing manifest without rerunning scoring."""
     try:
         target_run_dir = run_dir or find_latest_run_dir(runs_root)
     except FileNotFoundError as exc:
@@ -2127,12 +2140,11 @@ def repair_sidecars(
     if embed_dng_metadata and lightroom_auto_edit:
         raise typer.BadParameter("--embed-dng-metadata is for culling tags, not lens edits")
 
+    assets_and_decisions: list[tuple[RawAsset, FinalDecision | None]] = []
     skipped = 0
-    preserved_picks = 0
-    replay: list[tuple[RawAsset, FinalDecision, bool]] = []
     for record in records:
         decision = decision_from_manifest_record(record)
-        if decision is None:
+        if decision is None and "raw_path" not in record:
             skipped += 1
             continue
         raw_path = Path(str(record["raw_path"]))
@@ -2145,20 +2157,26 @@ def repair_sidecars(
             kind=asset_kind,
             paired_raw_path=Path(str(paired_raw_path)) if paired_raw_path else None,
         )
+        assets_and_decisions.append((asset, decision))
+
+    try:
+        validate_unique_sidecar_targets(asset for asset, _ in assets_and_decisions)
+    except SidecarCollisionError as exc:
+        raise typer.BadParameter(str(exc)) from exc
+
+    preserved_picks = 0
+    replay: list[tuple[RawAsset, FinalDecision, bool]] = []
+    for asset, decision in assets_and_decisions:
+        if decision is None:
+            skipped += 1
+            continue
         if preserve_existing_picks and photo_is_picked(asset):
             preserved_picks += 1
             continue
-        embed_dng = embed_dng_metadata and raw_path.suffix.lower() == ".dng"
-        if embed_dng and (xmp_path.exists() or not raw_path.is_file()):
-            raise typer.BadParameter(
-                f"Cannot replay embedded tags for {raw_path}: the DNG is missing "
-                "or already has an external XMP sidecar"
-            )
-        if not embed_dng:
-            try:
-                validate_culling_sidecar_target(asset)
-            except DngMetadataError as exc:
-                raise typer.BadParameter(str(exc)) from exc
+        try:
+            embed_dng = culling_requires_embedded_dng(asset, allow_embedded=embed_dng_metadata)
+        except DngMetadataError as exc:
+            raise typer.BadParameter(str(exc)) from exc
         replay.append((asset, decision, embed_dng))
 
     if not dry_run:
@@ -2177,8 +2195,11 @@ def repair_sidecars(
     console.print(f"Mode: {'dry run' if dry_run else 'write'}")
     console.print(
         f"Sidecars {'that would be rewritten' if dry_run else 'rewritten'}: "
-        f"{sum(not embed_dng for _, _, embed_dng in replay)}"
+        f"{sum(not (asset.is_jpeg or embed_dng) for asset, _, embed_dng in replay)}"
     )
+    jpeg_count = sum(asset.is_jpeg for asset, _, _ in replay)
+    if jpeg_count:
+        console.print(f"Embedded JPEG metadata records: {jpeg_count}")
     if embed_dng_metadata:
         console.print(f"Embedded DNG metadata records: {sum(row[2] for row in replay)}")
     console.print(f"Existing picks preserved: {preserved_picks}")

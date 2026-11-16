@@ -173,9 +173,13 @@ In `--dry-run` mode, the pipeline still:
 
 With `--no-dry-run`, it writes or updates `.xmp` sidecars next to each RAW and
 embedded XMP culling metadata inside JPEG files. Direct cull stops before
-scoring if a DNG has embedded Lightroom edits and would need a new sidecar.
+scoring if a DNG has embedded Lightroom edits or culling tags and would need
+a new sidecar.
 Cull in dry-run mode, then apply the manifest with
-`repair-sidecars --embed-dng-metadata --no-dry-run` to preserve those edits.
+`repair-sidecars --embed-dng-metadata --no-dry-run` to preserve that metadata.
+Replay updates existing sidecars, writes inside DNGs with active embedded
+metadata, and creates sidecars for the other RAW files. Keep RAW basenames
+distinct within each folder so each file has its own sidecar path.
 
 `--lightroom-auto-edit` extends culling sidecar writes for RAW photos with
 safe Lightroom sidecar edits:
