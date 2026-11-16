@@ -113,8 +113,8 @@ class LightroomUiTests(unittest.TestCase):
                 ),
             )
             with (
-                patch("cull_sh.lightroom_ui.shutil.which", return_value="/usr/bin/exiftool"),
-                patch("cull_sh.lightroom_ui.subprocess.run", return_value=exiftool_result),
+                patch("cull_sh.xmp.shutil.which", return_value="/usr/bin/exiftool"),
+                patch("cull_sh.xmp.subprocess.run", return_value=exiftool_result),
             ):
                 stage = build_adaptive_color_stage(root, DEFAULT_EXTENSIONS)
 

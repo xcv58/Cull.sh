@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from dataclasses import dataclass
+import json
 from pathlib import Path
 import shutil
 import subprocess
@@ -32,6 +34,87 @@ ET.register_namespace("rdf", RDF_NS)
 ET.register_namespace("xmp", XMP_NS)
 ET.register_namespace("xmpDM", XMP_DM_NS)
 ET.register_namespace("crs", CRS_NS)
+
+
+class DngMetadataError(RuntimeError):
+    """Reading the DNG or writing a new sidecar would risk its embedded edits."""
+
+
+@dataclass(slots=True)
+class EmbeddedDngState:
+    rejected: bool = False
+    has_develop_settings: bool = False
+    has_adaptive_color: bool = False
+    has_lens_corrections: bool = False
+
+
+def read_embedded_dng_state(raw_path: Path) -> EmbeddedDngState | None:
+    if raw_path.suffix.lower() != ".dng":
+        return None
+
+    exiftool = shutil.which("exiftool")
+    if exiftool is None:
+        raise DngMetadataError(f"ExifTool is required to check embedded edits in {raw_path}")
+
+    try:
+        result = subprocess.run(
+            [
+                exiftool,
+                "-j",
+                "-XMP-crs:AILookActive",
+                "-XMP-crs:AILookAILookData",
+                "-XMP-crs:HasSettings",
+                "-XMP-crs:LookName",
+                "-XMP-crs:LensProfileEnable",
+                "-XMP-xmp:Rating",
+                "-XMP-xmpDM:Pick",
+                str(raw_path),
+            ],
+            check=False,
+            capture_output=True,
+            text=True,
+            timeout=20,
+        )
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        raise DngMetadataError(f"Unable to read embedded metadata in {raw_path}: {exc}") from exc
+
+    if result.returncode != 0:
+        detail = result.stderr.strip() or f"ExifTool exited with status {result.returncode}"
+        raise DngMetadataError(f"Unable to read embedded metadata in {raw_path}: {detail}")
+
+    try:
+        payload = json.loads(result.stdout)
+    except json.JSONDecodeError as exc:
+        raise DngMetadataError(f"Invalid ExifTool response for {raw_path}") from exc
+    if not payload:
+        raise DngMetadataError(f"ExifTool returned no embedded DNG metadata for {raw_path}")
+
+    metadata = payload[0]
+    return EmbeddedDngState(
+        rejected=metadata.get("Rating") == -1 or metadata.get("Pick") == -1,
+        has_develop_settings=(
+            metadata.get("HasSettings") is True or metadata.get("AILookActive") is True
+        ),
+        has_adaptive_color=(
+            metadata.get("AILookActive") is True
+            and metadata.get("LookName") == "Adaptive Color"
+            and bool(metadata.get("AILookAILookData"))
+        ),
+        has_lens_corrections=metadata.get("LensProfileEnable") == 1,
+    )
+
+
+def validate_culling_sidecar_target(asset: RawAsset) -> None:
+    if asset.raw_path.suffix.lower() != ".dng" or asset.xmp_path.exists():
+        return
+
+    embedded = read_embedded_dng_state(asset.raw_path)
+    if embedded and (embedded.has_develop_settings or embedded.has_lens_corrections):
+        raise DngMetadataError(
+            f"{asset.raw_path} has embedded Lightroom edits that a new XMP sidecar would hide. "
+            "Run cull in dry-run mode, then replay the manifest with "
+            "repair-sidecars --embed-dng-metadata."
+        )
 
 
 def write_xmp_sidecar(
@@ -84,6 +167,7 @@ def write_photo_metadata(
         write_jpeg_metadata(asset.raw_path, decision)
         return
 
+    validate_culling_sidecar_target(asset)
     write_xmp_sidecar(
         asset.xmp_path,
         decision,

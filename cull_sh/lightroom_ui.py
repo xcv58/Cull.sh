@@ -3,13 +3,12 @@ from __future__ import annotations
 from dataclasses import dataclass
 import json
 from pathlib import Path
-import shutil
-import subprocess
 
 from cull_sh.models import LightroomEditScope
 from cull_sh.scanner import discover_jpeg_assets
 from cull_sh.scanner import discover_raw_assets
 from cull_sh.xmp import jpeg_is_rejected
+from cull_sh.xmp import read_embedded_dng_state
 from cull_sh.xmp import sidecar_has_adaptive_color_payload
 from cull_sh.xmp import sidecar_has_lens_corrections
 from cull_sh.xmp import sidecar_is_rejected
@@ -47,14 +46,6 @@ class LightroomJpegAutoStage:
     rejected_filenames: list[str]
     candidate_filenames: list[str]
     errors: list[dict[str, str]]
-
-
-@dataclass(slots=True)
-class EmbeddedDngState:
-    rejected: bool = False
-    has_develop_settings: bool = False
-    has_adaptive_color: bool = False
-    has_lens_corrections: bool = False
 
 
 def build_adaptive_color_stage(
@@ -473,58 +464,3 @@ def _verification_filenames(stage: LightroomAdaptiveColorStage) -> list[str]:
         if filename not in verification:
             verification.append(filename)
     return verification
-
-
-def read_embedded_dng_state(raw_path: Path) -> EmbeddedDngState | None:
-    if raw_path.suffix.lower() != ".dng":
-        return None
-
-    exiftool = shutil.which("exiftool")
-    if exiftool is None:
-        raise RuntimeError("exiftool is required to verify embedded DNG edits")
-
-    try:
-        result = subprocess.run(
-            [
-                exiftool,
-                "-j",
-                "-XMP-crs:AILookActive",
-                "-XMP-crs:AILookAILookData",
-                "-XMP-crs:HasSettings",
-                "-XMP-crs:LookName",
-                "-XMP-crs:LensProfileEnable",
-                "-XMP-xmp:Rating",
-                "-XMP-xmpDM:Pick",
-                str(raw_path),
-            ],
-            check=False,
-            capture_output=True,
-            text=True,
-            timeout=20,
-        )
-    except (OSError, subprocess.TimeoutExpired) as exc:
-        raise RuntimeError(f"Unable to read embedded DNG metadata: {exc}") from exc
-
-    if result.returncode != 0:
-        raise RuntimeError(result.stderr.strip() or "Unable to read embedded DNG metadata")
-
-    try:
-        payload = json.loads(result.stdout)
-    except json.JSONDecodeError as exc:
-        raise RuntimeError("Invalid ExifTool response for embedded DNG metadata") from exc
-    if not payload:
-        raise RuntimeError("ExifTool returned no embedded DNG metadata record")
-
-    metadata = payload[0]
-    return EmbeddedDngState(
-        rejected=metadata.get("Rating") == -1 or metadata.get("Pick") == -1,
-        has_develop_settings=(
-            metadata.get("HasSettings") is True or metadata.get("AILookActive") is True
-        ),
-        has_adaptive_color=(
-            metadata.get("AILookActive") is True
-            and metadata.get("LookName") == "Adaptive Color"
-            and bool(metadata.get("AILookAILookData"))
-        ),
-        has_lens_corrections=metadata.get("LensProfileEnable") == 1,
-    )

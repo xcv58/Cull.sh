@@ -39,7 +39,6 @@ from cull_sh.edit_feedback import run_feedback_pilot
 from cull_sh.edit_feedback import select_feedback_picks
 from cull_sh.lightroom_ui import build_adaptive_color_stage
 from cull_sh.lightroom_ui import build_jpeg_auto_stage
-from cull_sh.lightroom_ui import read_embedded_dng_state
 from cull_sh.lightroom_ui import write_adaptive_color_handoff
 from cull_sh.lightroom_ui import write_jpeg_auto_handoff
 from cull_sh.manifests import create_run_dir
@@ -66,8 +65,11 @@ from cull_sh.rapidraw import render_rapidraw_review
 from cull_sh.rapidraw import stage_rapidraw_develop
 from cull_sh.reporting import RichPipelineReporter
 from cull_sh.scanner import discover_raw_assets
+from cull_sh.xmp import DngMetadataError
 from cull_sh.xmp import photo_is_picked
+from cull_sh.xmp import read_embedded_dng_state
 from cull_sh.xmp import sidecar_is_rejected
+from cull_sh.xmp import validate_culling_sidecar_target
 from cull_sh.xmp import write_develop_sidecar
 from cull_sh.xmp import write_embedded_cull_metadata
 from cull_sh.xmp import write_photo_metadata
@@ -1083,6 +1085,9 @@ def cull(
     try:
         with RichPipelineReporter(console) as reporter:
             items, summary, run_dir = run_pipeline(config, reporter=reporter)
+    except DngMetadataError as exc:
+        console.print(f"Culling stopped before writing metadata: {exc}", markup=False)
+        raise typer.Exit(code=1) from exc
     except VisionBackendError as exc:
         console.print(f"Culling stopped after the first vision-model failure: {exc}")
         console.print("No fallback model or additional cohort was attempted.")
@@ -2149,13 +2154,11 @@ def repair_sidecars(
                 f"Cannot replay embedded tags for {raw_path}: the DNG is missing "
                 "or already has an external XMP sidecar"
             )
-        if not embed_dng and not xmp_path.exists():
-            embedded = read_embedded_dng_state(raw_path)
-            if embedded and embedded.has_develop_settings:
-                raise typer.BadParameter(
-                    f"{raw_path} has embedded Lightroom edits. Use --embed-dng-metadata "
-                    "to avoid hiding them with a new sidecar."
-                )
+        if not embed_dng:
+            try:
+                validate_culling_sidecar_target(asset)
+            except DngMetadataError as exc:
+                raise typer.BadParameter(str(exc)) from exc
         replay.append((asset, decision, embed_dng))
 
     if not dry_run:

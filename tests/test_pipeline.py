@@ -6,7 +6,10 @@ import unittest
 from unittest.mock import MagicMock
 from unittest.mock import patch
 
+from typer.testing import CliRunner
+
 from cull_sh.backends import VisionBackendError
+from cull_sh.cli import app
 from cull_sh.config import BackendConfig
 from cull_sh.config import PipelineConfig
 from cull_sh.models import AssetKind
@@ -26,9 +29,61 @@ from cull_sh.pipeline import mirror_paired_jpeg_decisions
 from cull_sh.pipeline import persist_decisions
 from cull_sh.pipeline import score_with_backend
 from cull_sh.reporting import NullReporter
+from cull_sh.xmp import EmbeddedDngState
 
 
 class PipelineDecisionTests(unittest.TestCase):
+    def test_cull_stops_before_extraction_for_a_dng_with_embedded_edits(self) -> None:
+        with TemporaryDirectory() as folder:
+            root = Path(folder)
+            (root / "first.ARW").touch()
+            dng = root / "second.DNG"
+            dng.write_bytes(b"photo with embedded edits")
+
+            with (
+                patch("cull_sh.xmp.read_embedded_dng_state", return_value=EmbeddedDngState(
+                    has_develop_settings=True,
+                )),
+                patch("cull_sh.pipeline.build_default_extractor") as extractor,
+            ):
+                result = CliRunner().invoke(
+                    app, ["cull", "--path", str(root), "--prompt", "test", "--no-dry-run"]
+                )
+
+            self.assertEqual(result.exit_code, 1, result.output)
+            self.assertIn("repair-sidecars --embed-dng-metadata", result.output)
+            extractor.assert_not_called()
+            self.assertEqual(list(root.glob("*.xmp")), [])
+            self.assertEqual(dng.read_bytes(), b"photo with embedded edits")
+
+    def test_persist_decisions_protects_edits_added_after_preflight(self) -> None:
+        with TemporaryDirectory() as folder:
+            root = Path(folder)
+            raw_path = root / "frame.DNG"
+            xmp_path = raw_path.with_suffix(".xmp")
+            item = WorkItem(
+                asset=RawAsset(raw_path=raw_path, xmp_path=xmp_path),
+                decision=FinalDecision(
+                    filename=raw_path.name,
+                    rating=4,
+                    label=ColorLabel.GREEN,
+                    bucket=DecisionBucket.PICK,
+                    source=DecisionSource.LOCAL,
+                ),
+            )
+            config = PipelineConfig(path=root, prompt="test", dry_run=False)
+
+            with patch(
+                "cull_sh.xmp.read_embedded_dng_state",
+                return_value=EmbeddedDngState(has_lens_corrections=True),
+            ):
+                written = persist_decisions([item], config)
+
+            self.assertEqual(written, 0)
+            self.assertFalse(xmp_path.exists())
+            self.assertEqual(item.status, WorkStatus.FAILED)
+            self.assertIn("embedded Lightroom edits", item.error or "")
+
     def test_vision_model_failure_aborts_before_next_cohort(self) -> None:
         first = _ready_item("first.ARW", "scene-0001")
         second = _ready_item("second.ARW", "scene-0002")
