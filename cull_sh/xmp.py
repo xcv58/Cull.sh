@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from dataclasses import dataclass
+import json
 from pathlib import Path
 import shutil
 import subprocess
@@ -26,12 +28,115 @@ NAMESPACES = {
     "xmpDM": XMP_DM_NS,
     "crs": CRS_NS,
 }
+LENS_CORRECTION_SETTINGS = {
+    "LensProfileEnable": "1",
+    "LensProfileSetup": "LensDefaults",
+    "LensProfileDistortionScale": "100",
+    "LensProfileVignettingScale": "100",
+    "LensManualDistortionAmount": "0",
+    "HasSettings": "True",
+}
 
 ET.register_namespace("x", ADOBE_NS)
 ET.register_namespace("rdf", RDF_NS)
 ET.register_namespace("xmp", XMP_NS)
 ET.register_namespace("xmpDM", XMP_DM_NS)
 ET.register_namespace("crs", CRS_NS)
+
+
+class DngMetadataError(RuntimeError):
+    """The DNG metadata could not be read or safely written."""
+
+
+@dataclass(slots=True)
+class EmbeddedDngState:
+    rejected: bool = False
+    has_develop_settings: bool = False
+    has_adaptive_color: bool = False
+    has_lens_corrections: bool = False
+    has_culling_metadata: bool = False
+
+    @property
+    def has_active_metadata(self) -> bool:
+        return self.has_develop_settings or self.has_lens_corrections or self.has_culling_metadata
+
+
+def read_embedded_dng_state(raw_path: Path) -> EmbeddedDngState | None:
+    if raw_path.suffix.lower() != ".dng":
+        return None
+
+    exiftool = shutil.which("exiftool")
+    if exiftool is None:
+        raise DngMetadataError(f"ExifTool is required to check embedded edits in {raw_path}")
+
+    try:
+        result = subprocess.run(
+            [
+                exiftool,
+                "-j",
+                "-XMP-crs:AILookActive",
+                "-XMP-crs:AILookAILookData",
+                "-XMP-crs:HasSettings",
+                "-XMP-crs:LookName",
+                "-XMP-crs:LensProfileEnable",
+                "-XMP-xmp:Rating",
+                "-XMP-xmpDM:Pick",
+                "-XMP-xmpDM:Good",
+                "-XMP-xmp:Label",
+                str(raw_path),
+            ],
+            check=False,
+            capture_output=True,
+            text=True,
+            timeout=20,
+        )
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        raise DngMetadataError(f"Unable to read embedded metadata in {raw_path}: {exc}") from exc
+
+    if result.returncode != 0:
+        detail = result.stderr.strip() or f"ExifTool exited with status {result.returncode}"
+        raise DngMetadataError(f"Unable to read embedded metadata in {raw_path}: {detail}")
+
+    try:
+        payload = json.loads(result.stdout)
+    except json.JSONDecodeError as exc:
+        raise DngMetadataError(f"Invalid ExifTool response for {raw_path}") from exc
+    if not payload:
+        raise DngMetadataError(f"ExifTool returned no embedded DNG metadata for {raw_path}")
+
+    metadata = payload[0]
+    return EmbeddedDngState(
+        rejected=metadata.get("Rating") == -1 or metadata.get("Pick") == -1,
+        has_develop_settings=(
+            metadata.get("HasSettings") is True or metadata.get("AILookActive") is True
+        ),
+        has_adaptive_color=(
+            metadata.get("AILookActive") is True
+            and metadata.get("LookName") == "Adaptive Color"
+            and bool(metadata.get("AILookAILookData"))
+        ),
+        has_lens_corrections=metadata.get("LensProfileEnable") == 1,
+        has_culling_metadata=any(tag in metadata for tag in ("Rating", "Pick", "Good", "Label")),
+    )
+
+
+def read_active_embedded_dng_state(asset: RawAsset) -> EmbeddedDngState | None:
+    if asset.raw_path.suffix.lower() != ".dng" or asset.xmp_path.exists():
+        return None
+    return read_embedded_dng_state(asset.raw_path)
+
+
+def culling_requires_embedded_dng(asset: RawAsset, *, allow_embedded: bool = False) -> bool:
+    embedded = read_active_embedded_dng_state(asset)
+    requires_embedded = embedded is not None and embedded.has_active_metadata
+    if requires_embedded and not allow_embedded:
+        raise DngMetadataError(
+            f"{asset.raw_path} has embedded Lightroom edits or culling tags "
+            "that a new XMP sidecar would hide. "
+            "Run cull in dry-run mode, then replay the manifest with "
+            "repair-sidecars --embed-dng-metadata."
+        )
+    return requires_embedded
 
 
 def write_xmp_sidecar(
@@ -84,6 +189,7 @@ def write_photo_metadata(
         write_jpeg_metadata(asset.raw_path, decision)
         return
 
+    culling_requires_embedded_dng(asset)
     write_xmp_sidecar(
         asset.xmp_path,
         decision,
@@ -93,20 +199,37 @@ def write_photo_metadata(
 
 
 def write_jpeg_metadata(path: Path, decision: FinalDecision) -> None:
+    write_embedded_cull_metadata(path, decision)
+
+
+def write_embedded_cull_metadata(path: Path, decision: FinalDecision) -> None:
+    """Update culling tags without replacing Lightroom's embedded develop packet."""
+    _write_embedded_xmp(path, _jpeg_decision_args(decision))
+
+
+def write_embedded_lens_corrections(path: Path) -> None:
+    """Enable lens defaults in a DNG whose culling tags are embedded."""
+    _write_embedded_xmp(
+        path,
+        [f"-XMP-crs:{name}={value}" for name, value in LENS_CORRECTION_SETTINGS.items()],
+    )
+
+
+def _write_embedded_xmp(path: Path, arguments: list[str]) -> None:
     exiftool = shutil.which("exiftool")
     if exiftool is None:
-        raise RuntimeError("exiftool is required to write JPEG metadata")
+        raise RuntimeError("exiftool is required to write embedded metadata")
 
     command = [
         exiftool,
         "-overwrite_original",
-        *_jpeg_decision_args(decision),
+        *arguments,
         str(path),
     ]
     result = subprocess.run(command, check=False, capture_output=True, text=True)
     if result.returncode != 0:
         error = result.stderr.strip() or result.stdout.strip()
-        raise RuntimeError(f"exiftool failed to write JPEG metadata: {error}")
+        raise RuntimeError(f"exiftool failed to write embedded metadata: {error}")
 
 
 def write_lightroom_edit_sidecar(path: Path) -> None:
@@ -287,13 +410,15 @@ def photo_is_rejected(asset: RawAsset) -> bool:
 
 
 def photo_is_picked(asset: RawAsset) -> bool:
-    if asset.is_jpeg:
+    if asset.is_jpeg or (
+        asset.raw_path.suffix.lower() == ".dng" and not asset.xmp_path.exists()
+    ):
         return jpeg_is_picked(asset.raw_path)
     return sidecar_is_picked(asset.xmp_path)
 
 
 def sidecar_has_adaptive_color_payload(path: Path) -> bool:
-    """Return True when Lightroom has generated a real Adaptive Color payload."""
+    """Verify the active Adaptive Color reference and its Lightroom RAW sidecar."""
     if not path.exists():
         return False
 
@@ -302,7 +427,17 @@ def sidecar_has_adaptive_color_payload(path: Path) -> bool:
     if description is None:
         return False
 
-    return _has_ai_look(description) and _has_adaptive_color_look(description)
+    ai_look = description.find("crs:AILook", NAMESPACES)
+    if (
+        ai_look is None
+        or _metadata_boolean(ai_look.get(f"{{{CRS_NS}}}Active")) is not True
+        or not ai_look.get(f"{{{CRS_NS}}}AILookData", "").strip()
+        or not _has_adaptive_color_look(description)
+    ):
+        return False
+
+    acr_path = path.with_suffix(".acr")
+    return acr_path.is_file() and acr_path.stat().st_size > 0
 
 
 def sidecar_has_lens_corrections(path: Path) -> bool:
@@ -332,12 +467,8 @@ def apply_lightroom_sidecar_edit(description: ET.Element) -> None:
         f"{{{CRS_NS}}}ProcessVersion",
         description.get(f"{{{CRS_NS}}}ProcessVersion", "15.4"),
     )
-    description.set(f"{{{CRS_NS}}}LensProfileEnable", "1")
-    description.set(f"{{{CRS_NS}}}LensProfileSetup", "LensDefaults")
-    description.set(f"{{{CRS_NS}}}LensProfileDistortionScale", "100")
-    description.set(f"{{{CRS_NS}}}LensProfileVignettingScale", "100")
-    description.set(f"{{{CRS_NS}}}LensManualDistortionAmount", "0")
-    description.set(f"{{{CRS_NS}}}HasSettings", "True")
+    for name, value in LENS_CORRECTION_SETTINGS.items():
+        description.set(f"{{{CRS_NS}}}{name}", value)
 
     has_ai_look = _has_ai_look(description)
     if _has_adaptive_color_look(description) and not has_ai_look:

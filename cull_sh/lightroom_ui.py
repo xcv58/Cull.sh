@@ -3,13 +3,12 @@ from __future__ import annotations
 from dataclasses import dataclass
 import json
 from pathlib import Path
-import shutil
-import subprocess
 
 from cull_sh.models import LightroomEditScope
 from cull_sh.scanner import discover_jpeg_assets
 from cull_sh.scanner import discover_raw_assets
 from cull_sh.xmp import jpeg_is_rejected
+from cull_sh.xmp import read_embedded_dng_state
 from cull_sh.xmp import sidecar_has_adaptive_color_payload
 from cull_sh.xmp import sidecar_has_lens_corrections
 from cull_sh.xmp import sidecar_is_rejected
@@ -26,6 +25,7 @@ class LightroomAdaptiveColorStage:
     already_adaptive_color: int
     pending_adaptive_color: int
     lens_corrections_enabled: int
+    pending_lens_paths: list[str]
     rejected_filenames: list[str]
     pending_filenames: list[str]
     adaptive_color_filenames: list[str]
@@ -48,13 +48,6 @@ class LightroomJpegAutoStage:
     errors: list[dict[str, str]]
 
 
-@dataclass(slots=True)
-class _EmbeddedDngState:
-    rejected: bool = False
-    has_adaptive_color: bool = False
-    has_lens_corrections: bool = False
-
-
 def build_adaptive_color_stage(
     path: Path,
     extensions: tuple[str, ...],
@@ -73,11 +66,16 @@ def build_adaptive_color_stage(
     dng_candidate_filenames: list[str] = []
     errors: list[dict[str, str]] = []
     lens_corrections_enabled = 0
+    pending_lens_paths: list[str] = []
     non_rejected = 0
 
     for asset in assets:
-        embedded_dng_state = _read_embedded_dng_state(asset.raw_path)
         try:
+            # In Lightroom Local, an external XMP takes precedence over embedded
+            # DNG edits. A cull-only sidecar can hide a valid embedded profile.
+            embedded_dng_state = (
+                None if asset.xmp_path.exists() else read_embedded_dng_state(asset.raw_path)
+            )
             is_rejected = sidecar_is_rejected(asset.xmp_path)
             has_adaptive_color_xmp = sidecar_has_adaptive_color_payload(asset.xmp_path)
             has_lens_corrections = sidecar_has_lens_corrections(asset.xmp_path)
@@ -95,12 +93,9 @@ def build_adaptive_color_stage(
             embedded_dng_state and embedded_dng_state.has_adaptive_color
         )
         if embedded_dng_state is not None:
-            is_rejected = is_rejected or embedded_dng_state.rejected
-            has_lens_corrections = (
-                has_lens_corrections or embedded_dng_state.has_lens_corrections
-            )
+            is_rejected = embedded_dng_state.rejected
+            has_lens_corrections = embedded_dng_state.has_lens_corrections
 
-        has_lightroom_acr = asset.raw_path.with_suffix(".acr").exists()
         if is_rejected:
             rejected_filenames.append(asset.filename)
         else:
@@ -113,9 +108,11 @@ def build_adaptive_color_stage(
             dng_candidate_filenames.append(asset.filename)
         if has_lens_corrections:
             lens_corrections_enabled += 1
-        if has_adaptive_color_xmp or has_lightroom_acr or has_embedded_adaptive_color:
+        else:
+            pending_lens_paths.append(str(asset.raw_path.relative_to(path)))
+        if has_adaptive_color_xmp or has_embedded_adaptive_color:
             adaptive_color_filenames.append(asset.filename)
-            if has_lightroom_acr:
+            if has_adaptive_color_xmp:
                 lightroom_acr_filenames.append(asset.filename)
             if has_embedded_adaptive_color:
                 embedded_dng_filenames.append(asset.filename)
@@ -133,6 +130,7 @@ def build_adaptive_color_stage(
         already_adaptive_color=len(adaptive_color_filenames),
         pending_adaptive_color=len(pending_filenames),
         lens_corrections_enabled=lens_corrections_enabled,
+        pending_lens_paths=pending_lens_paths,
         rejected_filenames=rejected_filenames,
         pending_filenames=pending_filenames,
         adaptive_color_filenames=adaptive_color_filenames,
@@ -236,6 +234,7 @@ def _stage_payload(stage: LightroomAdaptiveColorStage) -> dict[str, object]:
         "already_adaptive_color": stage.already_adaptive_color,
         "pending_adaptive_color": stage.pending_adaptive_color,
         "lens_corrections_enabled": stage.lens_corrections_enabled,
+        "pending_lens_paths": stage.pending_lens_paths,
         "seed_filename": _seed_filename(stage),
         "verification_filenames": _verification_filenames(stage),
         "rejected_filenames": stage.rejected_filenames,
@@ -244,7 +243,6 @@ def _stage_payload(stage: LightroomAdaptiveColorStage) -> dict[str, object]:
         "lightroom_acr_filenames": stage.lightroom_acr_filenames,
         "embedded_dng_filenames": stage.embedded_dng_filenames,
         "dng_candidate_filenames": stage.dng_candidate_filenames,
-        "dng_update_ai_settings_required": bool(stage.dng_candidate_filenames),
         "automation_mode": "seed_profile_selective_copy_paste",
         "errors": stage.errors,
         "computer_use_instruction": _computer_use_instruction(stage),
@@ -273,6 +271,9 @@ def _stage_checklist(stage: LightroomAdaptiveColorStage) -> str:
         pending_preview += f"\n- ... {stage.pending_adaptive_color - 20} more"
     if not pending_preview:
         pending_preview = "- None"
+    pending_lens_preview = "\n".join(f"- {name}" for name in stage.pending_lens_paths[:20])
+    if len(stage.pending_lens_paths) > 20:
+        pending_lens_preview += f"\n- ... {len(stage.pending_lens_paths) - 20} more (see JSON)"
 
     return f"""# Lightroom Adaptive Color Computer Use Handoff
 
@@ -288,7 +289,7 @@ Counts:
 - Already Adaptive Color / Lightroom AI payload: {stage.already_adaptive_color}
 - Lightroom `.acr` AI payload files: {len(stage.lightroom_acr_filenames)}
 - Embedded DNG AI payload files: {len(stage.embedded_dng_filenames)}
-- In-scope DNG files for batch AI refresh after paste: {len(stage.dng_candidate_filenames)}
+- In-scope DNG files to check for AI refresh after paste: {len(stage.dng_candidate_filenames)}
 - Pending Adaptive Color: {stage.pending_adaptive_color}
 - Lens corrections enabled: {stage.lens_corrections_enabled}
 - Seed photo: {_seed_filename(stage) or "None"}
@@ -298,9 +299,13 @@ Computer Use instruction:
 
 {_computer_use_instruction(stage)}
 
-Pending sample:
+Pending Adaptive Color sample:
 
 {pending_preview}
+
+Pending lens corrections sample:
+
+{pending_lens_preview or "- None"}
 """
 
 
@@ -339,14 +344,15 @@ def _computer_use_instruction(stage: LightroomAdaptiveColorStage) -> str:
     verification = ", ".join(_verification_filenames(stage))
     if stage.edit_scope == LightroomEditScope.ALL:
         scope_instruction = (
-            "Use the search/filter controls to show RAW photos in the folder, "
+            "Use Filtering > Extension to show only the in-scope RAW extensions, "
             "including rejected photos; do not filter rejected photos out. "
         )
         seed_label = "one RAW"
         selection_label = "visible RAW photos"
     else:
         scope_instruction = (
-            "Use the filter/refine controls to show non-rejected photos only "
+            "Use Filtering > Extension to show only the in-scope RAW extensions, "
+            "and use the Flag filter to show non-rejected photos only "
             "(picked plus unflagged; rejected excluded). "
         )
         seed_label = "one non-rejected RAW"
@@ -355,18 +361,19 @@ def _computer_use_instruction(stage: LightroomAdaptiveColorStage) -> str:
     return (
         "Use Adobe Lightroom, not Lightroom Classic. "
         f"Open the Local folder named '{folder_name}' at {stage.path}. "
-        "Clear the search box and enable Include subfolders when Lightroom shows it. "
+        "Clear search and filters. Enable Include subfolders only when the handoff "
+        "includes those folders; keep delivery folders out of the selection. "
         f"{scope_instruction}"
         f"Before applying anything, verify the visible count is {stage.candidates}. "
         f"Use {seed or seed_label} as the seed photo. In Detail view, "
         "choose Adaptive Color directly from the Edit panel's Profile dropdown and "
-        "verify the seed Profile field shows Adaptive Color. Open Copy Edit "
-        "Settings, clear every setting, then enable only the profile/treatment "
-        "setting that carries the selected Profile. Do not copy exposure, color "
+        "verify the seed Profile field shows Adaptive Color. Open Choose Edit "
+        "Settings to Copy. In Lightroom 10, use Select > None and check only "
+        "Profile: Adaptive Color (verify the checkbox visually). Do not copy exposure, color "
         "mixers, curves, masks, crop, geometry, detail, or lens correction settings. "
         f"Return to Grid view, select all {selection_label}, and paste the "
         "copied edit settings to the entire selection. Wait for Lightroom's paste "
-        "and AI settings update to finish. "
+        "and AI settings update to finish; do not choose Update AI Settings Later. "
         f"{dng_instruction}"
         "Then refresh each verification photo before reading the Profile field. "
         "Verify Adaptive Color on these photos: "
@@ -393,10 +400,9 @@ def _jpeg_computer_use_instruction(stage: LightroomJpegAutoStage) -> str:
     return (
         "Use Adobe Lightroom, not Lightroom Classic. "
         f"Open the Local folder named '{folder_name}' at {stage.path}. "
-        "Clear the search box and enable Include subfolders when Lightroom shows it. "
+        "Clear search and filters. Enable Include subfolders only when they are in scope. "
         f"{scope_instruction}"
-        "Filter/search for JPEG files only, using Lightroom's type/extension "
-        "controls when available or a jpg/jpeg search token otherwise. "
+        "Use Filtering > Extension to show jpg/jpeg files only. "
         f"Before applying anything, verify the visible count is {stage.candidates}. "
         f"Return to Grid view, select all {selection_label}, and choose "
         f"Photo > Apply Auto Settings to {stage.candidates} Photos. Do not paste "
@@ -412,13 +418,11 @@ def _dng_update_instruction(stage: LightroomAdaptiveColorStage) -> str:
 
     dng_count = len(stage.dng_candidate_filenames)
     return (
-        f"Because this run includes {dng_count} in-scope DNG file(s), run the "
-        "DNG AI refresh after the paste: filter/search the current folder to "
-        f"show only DNG files, verify the visible count is {dng_count}, select "
-        "all visible DNGs, choose Photo > Update AI Settings, and wait for "
-        f"Lightroom to finish updating all {dng_count} photo(s). If you repair "
-        "or rewrite cull/lens metadata after Lightroom applies Adaptive Color, "
-        "repeat this DNG-only Update AI Settings step afterward. "
+        f"Verify that all {dng_count} in-scope DNG files have active embedded "
+        "Adaptive Color after the paste. If a DNG reports stale or missing AI "
+        "settings, filter to DNGs, verify the selection, then use "
+        "Photo > Update AI Settings and recheck the embedded state. "
+        "Recheck DNGs after any subsequent metadata rewrite. "
     )
 
 
@@ -460,52 +464,3 @@ def _verification_filenames(stage: LightroomAdaptiveColorStage) -> list[str]:
         if filename not in verification:
             verification.append(filename)
     return verification
-
-
-def _read_embedded_dng_state(raw_path: Path) -> _EmbeddedDngState | None:
-    if raw_path.suffix.lower() != ".dng":
-        return None
-
-    exiftool = shutil.which("exiftool")
-    if exiftool is None:
-        return None
-
-    try:
-        result = subprocess.run(
-            [
-                exiftool,
-                "-j",
-                "-XMP-crs:AILookActive",
-                "-XMP-crs:LookName",
-                "-XMP-crs:LensProfileEnable",
-                "-XMP-xmp:Rating",
-                "-XMP-xmpDM:Pick",
-                str(raw_path),
-            ],
-            check=False,
-            capture_output=True,
-            text=True,
-            timeout=20,
-        )
-    except (OSError, subprocess.TimeoutExpired):
-        return None
-
-    if result.returncode != 0:
-        return None
-
-    try:
-        payload = json.loads(result.stdout)
-    except json.JSONDecodeError:
-        return None
-    if not payload:
-        return None
-
-    metadata = payload[0]
-    return _EmbeddedDngState(
-        rejected=metadata.get("Rating") == -1 or metadata.get("Pick") == -1,
-        has_adaptive_color=(
-            metadata.get("AILookActive") is True
-            and metadata.get("LookName") == "Adaptive Color"
-        ),
-        has_lens_corrections=metadata.get("LensProfileEnable") == 1,
-    )

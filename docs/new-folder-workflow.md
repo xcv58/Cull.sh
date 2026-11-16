@@ -12,8 +12,8 @@ The production contract is:
 4. Lightroom applies Adaptive Color to every RAW in one batch.
 5. Lightroom exports only the picked photographs as JPEGs in one batch.
 
-This is a batch workflow. It does not use per-photo AI develop suggestions or
-per-photo Lightroom UI automation.
+This is a batch workflow. The Local view steps below were checked in Adobe
+Lightroom desktop 10.0 with Sony ARW, DJI DNG, and standalone JPEG files.
 
 ## 1. Preflight and protect existing work
 
@@ -21,7 +21,9 @@ Before running a command that can write metadata:
 
 - Confirm the exact source folder and whether it contains RAWs, DNGs, JPEGs,
   existing XMP sidecars, or Lightroom `.acr` payloads.
-- Ignore output directories, hidden files, and AppleDouble `._*` companions.
+- Cull.sh skips hidden files, AppleDouble companions, and subdirectories
+  named `output`. In Lightroom, work in individual source folders if an
+  included delivery folder already contains photos.
 - Back up existing XMP sidecars and embedded-DNG metadata when the folder has
   already been touched by a person or another application.
 - Run the dependency check:
@@ -30,8 +32,11 @@ Before running a command that can write metadata:
 .venv/bin/python main.py doctor
 ```
 
-Do not start a metadata-writing phase if ExifTool, Ollama, Qwen, or required
-TOPIQ support is unavailable.
+Do not write culling decisions before the ExifTool, Ollama, Qwen, and TOPIQ
+checks pass. A listed Ollama model can have missing weights. If Doctor cannot
+read the configured model, restore it before culling. If applying the
+Lightroom baseline first, back up the DNG and JPEG originals; after the later
+culling metadata write, verify that the Lightroom edits still read correctly.
 
 ## 2. Run and verify culling without writing metadata
 
@@ -78,6 +83,17 @@ unchanged. This makes a new run additive when a folder contains earlier human
 selections. Inspect the command summary and confirm that its expected and
 written counts agree.
 
+If any DNGs already contain active embedded Lightroom edits or culling tags, use
+`repair-sidecars --embed-dng-metadata` with the same verified manifest and
+keep a backup of those DNGs before replay. Lightroom 10 gives an existing
+external XMP precedence over the embedded settings. Replay updates existing
+sidecars, writes only culling tags inside DNGs with active embedded metadata,
+and creates sidecars for the other RAWs. If two RAW files share a sidecar path,
+such as `photo.ARW` and `photo.DNG` in the same folder, replay stops before
+writing. Resolve the collision and regenerate the manifest before retrying.
+Reopen Lightroom and verify both the flag and profile before exporting. Even a
+flag-only embedded write can leave Lightroom's Adaptive Color render stale.
+
 ## 4. Apply the RAW baseline to the whole folder
 
 Ensure every RAW, including rejects, receives merge-safe lens-profile settings:
@@ -91,8 +107,14 @@ Ensure every RAW, including rejects, receives merge-safe lens-profile settings:
 
 This stage enables Lightroom lens corrections only. It preserves unrelated
 existing XMP fields and does not invent Lightroom's Adaptive Color payload.
-Verify the discovered count, edit-candidate count, written-sidecar count,
-lens-enabled count, and error count before opening Lightroom.
+Verify the discovered count, edit-candidate count, write counts, and errors
+before opening Lightroom.
+
+For DNGs with embedded culling tags and no embedded develop edits, the command
+enables lens defaults inside the DNG to keep those tags active. It recognizes
+lens corrections that are already enabled inside a DNG. For DNGs with embedded
+develop edits and missing lens corrections, enable them in Lightroom's Optics
+panel.
 
 ## 5. Apply Adaptive Color once as a Lightroom batch
 
@@ -104,21 +126,28 @@ Generate the count-aware handoff:
   --lightroom-edit-scope all
 ```
 
-Then use Adobe Lightroom's Local view:
+Then use Adobe Lightroom's Local view. In Lightroom 10, Photos and Filtering
+are separate left-side panels. Shortcuts below assume the default Lightroom
+key map; use the named controls if the workspace uses a different map.
 
 1. Open the exact folder, clear filters, and include subfolders only when they
    are part of the intended scope.
-2. Show all in-scope RAWs, including rejected photos, and verify that the
-   visible count matches the generated handoff.
-3. On one seed RAW, choose **Adaptive Color** from the Profile control.
-4. Copy Edit Settings, clear all settings, and select only the profile/treatment
-   setting. Do not copy exposure, white balance, curves, masks, crop, geometry,
-   detail, or lens corrections.
-5. Return to Grid, select all visible RAWs, and paste once.
-6. Wait for Lightroom's AI update to finish. Inspect at least the first,
-   middle, and last photograph to confirm that the batch reached the full set.
-7. If the folder contains DNGs, filter to the DNG subset and run
-   **Photo > Update AI Settings** after the paste.
+2. Open **Filtering > Extension**. Choose the in-scope RAW extensions, such
+   as `arw` and `dng`, leaving the Flag filter clear. Check that the grid count
+   matches the handoff. Leave JPEGs for the separate pass below.
+3. Open one RAW in Detail. In **Edit > Profile**, choose **Adaptive Color**.
+4. Open **Choose Edit Settings to Copy** (`Shift+Cmd+C` on Mac). In **Copy
+   Settings**, choose **Select > None**, check only **Profile: Adaptive Color**,
+   visually verify the selection, and click **Copy**.
+5. Return to Square Grid (`G`), select all visible RAWs, and verify that the
+   selected count matches the visible count. Paste once (`Cmd+V` on Mac).
+   Lightroom may show a confirmation with the affected count for a large batch.
+6. Let the paste and AI update finish. Inspect sample photos in Detail. On the
+   tested build the same batch wrote active Adaptive Color to ARW XMP plus ACR
+   sidecars and to embedded DNG metadata.
+7. If a DNG reports stale or missing AI settings, isolate the DNGs with the
+   Extension filter, check the count, and use **Photo > Update AI Settings**.
+   Recheck the embedded settings after this and after any metadata repair.
 
 Validate Lightroom's written state after the batch:
 
@@ -130,14 +159,30 @@ Validate Lightroom's written state after the batch:
   --assert-complete
 ```
 
-Stop if the visible count or Adaptive Color verification does not match. Fix
-the batch scope or Lightroom writeback before exporting.
+Stop if the visible count, Adaptive Color, or lens count does not match. An
+ACR file on its own can represent other AI edits; Cull.sh also checks for the
+active Adaptive Color reference. Fix scope or Lightroom writeback before
+exporting.
+
+Lightroom 10 can paste Adaptive Color using a previously loaded edit state,
+even if the lens sidecars were written on disk before the paste. If lens
+corrections are missing after the batch, generate a fresh handoff for the
+affected paths. In **Edit > Optics**, enable **Lens Corrections** on a
+matching camera/lens seed, then use **Copy Settings > Select > None** and
+check only **Optics > Enable Lens Corrections**. Paste to the affected photos
+with that lens, separately for each camera/lens combination. Recheck both
+the lens and Adaptive Color counts before exporting.
 
 ## 6. Export the final picks
 
-In Lightroom, filter to the Cull.sh picks/kept photographs and export that set
-to JPEG in one batch. Do not export the rejected photos merely because they
-received the same baseline edit.
+Clear Extension filters and turn on **Filtering > Flag > Show picked photos**.
+Compare the grid count with the frozen picks (plus any preserved picks). In
+Square Grid, select the result and use **File > Export** (or `Shift+E` with the
+default shortcuts). Choose JPG, Full Size, sRGB, and the requested quality
+(90% is a starting point). Export to a separate delivery folder and check the
+output names and count against the picks. If Lightroom opens **AI Update
+Required**, leave **Update affected photos** checked and let the refresh
+finish before choosing the export location.
 
 The intended result is simple: all RAWs retain a consistent lens-correction and
 Adaptive Color baseline, while only the selected photographs become delivery
@@ -154,9 +199,10 @@ scope, prepare a separate JPEG batch with:
   --lightroom-edit-scope all
 ```
 
-That Lightroom handoff uses **Photo > Apply Auto Settings** for JPEGs. It is
-not part of the normal RAW Adaptive Color batch and should not be mixed into
-the RAW baseline procedure.
+Use **Filtering > Extension** to show just `jpg`/`jpeg`, verify the selected
+count in Square Grid, and choose **Photo > Apply Auto Settings** (or
+`Shift+A` with the default shortcuts). In Local view Lightroom writes the
+edits as metadata in the JPEG, so keep a backup of the original file.
 
 ## Failure and recovery rules
 

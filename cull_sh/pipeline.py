@@ -40,7 +40,9 @@ from cull_sh.ranking import suppress_duplicates_and_rerank
 from cull_sh.reporting import NullReporter
 from cull_sh.reporting import PipelineReporter
 from cull_sh.scanner import discover_photo_assets
+from cull_sh.scanner import validate_unique_sidecar_targets
 from cull_sh.shadow import write_topiq_shadow_report
+from cull_sh.xmp import culling_requires_embedded_dng
 from cull_sh.xmp import write_photo_metadata
 
 
@@ -62,15 +64,21 @@ def run_pipeline(
     """Run discovery plus the local extraction and blur filtering phases."""
     reporter = reporter or NullReporter()
     items = build_work_items(config)
+    if not config.dry_run:
+        validate_unique_sidecar_targets(item.asset for item in items)
     total_discovered = len(items)
-    run_dir = create_run_dir(config.runs_dir)
-    write_run_config(run_dir, config)
     scene_count = assign_scene_groups(
         items,
         max_gap_seconds=config.scene_gap_seconds,
         max_sequence_gap=config.scene_max_sequence_gap,
     )
     items, processed_scene_count = limit_items_to_scenes(items, config.limit)
+    if not config.dry_run:
+        for item in items:
+            culling_requires_embedded_dng(item.asset)
+
+    run_dir = create_run_dir(config.runs_dir)
+    write_run_config(run_dir, config)
     summary = PipelineSummary(discovered=len(items))
     reporter.message(f"Run initialized: discovered {total_discovered} photo file(s)")
     if scene_count:
