@@ -38,6 +38,7 @@ class LightroomUiTests(unittest.TestCase):
                 ),
             )
             _write_adaptive_color_sidecar(root / "c.xmp", ai_payload=True)
+            (root / "c.acr").write_bytes(b"lightroom-ai-payload")
             _write_adaptive_color_sidecar(root / "d.xmp", ai_payload=False)
             (root / "e.acr").write_bytes(b"lightroom-ai-payload")
 
@@ -47,14 +48,23 @@ class LightroomUiTests(unittest.TestCase):
             self.assertEqual(stage.rejected, 1)
             self.assertEqual(stage.non_rejected, 4)
             self.assertEqual(stage.candidates, 5)
-            self.assertEqual(stage.already_adaptive_color, 2)
-            self.assertEqual(stage.pending_adaptive_color, 3)
+            self.assertEqual(stage.already_adaptive_color, 1)
+            self.assertEqual(stage.pending_adaptive_color, 4)
             self.assertEqual(stage.lens_corrections_enabled, 2)
             self.assertEqual(stage.rejected_filenames, ["b.ARW"])
-            self.assertEqual(stage.adaptive_color_filenames, ["c.ARW", "e.ARW"])
-            self.assertEqual(stage.lightroom_acr_filenames, ["e.ARW"])
+            self.assertEqual(stage.adaptive_color_filenames, ["c.ARW"])
+            self.assertEqual(stage.lightroom_acr_filenames, ["c.ARW"])
             self.assertEqual(stage.dng_candidate_filenames, [])
-            self.assertEqual(stage.pending_filenames, ["a.ARW", "b.ARW", "d.ARW"])
+            self.assertEqual(stage.pending_filenames, ["a.ARW", "b.ARW", "d.ARW", "e.ARW"])
+
+    def test_profile_reference_without_acr_payload_remains_pending(self) -> None:
+        with TemporaryDirectory() as tmp_dir:
+            root = Path(tmp_dir)
+            (root / "frame.ARW").write_bytes(b"raw")
+            _write_adaptive_color_sidecar(root / "frame.xmp", ai_payload=True)
+            (root / "frame.acr").touch()
+            stage = build_adaptive_color_stage(root, DEFAULT_EXTENSIONS)
+            self.assertEqual(stage.pending_filenames, ["frame.ARW"])
 
     def test_build_adaptive_color_stage_can_scope_to_kept_files(self) -> None:
         with TemporaryDirectory() as tmp_dir:
@@ -95,6 +105,7 @@ class LightroomUiTests(unittest.TestCase):
                     [
                         {
                             "AILookActive": True,
+                            "AILookAILookData": "26C78FE6488D309FEBB918588EA56538",
                             "LookName": "Adaptive Color",
                             "LensProfileEnable": 1,
                         }
@@ -116,7 +127,19 @@ class LightroomUiTests(unittest.TestCase):
             self.assertEqual(stage.embedded_dng_filenames, ["drone.DNG"])
             self.assertEqual(stage.dng_candidate_filenames, ["drone.DNG"])
 
-    def test_build_adaptive_color_stage_scopes_dng_refresh_to_kept_files(self) -> None:
+    def test_external_dng_sidecar_takes_precedence_over_embedded_edits(self) -> None:
+        with TemporaryDirectory() as tmp_dir:
+            root = Path(tmp_dir)
+            (root / "drone.DNG").touch()
+            _write_adaptive_color_sidecar(root / "drone.xmp", ai_payload=False)
+            with patch("cull_sh.lightroom_ui.read_embedded_dng_state") as read_embedded:
+                stage = build_adaptive_color_stage(root, DEFAULT_EXTENSIONS)
+            read_embedded.assert_not_called()
+            self.assertEqual(stage.pending_filenames, ["drone.DNG"])
+            self.assertEqual(stage.embedded_dng_filenames, [])
+
+    @patch("cull_sh.lightroom_ui.read_embedded_dng_state", return_value=None)
+    def test_build_adaptive_color_stage_scopes_dng_refresh_to_kept_files(self, _) -> None:
         with TemporaryDirectory() as tmp_dir:
             root = Path(tmp_dir)
             for filename in ("keep.DNG", "reject.DNG"):
@@ -163,13 +186,13 @@ class LightroomUiTests(unittest.TestCase):
             self.assertEqual(payload["seed_filename"], "frame.ARW")
             self.assertEqual(payload["verification_filenames"], ["frame.ARW"])
             self.assertEqual(payload["dng_candidate_filenames"], [])
-            self.assertFalse(payload["dng_update_ai_settings_required"])
-            self.assertIn("Copy Edit Settings", payload["computer_use_instruction"])
-            self.assertIn("only the profile/treatment", payload["computer_use_instruction"])
+            self.assertIn("Choose Edit Settings to Copy", payload["computer_use_instruction"])
+            self.assertIn("Select > None", payload["computer_use_instruction"])
             self.assertIn("AI settings update", payload["computer_use_instruction"])
             self.assertIn("Profile dropdown", checklist)
 
-    def test_write_adaptive_color_handoff_includes_dng_update_step(self) -> None:
+    @patch("cull_sh.lightroom_ui.read_embedded_dng_state", return_value=None)
+    def test_write_adaptive_color_handoff_includes_dng_update_step(self, _) -> None:
         with TemporaryDirectory() as tmp_dir:
             root = Path(tmp_dir)
             (root / "drone.DNG").write_bytes(b"raw")
@@ -181,7 +204,6 @@ class LightroomUiTests(unittest.TestCase):
             payload = json.loads(payload_path.read_text(encoding="utf-8"))
             checklist = checklist_path.read_text(encoding="utf-8")
             self.assertEqual(payload["dng_candidate_filenames"], ["drone.DNG"])
-            self.assertTrue(payload["dng_update_ai_settings_required"])
             self.assertIn("Photo > Update AI Settings", payload["computer_use_instruction"])
             self.assertIn("visible count is 1", payload["computer_use_instruction"])
             self.assertIn("In-scope DNG files", checklist)

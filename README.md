@@ -179,19 +179,14 @@ safe Lightroom sidecar edits:
 
 - lens profile corrections enabled
 
-Cull.sh does not invent Lightroom's per-image Adaptive Color AI payload. The
-validated path is to let Lightroom apply that profile through the UI or a preset
-automation pass, because the visible Adaptive Color result requires Lightroom's
-generated `crs:AILook` data. The verifier counts Lightroom `.acr` payloads for
-sidecar RAW files and embedded DNG XMP when Lightroom writes the AI payload back
-into a DNG.
+Lightroom generates the per-image Adaptive Color payload. Cull.sh verifies the
+active Adaptive Color reference and its companion `.acr` for sidecar RAWs, or
+the active embedded Adaptive Color reference for DNGs. The
+`--assert-complete` check also requires lens corrections for each in-scope RAW.
 
-For folders containing DNG files, Lightroom may show an Adaptive Profile refresh
-warning after metadata is written back into the DNG. The generated
-`lightroom-adaptive-color` Computer Use handoff includes a DNG-only cleanup:
-filter the folder to DNGs, select the visible DNG set, run
-`Photo > Update AI Settings`, and wait for Lightroom to finish the batch. Repeat
-that DNG-only update after any post-Lightroom sidecar/DNG metadata repair.
+After a batch paste or later metadata repair, recheck the DNGs. If Lightroom
+reports stale AI settings, filter to DNGs and use **Photo > Update AI Settings**
+on that selection before verifying again.
 
 By default, Lightroom edit stages process all RAWs, including rejected photos,
 so the whole folder has the same baseline treatment if you later rescue a reject.
@@ -219,13 +214,11 @@ python main.py lightroom-adaptive-color --path "/path/to/culled-raws"
 ```
 
 This writes `lightroom-adaptive-color.md` and `.json` under a new `runs/`
-directory. The checklist tells Computer Use to open Adobe Lightroom, filter to
-the in-scope RAW photos, verify the visible count, select all visible photos, and
-choose `Adaptive Color` directly from Lightroom's Profile dropdown. This profile
-step must happen inside Lightroom so Lightroom can generate per-image
-`crs:AILook` data. When DNGs are in scope, the checklist also tells Computer Use
-to filter to the DNG subset and run `Photo > Update AI Settings` after the paste
-so Lightroom refreshes the embedded Adaptive Profile render data.
+directory. In Lightroom 10 Local, filter by extension and verify the count
+before editing. Apply Adaptive Color to one RAW, use **Choose Edit Settings to
+Copy > Select > None**, then check only **Profile: Adaptive Color** and paste
+in Square Grid. See the [production workflow](docs/new-folder-workflow.md)
+for the full batch and export checks.
 
 JPEG Lightroom edits are separate because Adaptive Color/Profile is a RAW/DNG
 feature. Use `lightroom-jpeg-auto` after culling to generate a Computer Use

@@ -49,6 +49,21 @@ class ScannerTests(unittest.TestCase):
             )
             self.assertEqual([asset.is_jpeg for asset in assets], [False, True, True])
 
+    def test_recursive_source_scan_excludes_delivery_and_hidden_folders(self) -> None:
+        with TemporaryDirectory() as tmp_dir:
+            root = Path(tmp_dir)
+            for filename in ("shoot/frame.ARW", "output/delivery.JPG", ".backup/old.ARW"):
+                path = root / filename
+                path.parent.mkdir(exist_ok=True)
+                path.touch()
+
+            assets = discover_photo_assets(root, (".arw",), True, (".jpg",))
+            self.assertEqual([asset.filename for asset in assets], ["frame.ARW"])
+            self.assertEqual(
+                [asset.filename for asset in discover_jpeg_assets(root / "output", (".jpg",))],
+                ["delivery.JPG"],
+            )
+
     def test_discover_jpeg_assets_ignores_appledouble_companions(self) -> None:
         with TemporaryDirectory() as tmp_dir:
             root = Path(tmp_dir)

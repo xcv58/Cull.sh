@@ -93,9 +93,14 @@ def write_photo_metadata(
 
 
 def write_jpeg_metadata(path: Path, decision: FinalDecision) -> None:
+    write_embedded_cull_metadata(path, decision)
+
+
+def write_embedded_cull_metadata(path: Path, decision: FinalDecision) -> None:
+    """Update culling tags without replacing Lightroom's embedded develop packet."""
     exiftool = shutil.which("exiftool")
     if exiftool is None:
-        raise RuntimeError("exiftool is required to write JPEG metadata")
+        raise RuntimeError("exiftool is required to write embedded metadata")
 
     command = [
         exiftool,
@@ -106,7 +111,7 @@ def write_jpeg_metadata(path: Path, decision: FinalDecision) -> None:
     result = subprocess.run(command, check=False, capture_output=True, text=True)
     if result.returncode != 0:
         error = result.stderr.strip() or result.stdout.strip()
-        raise RuntimeError(f"exiftool failed to write JPEG metadata: {error}")
+        raise RuntimeError(f"exiftool failed to write embedded metadata: {error}")
 
 
 def write_lightroom_edit_sidecar(path: Path) -> None:
@@ -287,13 +292,15 @@ def photo_is_rejected(asset: RawAsset) -> bool:
 
 
 def photo_is_picked(asset: RawAsset) -> bool:
-    if asset.is_jpeg:
+    if asset.is_jpeg or (
+        asset.raw_path.suffix.lower() == ".dng" and not asset.xmp_path.exists()
+    ):
         return jpeg_is_picked(asset.raw_path)
     return sidecar_is_picked(asset.xmp_path)
 
 
 def sidecar_has_adaptive_color_payload(path: Path) -> bool:
-    """Return True when Lightroom has generated a real Adaptive Color payload."""
+    """Verify the active Adaptive Color reference and its Lightroom RAW sidecar."""
     if not path.exists():
         return False
 
@@ -302,7 +309,17 @@ def sidecar_has_adaptive_color_payload(path: Path) -> bool:
     if description is None:
         return False
 
-    return _has_ai_look(description) and _has_adaptive_color_look(description)
+    ai_look = description.find("crs:AILook", NAMESPACES)
+    if (
+        ai_look is None
+        or _metadata_boolean(ai_look.get(f"{{{CRS_NS}}}Active")) is not True
+        or not ai_look.get(f"{{{CRS_NS}}}AILookData", "").strip()
+        or not _has_adaptive_color_look(description)
+    ):
+        return False
+
+    acr_path = path.with_suffix(".acr")
+    return acr_path.is_file() and acr_path.stat().st_size > 0
 
 
 def sidecar_has_lens_corrections(path: Path) -> bool:

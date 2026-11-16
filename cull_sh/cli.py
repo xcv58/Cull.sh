@@ -39,6 +39,7 @@ from cull_sh.edit_feedback import run_feedback_pilot
 from cull_sh.edit_feedback import select_feedback_picks
 from cull_sh.lightroom_ui import build_adaptive_color_stage
 from cull_sh.lightroom_ui import build_jpeg_auto_stage
+from cull_sh.lightroom_ui import read_embedded_dng_state
 from cull_sh.lightroom_ui import write_adaptive_color_handoff
 from cull_sh.lightroom_ui import write_jpeg_auto_handoff
 from cull_sh.manifests import create_run_dir
@@ -68,6 +69,7 @@ from cull_sh.scanner import discover_raw_assets
 from cull_sh.xmp import photo_is_picked
 from cull_sh.xmp import sidecar_is_rejected
 from cull_sh.xmp import write_develop_sidecar
+from cull_sh.xmp import write_embedded_cull_metadata
 from cull_sh.xmp import write_photo_metadata
 from cull_sh.xmp import write_lightroom_edit_sidecar
 from cull_sh.vlm_benchmark import VLMModelSpec
@@ -809,15 +811,30 @@ def doctor(
             for model in models
             if isinstance(model, dict)
         }
-        production_model_ready = DEFAULT_PRODUCTION_MODEL in installed_names or any(
-            name.startswith(f"{DEFAULT_PRODUCTION_MODEL}:") for name in installed_names
-        )
-        health.add_row(
-            "Production model",
-            f"ready ({DEFAULT_PRODUCTION_MODEL})"
-            if production_model_ready
-            else f"missing ({DEFAULT_PRODUCTION_MODEL})",
-        )
+        production_names = {DEFAULT_PRODUCTION_MODEL, f"{DEFAULT_PRODUCTION_MODEL}:latest"}
+        if installed_names.isdisjoint(production_names):
+            health.add_row("Production model", f"missing ({DEFAULT_PRODUCTION_MODEL})")
+        else:
+            try:
+                details = httpx.post(
+                    f"{backend_url.rstrip('/')}/api/show",
+                    json={"model": DEFAULT_PRODUCTION_MODEL},
+                    timeout=5.0,
+                )
+                details.raise_for_status()
+                if "vision" not in details.json().get("capabilities", []):
+                    health.add_row("Production model", "listed, but vision is unavailable")
+                else:
+                    health.add_row(
+                        "Production model", f"vision available ({DEFAULT_PRODUCTION_MODEL})"
+                    )
+            except httpx.HTTPStatusError as exc:
+                health.add_row(
+                    "Production model",
+                    f"listed, but model metadata is unreadable (HTTP {exc.response.status_code})",
+                )
+            except httpx.HTTPError as exc:
+                health.add_row("Production model", f"listed, but could not be read: {exc}")
     except Exception as exc:  # pragma: no cover - environment dependent
         health.add_row("Ollama API", f"unreachable: {exc}")
 
@@ -1239,11 +1256,15 @@ def lightroom_edit(
     rejected_found = 0
     skipped_rejected = 0
     sidecars_written = 0
+    embedded_lens_enabled = 0
     failed: list[tuple[str, str]] = []
 
     for asset in assets:
         try:
-            rejected = sidecar_is_rejected(asset.xmp_path)
+            embedded = (
+                None if asset.xmp_path.exists() else read_embedded_dng_state(asset.raw_path)
+            )
+            rejected = embedded.rejected if embedded else sidecar_is_rejected(asset.xmp_path)
         except Exception as exc:
             failed.append((asset.filename, f"sidecar read failed: {exc}"))
             continue
@@ -1254,6 +1275,12 @@ def lightroom_edit(
             continue
 
         candidates += 1
+        if embedded and embedded.has_develop_settings:
+            if embedded.has_lens_corrections:
+                embedded_lens_enabled += 1
+            else:
+                failed.append((asset.filename, "Use Lightroom Optics to preserve embedded edits"))
+            continue
         if dry_run:
             continue
         try:
@@ -1269,6 +1296,8 @@ def lightroom_edit(
     console.print(f"Rejected RAW files: {rejected_found}")
     console.print(f"Rejected skipped: {skipped_rejected}")
     console.print(f"Sidecars written: {sidecars_written}")
+    if embedded_lens_enabled:
+        console.print(f"DNGs with lens corrections already embedded: {embedded_lens_enabled}")
     console.print(f"Dry run: {'yes' if dry_run else 'no'}")
     console.print("Sidecar edit: lens corrections")
     console.print("Adaptive Color: requires Lightroom UI/preset automation")
@@ -1371,7 +1400,7 @@ def lightroom_adaptive_color(
     assert_complete: bool = typer.Option(
         False,
         "--assert-complete/--no-assert-complete",
-        help="Exit with an error when in-scope RAW files still need Adaptive Color.",
+        help="Require a nonempty RAW selection with verified Adaptive Color and lens corrections.",
     ),
     edit_scope: LightroomEditScope = typer.Option(
         LightroomEditScope.ALL,
@@ -1407,12 +1436,13 @@ def lightroom_adaptive_color(
     )
     counts.add_row("Pending Adaptive Color", str(stage.pending_adaptive_color))
     counts.add_row("Lens corrections enabled", str(stage.lens_corrections_enabled))
+    counts.add_row("Pending lens corrections", str(len(stage.pending_lens_paths)))
     counts.add_row("Sidecar read errors", str(len(stage.errors)))
     console.print(counts)
 
-    if stage.pending_adaptive_color == 0:
+    if not stage.errors and stage.candidates and stage.pending_adaptive_color == 0:
         console.print("Adaptive Color stage: complete for discovered in-scope files.")
-    else:
+    elif stage.candidates and not stage.errors:
         console.print(
             "Adaptive Color stage: ready for Computer Use in Adobe Lightroom."
         )
@@ -1423,6 +1453,9 @@ def lightroom_adaptive_color(
         pending_preview = ", ".join(stage.pending_filenames[:5])
         if pending_preview:
             console.print(f"Next pending: {pending_preview}")
+
+    if stage.pending_lens_paths:
+        console.print("Lens correction sample: " + ", ".join(stage.pending_lens_paths[:3]))
 
     if handoff:
         run_dir = create_run_dir(runs_root)
@@ -1440,8 +1473,15 @@ def lightroom_adaptive_color(
         console.print(errors)
         raise typer.Exit(code=1)
 
-    if assert_complete and stage.pending_adaptive_color:
-        raise typer.Exit(code=2)
+    if assert_complete:
+        baseline_complete = (
+            stage.candidates
+            and stage.pending_adaptive_color == 0
+            and stage.lens_corrections_enabled == stage.candidates
+        )
+        if not baseline_complete:
+            console.print("The RAW baseline is incomplete: check the selection, profile, and lens counts.")
+            raise typer.Exit(code=2)
 
 
 @app.command("suggest-edits")
@@ -2062,6 +2102,11 @@ def repair_sidecars(
         "--preserve-existing-picks/--replace-existing-picks",
         help="Leave photos currently marked as picks completely unchanged.",
     ),
+    embed_dng_metadata: bool = typer.Option(
+        False,
+        "--embed-dng-metadata",
+        help="Write DNG culling tags in place when Lightroom already stores edits there.",
+    ),
     dry_run: bool = typer.Option(
         True,
         "--dry-run/--no-dry-run",
@@ -2074,10 +2119,12 @@ def repair_sidecars(
     except FileNotFoundError as exc:
         raise typer.BadParameter(str(exc)) from exc
     records = load_manifest_records(target_run_dir)
+    if embed_dng_metadata and lightroom_auto_edit:
+        raise typer.BadParameter("--embed-dng-metadata is for culling tags, not lens edits")
 
-    rewritten = 0
     skipped = 0
     preserved_picks = 0
+    replay: list[tuple[RawAsset, FinalDecision, bool]] = []
     for record in records:
         decision = decision_from_manifest_record(record)
         if decision is None:
@@ -2096,20 +2143,41 @@ def repair_sidecars(
         if preserve_existing_picks and photo_is_picked(asset):
             preserved_picks += 1
             continue
-        if not dry_run:
-            write_photo_metadata(
-                asset,
-                decision,
-                apply_lightroom_edit=lightroom_auto_edit,
-                lightroom_edit_scope=lightroom_edit_scope,
+        embed_dng = embed_dng_metadata and raw_path.suffix.lower() == ".dng"
+        if embed_dng and (xmp_path.exists() or not raw_path.is_file()):
+            raise typer.BadParameter(
+                f"Cannot replay embedded tags for {raw_path}: the DNG is missing "
+                "or already has an external XMP sidecar"
             )
-        rewritten += 1
+        if not embed_dng and not xmp_path.exists():
+            embedded = read_embedded_dng_state(raw_path)
+            if embedded and embedded.has_develop_settings:
+                raise typer.BadParameter(
+                    f"{raw_path} has embedded Lightroom edits. Use --embed-dng-metadata "
+                    "to avoid hiding them with a new sidecar."
+                )
+        replay.append((asset, decision, embed_dng))
+
+    if not dry_run:
+        for asset, decision, embed_dng in replay:
+            if embed_dng:
+                write_embedded_cull_metadata(asset.raw_path, decision)
+            else:
+                write_photo_metadata(
+                    asset,
+                    decision,
+                    apply_lightroom_edit=lightroom_auto_edit,
+                    lightroom_edit_scope=lightroom_edit_scope,
+                )
 
     console.print(f"Run artifacts: {target_run_dir}")
     console.print(f"Mode: {'dry run' if dry_run else 'write'}")
     console.print(
-        f"Sidecars {'that would be rewritten' if dry_run else 'rewritten'}: {rewritten}"
+        f"Sidecars {'that would be rewritten' if dry_run else 'rewritten'}: "
+        f"{sum(not embed_dng for _, _, embed_dng in replay)}"
     )
+    if embed_dng_metadata:
+        console.print(f"Embedded DNG metadata records: {sum(row[2] for row in replay)}")
     console.print(f"Existing picks preserved: {preserved_picks}")
     console.print(f"Records skipped: {skipped}")
     console.print(

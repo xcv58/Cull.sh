@@ -4,6 +4,7 @@ import json
 import unittest
 from pathlib import Path
 from tempfile import TemporaryDirectory
+from unittest.mock import patch
 
 from typer.testing import CliRunner
 
@@ -72,6 +73,28 @@ class RepairSidecarsCliTests(unittest.TestCase):
             self.assertEqual(picked_xmp.read_bytes(), original_pick)
             self.assertTrue(sidecar_is_picked(picked_xmp))
             self.assertTrue(sidecar_is_rejected(neutral_xmp))
+
+    def test_embedded_dng_replay_does_not_create_an_xmp_sidecar(self) -> None:
+        with TemporaryDirectory() as tmp_dir:
+            root = Path(tmp_dir)
+            dng = root / "edited.DNG"
+            dng.touch()
+            record = self._record(dng.with_suffix(".xmp"), "pick", 4)
+            record.update(filename=dng.name, raw_path=str(dng))
+            (root / "manifest.jsonl").write_text(json.dumps(record) + "\n")
+
+            args = ["repair-sidecars", "--run-dir", str(root), "--embed-dng-metadata", "--no-dry-run"]
+            with patch("cull_sh.cli.write_embedded_cull_metadata") as write:
+                result = CliRunner().invoke(app, args)
+            self.assertEqual(result.exit_code, 0, result.output)
+            self.assertEqual(write.call_args.args[0], dng)
+            self.assertFalse(dng.with_suffix(".xmp").exists())
+
+            dng.with_suffix(".xmp").touch()
+            with patch("cull_sh.cli.write_embedded_cull_metadata") as write:
+                result = CliRunner().invoke(app, args)
+            self.assertNotEqual(result.exit_code, 0, result.output)
+            write.assert_not_called()
 
     @staticmethod
     def _write_xmp(path: Path, attributes: str) -> None:
